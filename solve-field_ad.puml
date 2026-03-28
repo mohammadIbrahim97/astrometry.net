@@ -1,0 +1,34 @@
+@startuml
+start
+group solve-field
+    :Define static functions;
+    group main
+        :Create variables;
+        group find_executable
+            :Find path to solve-field executable;
+        end group
+        :Create list of strings `engineargs`;
+        group append_executable
+            :Insert path to "astrometry-engine" into `engineargs`;
+        end group
+        :Remove duplicate short options;
+        :Remove unwanted augment-xylist options;
+        :Read all command-line options into their respective variables;
+        if (Arguments were provided) then (no)
+            :Print error message;
+            :Activate help;
+        endif
+        if (Is help activated?) then (yes)
+            :Print help text;
+            end
+        else (no)
+        while (Image file is waiting to be processed?) is (yes)
+            :Get paths of all the required output files;
+            :Handle possibly pre-existing files;
+            group astrometry-engine
+                :Run engine with parsed arguments;
+            end group
+        endwhile (no)
+        :Free allocated memory;
+stop
+@enduml
