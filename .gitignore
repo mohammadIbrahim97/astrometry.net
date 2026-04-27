@@ -97,3 +97,51 @@ util/wcs-match
 util/wcs-pv2sip
 report.txt
 .DS_Store
+*.o
+*.a
+*.so
+*.pyc
+__pycache__/
+demo/*
+
+# doxygen
+html/
+latex/
+Doxyfile
+
+# latex generated
+*.aux
+*.toc
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.pdf
+
+# static analysis
+cscope.out
+cscope.in.out
+cscope.po.out
+tags
+callgrind.out.*
+cachegrind.out.*
+massif.out.*
+perf.data
+perf.data.old
+gdb.txt
+gdb.log
+*.svg
+
+# valgrind / sanitizers
+vgcore.*
+*.asan
+Doxyfile.bak
+
+# Astrobench local/generated artifacts
+/profiling/runs/
+/profiling/data/manifests/
+/vtune/
+/perf.data
+*.perf
+*.vtune
+
