@@ -204,9 +204,9 @@ comparison.md
 
 A clean benchmark proof requires:
 
-same job count in serial and parallel runs;
-same success count in serial and parallel runs;
-lower elapsed time for the parallel run.
+- same job count in serial and parallel runs
+- same success count in serial and parallel runs
+- lower elapsed time for the parallel run
 
 Correct interpretation:
 Outer-layer parallelization improved batch throughput.
