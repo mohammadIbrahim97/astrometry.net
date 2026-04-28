@@ -204,13 +204,5 @@ The comparison verifies **batch throughput**, not the internal runtime of one in
 
 {conclusion}
 
-## Correctness boundary
-
-The internal Astrometry.net solver is not modified by this outer-layer benchmark. Each input image is still processed through a normal `solve-field` execution. The parallel layer only schedules multiple independent `solve-field` jobs at the same time.
-
-Therefore, a successful result means:
-
-```text
-The image batch finished faster.
 """
 )
