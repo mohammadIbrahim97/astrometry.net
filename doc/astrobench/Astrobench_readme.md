@@ -49,7 +49,7 @@ workspace/
 - FlameGraph tools, for future deep profiling extensions
 
 Astrobench uses path discovery first. If needed, paths can be overridden:
-./bin/astrobench --astrometry-install /path/to/astrometry-install --profiling-root /path/to/profiling doctor
+`./bin/astrobench --astrometry-install /path/to/astrometry-install --profiling-root /path/to/profiling doctor`
 
 ## Repository layout
 ```
