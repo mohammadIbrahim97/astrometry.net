@@ -44,7 +44,7 @@ workspace/
 
 ### Optional:
 
-- Linux perf, for profile --tool perf-stat
+- Linux perf, for `profile --tool perf-stat`
 - Intel VTune, for optional deeper profiling
 - FlameGraph tools, for future deep profiling extensions
 
