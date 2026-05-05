@@ -15,8 +15,8 @@ import sys
 from .blur_score import (
     DEFAULT_TARGET_FWHM,
     InsufficientSources,
-    compute_blur_score,
     measure_psf,
+    score_from_psf,
 )
 
 DEFAULT_IMAGES_DIR = "/src/Astrometry-testing-data/data"
@@ -43,22 +43,23 @@ def main(argv=None):
 
     if args.paths:
         files = args.paths
-    else:
-        if not os.path.isdir(args.images_dir):
-            print(f"images-dir not found: {args.images_dir}", file=sys.stderr)
-            return 2
+    elif os.path.isdir(args.images_dir):
         files = _walk_images(args.images_dir)
+    else:
+        print(f"images-dir not found: {args.images_dir}", file=sys.stderr)
+        return 2
 
     print("image,fwhm,ellipticity,n_sources,score")
     for path in files:
         try:
             f, e, n = measure_psf(path)
-            s = compute_blur_score(path, target_fwhm=args.target_fwhm)
-            print(f"{path},{f:.4f},{e:.4f},{n},{s:.4f}")
         except InsufficientSources:
             print(f"{path},nan,nan,0,nan")
+            continue
         except Exception as ex:
             print(f"# error {path}: {ex}", file=sys.stderr)
+            continue
+        print(f"{path},{f:.4f},{e:.4f},{n},{score_from_psf(f, e, n, args.target_fwhm):.4f}")
     return 0
 
 

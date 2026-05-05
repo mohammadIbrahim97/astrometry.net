@@ -1,7 +1,6 @@
 # This file is part of the Astrometry.net suite.
 # Licensed under a 3-clause BSD style license - see LICENSE
 import os
-import shutil
 import tempfile
 import unittest
 import numpy as np
@@ -10,6 +9,7 @@ from .blur_score import (
     InsufficientSources,
     compute_blur_score,
     measure_psf,
+    score_from_psf,
 )
 
 
@@ -31,27 +31,21 @@ def _starfield(n_stars, fwhm, shape=(512, 512), ellipticity=0.0,
         x0 = rng.uniform(margin, shape[1] - margin)
         y0 = rng.uniform(margin, shape[0] - margin)
         amp = rng.uniform(800, 6000)
-        img = img + _gaussian_star(shape, x0, y0, fwhm,
-                                   amp=amp, ellipticity=ellipticity).astype(np.float32)
+        img += _gaussian_star(shape, x0, y0, fwhm,
+                              amp=amp, ellipticity=ellipticity).astype(np.float32)
     return img
-
-
-def _save_fits(arr, path):
-    from astropy.io import fits
-    fits.PrimaryHDU(arr.astype(np.float32)).writeto(path, overwrite=True)
 
 
 class TestBlurScore(unittest.TestCase):
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
 
     def _save(self, name, arr):
-        path = os.path.join(self.tmpdir, name + ".fits")
-        _save_fits(arr, path)
+        from astropy.io import fits
+        path = os.path.join(self.tmpdir.name, name + ".fits")
+        fits.PrimaryHDU(arr.astype(np.float32)).writeto(path, overwrite=True)
         return path
 
     def test_score_in_range(self):
@@ -74,16 +68,25 @@ class TestBlurScore(unittest.TestCase):
 
     def test_determinism(self):
         path = self._save("det", _starfield(40, fwhm=3.0, seed=42))
-        a = compute_blur_score(path)
-        b = compute_blur_score(path)
-        self.assertEqual(a, b)
+        self.assertEqual(compute_blur_score(path), compute_blur_score(path))
 
     def test_insufficient_sources_raises(self):
         rng = np.random.default_rng(0)
-        noise = rng.normal(100, 5, (256, 256)).astype(np.float32)
-        path = self._save("noise", noise)
+        path = self._save("noise", rng.normal(100, 5, (256, 256)).astype(np.float32))
         with self.assertRaises(InsufficientSources):
             measure_psf(path)
+
+    def test_score_from_psf_formula(self):
+        # Perfect: target FWHM, round, saturated count
+        self.assertEqual(score_from_psf(3.0, 0.0, 10, target_fwhm=3.0), 1.0)
+        # FWHM 2x target → halves the score
+        self.assertAlmostEqual(score_from_psf(6.0, 0.0, 10, target_fwhm=3.0), 0.5)
+        # Heavy ellipticity → halves the score
+        self.assertAlmostEqual(score_from_psf(3.0, 0.5, 10, target_fwhm=3.0), 0.5)
+        # Few sources → linear penalty
+        self.assertAlmostEqual(score_from_psf(3.0, 0.0, 5, target_fwhm=3.0), 0.5)
+        # Degenerate FWHM
+        self.assertEqual(score_from_psf(0.0, 0.0, 10, target_fwhm=3.0), 0.0)
 
 
 if __name__ == "__main__":
