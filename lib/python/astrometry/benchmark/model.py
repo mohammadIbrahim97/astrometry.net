@@ -39,6 +39,17 @@ class SolveResult:
     stderr_log: Path
     command_log: Path
 
+    # Timing split: queue pressure vs actual solve-field runtime.
+    submitted_at: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    queue_wait_seconds: float | None = None
+
+    # Stable failure fields for CLI inspection + CSV/JSON reports.
+    error_kind: str | None = None
+    error_message: str | None = None
+
+
 @dataclass
 class WorkerSuggestion:
     usable_cpus: int
@@ -54,3 +65,4 @@ class RunSummary:
     workers: int
     elapsed_seconds: float
     results: list[SolveResult]
+    mode: str = "run"

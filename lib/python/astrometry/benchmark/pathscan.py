@@ -5,20 +5,22 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-@dataclass(frozen=True) # TODO: Move to model
+
+@dataclass(frozen=True)
 class ResolvedPaths:
+    # resolved project topology
     repo_root: Path
     astrometry_install: Path
     solve_field: Path
     astrometry_cfg: Path
-    profiling_root: Path
+    workspace_root: Path
     dataset_root: Path
     ser_root: Path | None
     output_root: Path
-    flamegraph_dir: Path | None
 
 
 class PathResolutionError(RuntimeError):
+    # path discovery failure
     pass
 
 
@@ -27,9 +29,11 @@ def resolve_project_paths(
     cli_overrides: dict[str, str | None],
     start: Path | None = None,
 ) -> ResolvedPaths:
+    # repo anchor + adjacent scan scope
     repo_root = find_repo_root(start or Path.cwd())
     scan_roots = [repo_root, repo_root.parent]
 
+    # astrometry runtime install
     astrometry_install = resolve_dir(
         name="astrometry-install",
         cli_value=cli_overrides.get("astrometry_install"),
@@ -39,44 +43,32 @@ def resolve_project_paths(
         required_markers=[Path("bin/solve-field"), Path("etc/astrometry.cfg")],
     )
 
-    profiling_root = resolve_dir(
+    # workspace: datasets, manifests, runs, reports
+    workspace_root = resolve_dir(
         name="profiling",
-        cli_value=cli_overrides.get("profiling_root"),
-        env_name="ASTROBENCH_PROFILING_ROOT",
-        config_value=config.get("paths", {}).get("profiling_root"),
+        cli_value=cli_overrides.get("workspace_root"),
+        env_name="ASTROBENCH_WORKSPACE_ROOT",
+        config_value=config.get("paths", {}).get("workspace_root"),
         scan_roots=scan_roots,
-        required_markers=[Path("data/categorized_5img_set"), Path("runs")],
+        required_markers=[Path("runs")],
     )
 
-    flamegraph_dir = resolve_optional_dir(
-        name="FlameGraph",
-        cli_value=cli_overrides.get("flamegraph_dir"),
-        env_name="ASTROBENCH_FLAMEGRAPH_DIR",
-        config_value=config.get("paths", {}).get("flamegraph_dir"),
-        scan_roots=[
-            repo_root / "tools",
-            repo_root.parent / "tools",
-            repo_root,
-            repo_root.parent,
-            Path.home() / "tools",
-        ],
-        required_markers=[Path("flamegraph.pl"), Path("stackcollapse-perf.pl")],
-    )
-
+    # dataset locations relative to workspace
     dataset_rel = Path(config.get("dataset", {}).get("categorized_relative", "data/categorized_5img_set"))
     ser_rel = Path(config.get("dataset", {}).get("ser_relative", "data/ser_data"))
-    output_rel = Path(config.get("benchmark", {}).get("output_relative", "runs/astrobench"))
 
+    # concrete runtime paths
     solve_field = astrometry_install / "bin" / "solve-field"
     astrometry_cfg = astrometry_install / "etc" / "astrometry.cfg"
-    dataset_root = profiling_root / dataset_rel
-    ser_root = profiling_root / ser_rel
-    output_root = profiling_root / output_rel
+    dataset_root = workspace_root / dataset_rel
+    ser_root = workspace_root / ser_rel
+    output_root = resolve_output_root(config, workspace_root)
 
+    # mandatory binary + cfg
     require_file(solve_field, "solve-field")
     require_file(astrometry_cfg, "astrometry.cfg")
-    require_dir(dataset_root, "categorized dataset root")
 
+    # ensure run sink
     output_root.mkdir(parents=True, exist_ok=True)
 
     return ResolvedPaths(
@@ -84,19 +76,31 @@ def resolve_project_paths(
         astrometry_install=astrometry_install,
         solve_field=solve_field,
         astrometry_cfg=astrometry_cfg,
-        profiling_root=profiling_root,
+        workspace_root=workspace_root,
         dataset_root=dataset_root,
         ser_root=ser_root if ser_root.is_dir() else None,
         output_root=output_root,
-        flamegraph_dir=flamegraph_dir,
     )
 
 
+def resolve_output_root(config: dict, workspace_root: Path) -> Path:
+    # absolute/custom output override
+    output_root_value = config.get("output", {}).get("root")
+    if output_root_value:
+        return Path(str(output_root_value)).expanduser().resolve()
+
+    # workspace-relative default
+    output_rel = Path(config.get("benchmark", {}).get("output_relative", "runs/astrobench"))
+    return workspace_root / output_rel
+
+
 def find_repo_root(start: Path) -> Path:
+    # normalize file input to parent dir
     current = start.resolve()
     if current.is_file():
         current = current.parent
 
+    # upward repo marker scan
     for candidate in [current, *current.parents]:
         if is_astrometry_repo(candidate):
             return candidate
@@ -108,10 +112,10 @@ def find_repo_root(start: Path) -> Path:
 
 
 def is_astrometry_repo(path: Path) -> bool:
+    # astrometry.net repo signature
     return (
         (path / "bin").is_dir()
         and (path / "lib").is_dir()
-        and (path / "doc").is_dir()
         and ((path / ".git").exists() or (path / "configure").exists())
     )
 
@@ -124,8 +128,10 @@ def resolve_dir(
     scan_roots: list[Path],
     required_markers: list[Path],
 ) -> Path:
+    # priority-ordered directory candidates
     candidates = candidate_dirs(name, cli_value, env_name, config_value, scan_roots)
 
+    # first marker-complete hit wins
     for candidate in candidates:
         if directory_matches(candidate, required_markers):
             return candidate.resolve()
@@ -140,23 +146,6 @@ def resolve_dir(
     )
 
 
-def resolve_optional_dir(
-    name: str,
-    cli_value: str | None,
-    env_name: str,
-    config_value: str | None,
-    scan_roots: list[Path],
-    required_markers: list[Path],
-) -> Path | None:
-    candidates = candidate_dirs(name, cli_value, env_name, config_value, scan_roots)
-
-    for candidate in candidates:
-        if directory_matches(candidate, required_markers):
-            return candidate.resolve()
-
-    return None
-
-
 def candidate_dirs(
     name: str,
     cli_value: str | None,
@@ -166,10 +155,12 @@ def candidate_dirs(
 ) -> list[Path]:
     raw_candidates: list[Path] = []
 
+    # explicit sources: CLI > env > config
     for value in [cli_value, os.environ.get(env_name), config_value]:
         if value:
             raw_candidates.append(Path(value).expanduser())
 
+    # convention-based sibling scans
     for root in scan_roots:
         raw_candidates.extend([
             root / name,
@@ -177,6 +168,7 @@ def candidate_dirs(
             root / name.replace("-", "_"),
         ])
 
+    # PATH fallback via solve-field
     if name == "astrometry-install":
         found = shutil.which("solve-field")
         if found:
@@ -186,23 +178,21 @@ def candidate_dirs(
 
 
 def directory_matches(path: Path, required_markers: list[Path]) -> bool:
+    # marker-complete directory check
     return path.is_dir() and all((path / marker).exists() for marker in required_markers)
 
 
 def require_file(path: Path, label: str) -> None:
+    # hard file precondition
     if not path.is_file():
         raise PathResolutionError(f"Missing required file for {label}: {path}")
-
-
-def require_dir(path: Path, label: str) -> None:
-    if not path.is_dir():
-        raise PathResolutionError(f"Missing required directory for {label}: {path}")
 
 
 def deduplicate_paths(paths: list[Path]) -> list[Path]:
     seen: set[Path] = set()
     result: list[Path] = []
 
+    # stable-order path normalization
     for path in paths:
         try:
             normalized = path.expanduser().resolve()

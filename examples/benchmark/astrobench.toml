@@ -1,7 +1,14 @@
 [paths]
 astrometry_install = ""
-profiling_root = ""
-flamegraph_dir = ""
+workspace_root = ""
+
+[input]
+default_dir = ""
+recursive = false
+limit = 0
+
+[output]
+root = ""
 
 [solver]
 cpulimit_seconds = 120
@@ -24,11 +31,3 @@ categories = ["clean", "noisy", "blurred", "disturbed"]
 output_relative = "runs/astrobench"
 default_workload = "mixed20"
 workers = [1, 2, 4]
-
-[perf]
-frequency = 199
-callgraph_mode = "dwarf,16384"
-
-[vtune]
-enabled = true
-vtune_env = "/opt/intel/oneapi/vtune/2025.10/env/vars.sh"

@@ -16,6 +16,7 @@ def main() -> int:
         return 2
 
     sys.path.insert(0, str(repo_lib))
+    os.environ.setdefault("ASTROBENCH_REPO_ROOT", str(repo_root))
 
     try:
         from astrometry.benchmark.cli import main as cli_main
@@ -23,8 +24,8 @@ def main() -> int:
         print("[ERROR] Could not import astrometry.benchmark.cli", file=sys.stderr)
         print(f"[ERROR] repo_lib inserted: {repo_lib}", file=sys.stderr)
         print(f"[ERROR] original error: {error}", file=sys.stderr)
-        print("[HINT] Check that this file exists:", file=sys.stderr)
-        print(f"       {repo_lib}/astrometry/benchmark/cli.py", file=sys.stderr)
+        print("[HINT] Expected file:", file=sys.stderr)
+        print(f"       {repo_lib / 'astrometry' / 'benchmark' / 'cli.py'}", file=sys.stderr)
         return 2
 
     return cli_main()

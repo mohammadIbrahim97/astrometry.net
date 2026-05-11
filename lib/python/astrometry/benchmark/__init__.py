@@ -1,1 +1,1 @@
-"""Benchmark and profiling utility for Astrometry.net."""
+"""Concurrent solve-field batch controller for Astrometry.net."""

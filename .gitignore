@@ -145,3 +145,7 @@ Doxyfile.bak
 *.perf
 *.vtune
 
+
+# Astrobench local configuration
+.astrobench.toml
+astrobench.local.toml
