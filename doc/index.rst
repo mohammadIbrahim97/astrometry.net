@@ -21,6 +21,7 @@ Contents:
    nova
    oaq
    code
+   blur_score
 
 .. toctree::
    :hidden:
