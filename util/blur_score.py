@@ -15,6 +15,7 @@ import os
 import subprocess
 import tempfile
 import warnings
+
 import numpy as np
 
 DEFAULT_TARGET_FWHM = 3.0
@@ -131,10 +132,18 @@ def compute_blur_score(image, target_fwhm=DEFAULT_TARGET_FWHM, **kwargs):
     return score_from_psf(*measure_psf(image, **kwargs), target_fwhm=target_fwhm)
 
 
+def _clip01(value):
+    return float(np.clip(value, 0.0, 1.0))
+
+
 def score_from_psf(fwhm, ecc, n_bright, target_fwhm):
-    fwhm_score = min(1.0, target_fwhm / fwhm) if fwhm > 0 else 0.0
-    shape_weight = max(0.0, 1.0 - ecc)
-    count_weight = min(1.0, n_bright / COUNT_SATURATION)
+    """Compute final score from PSF summary statistics.
+
+    Uses robust medians from ``measure_psf`` and clips each component to [0, 1].
+    """
+    fwhm_score = _clip01(target_fwhm / fwhm) if fwhm > 0 else 0.0
+    shape_weight = _clip01(1.0 - ecc)
+    count_weight = _clip01(n_bright / COUNT_SATURATION)
     return float(fwhm_score * shape_weight * count_weight)
 
 

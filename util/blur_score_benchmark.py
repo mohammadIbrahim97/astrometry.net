@@ -24,13 +24,12 @@ IMG_EXTS = (".fits", ".fit", ".fts", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
 
 
 def _walk_images(root):
-    out = []
-    for dirpath, _, files in os.walk(root):
-        for fn in files:
-            if fn.lower().endswith(IMG_EXTS):
-                out.append(os.path.join(dirpath, fn))
-    out.sort()
-    return out
+    return sorted(
+        os.path.join(dirpath, fn)
+        for dirpath, _, files in os.walk(root)
+        for fn in files
+        if fn.lower().endswith(IMG_EXTS)
+    )
 
 
 def main(argv=None):
