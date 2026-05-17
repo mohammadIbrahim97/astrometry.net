@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 cleanup () {
     if [ $removeOverlay -eq 1 ]; then
