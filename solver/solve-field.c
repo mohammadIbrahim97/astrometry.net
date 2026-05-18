@@ -748,9 +748,9 @@ static void after_solved(augment_xylist_t* axy,
         }
         starxy_free(xy);
         printf("%d sources in total\n", xy->N);
-        printf("%d of which have been recognized\n", corrxy->N);
-        printf("%d objects are thus unrecognized\n", xy->N - corrxy->N);
-        printf("%d of which are brighter than the dimmest star recognized\n", unrecognizedObjsFound);
+        printf("%d correspondences\n", corrxy->N);
+        printf("%d unrecognized objects\n", xy->N - corrxy->N);
+        printf("%d unrecognized objects brighter than the dimmest correspondence\n", unrecognizedObjsFound);
     }
 }
 
