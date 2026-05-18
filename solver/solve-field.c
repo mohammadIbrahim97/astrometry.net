@@ -708,6 +708,50 @@ static void after_solved(augment_xylist_t* axy,
             exit(-1);
         }
     }
+
+    if (file_exists(axy->corrfn) && file_exists(axy->axyfn)) {
+        #define MAX_DISTRACTORS_TO_MENTION 5
+
+        xylist_t* xyls = xylist_open(axy->axyfn);
+        xylist_set_include_background(xyls, FALSE);
+        xylist_set_include_flux(xyls, FALSE);
+        // All detected object positions
+        starxy_t* xy = xylist_read_field(xyls, NULL);
+        xylist_close(xyls);
+
+        xylist_t* corrxyls = xylist_open(axy->corrfn);
+        xylist_set_include_background(corrxyls, FALSE);
+        xylist_set_include_flux(corrxyls, FALSE);
+        corrxyls->xname = "field_x";
+        corrxyls->yname = "field_y";
+        // Positions of all objects that could be mapped to objects in index
+        starxy_t* corrxy = xylist_read_field(corrxyls, NULL);
+        xylist_close(corrxyls);
+
+        // TODO: FIxed length types
+        double xycoords[2] = {0, 0};
+        double nextcorrcoords[2] = {0, 0};
+        printf("The %d brightest distractors (X, Y) are:\n", MAX_DISTRACTORS_TO_MENTION);
+        int unrecognizedObjsFound = 0;
+        for (int xyrow=0, nextcorrrow=0; nextcorrrow < corrxy->N; xyrow++) {
+            if (memcmp(xycoords, nextcorrcoords, 2*sizeof(double))) {
+                if (unrecognizedObjsFound<MAX_DISTRACTORS_TO_MENTION)
+                    printf("  %f, %f\n", xycoords[0], xycoords[1]);
+                unrecognizedObjsFound++;
+            } else {
+                starxy_get(corrxy, nextcorrrow, nextcorrcoords);
+                nextcorrrow++;
+            }
+
+            // Advance xy
+            starxy_get(xy, xyrow, xycoords);
+        }
+        starxy_free(xy);
+        printf("%d sources in total\n", xy->N);
+        printf("%d of which have been recognized\n", corrxy->N);
+        printf("%d objects are thus unrecognized\n", xy->N - corrxy->N);
+        printf("%d of which are brighter than the dimmest star recognized\n", unrecognizedObjsFound);
+    }
 }
 
 static void delete_temp_files(sl* tempfiles, sl* tempdirs) {
