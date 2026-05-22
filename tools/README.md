@@ -58,6 +58,7 @@ Example: `benchmark.sh ../demo "*.jpg" 2 0 999999 30 ../demo/statistics.json`
 `<DOWNSAMPLE-DEGREE>`, `<SCALE-LOW>`, `<SCALE-HIGH>` and `<CPULIMIT>` are
 passed as the `--downsample`, `--scale-low`, `--scale-high` and `--cpulimit`
 arguments of `solve-field`, respectively.
+The scale parameters are passed as arcseconds per pixel.
 
 Per file, it gathers the following statistics:
 - `solved`: Whether the file has been solved
@@ -66,6 +67,9 @@ Per file, it gathers the following statistics:
 - `ncorr` (if solved): The number of correspondences, 
     i.e. sources that could be mapped to objects present in the index,
     i.e. stars recognized in the image
+- `ndistract` (if solved): The value of the NDISTRACT field
+    in the corresponding .match file.
+    This is not necessarily equal to `nbrighter`, see below.
 - `nbrighter` (if solved): The number of sources that are not correspondences,
     but are brighter than the dimmest correspondence found
 
@@ -75,8 +79,11 @@ as well as the number of images that could and could not be solved
 (`solved` and `notsolved`), as well as
 the average time the solved images took (`avgtime`).
 
-The script currently depends on the precise console output from `solve-field`,
-so it is fragile, but it works for now.
+### Prerequisites:
+- `solve-field` in any of the directories in your `$PATH`
+- Astrometry.net's FITS utilities `tablist`, `listhead` and `subtable`
+    in any of the directories in your `$PATH`
+- `clean.sh` in the same directory as this script (see below)
 
 This script is not POSIX compatible
 because it uses `shopt -s lastpipe` and `$EPOCHREALTIME`.
