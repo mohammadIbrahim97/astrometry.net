@@ -64,12 +64,12 @@ find "$1" -mindepth 1 -maxdepth 1 -type f -name "$2" | while read -r file; do
   t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
   td=$(((t1 - t0) / 1000))
 
-  numsources="$(echo "$output" | grep "simplexy: found .* sources" | cut -d " " -f3)"
+  noext="${file%.*}"
+  numsources="$(listhead "$noext.axy" | grep "NAXIS2" | xargs | cut -d " " -f3)"
 
   # Write data
   printf "\n    {" >> "$statsfile"
 
-  noext="${file%.*}"
   if [ -f "$noext.solved" ]; then
     echo "Solved $file in $td ms."
     solved=$((solved+1))
