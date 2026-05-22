@@ -77,7 +77,7 @@ find "$1" -mindepth 1 -maxdepth 1 -type f -name "$2" | while read -r file; do
     numcorrs="$(listhead "$noext.corr" | grep "NAXIS2" | xargs | cut -d " " -f3)"
     numbrightunrecognized="$(bright_unrecognized "$noext")"
     ndistract=$(ndistract "$noext")
-    pxscale="$(echo "$output" | grep "pixel scale" | cut -d " " -f8)"
+    pxscale="$(listhead "$noext.wcs" | grep "COMMENT scale: .* arcsec/pix" | cut -d " " -f3)"
     {
       printf "\n      \"file\": \"%s\"," "$(basename "$file")"
       printf "\n      \"solved\": true,"
