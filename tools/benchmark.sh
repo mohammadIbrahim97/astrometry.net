@@ -1,6 +1,6 @@
 #!/bin/bash
 
-if [ $# -lt 5 ]; then
+if [ $# -lt 7 ]; then
   echo "Usage: $0 <DIR> <NAME-SCHEME> <DOWNSAMPLE-DEGREE> <SCALE-LOW> <SCALE-HIGH> <CPULIMIT> <OUT-FILE>"
   echo "  Example: $0 demo \"*.jpg\" 2 0 999999 30 demo/statistics.json"
   exit
