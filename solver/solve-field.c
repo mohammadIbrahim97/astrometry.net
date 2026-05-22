@@ -20,6 +20,7 @@
 #include <errors.h>
 #include <getopt.h>
 #include <assert.h>
+#include <sys/time.h>
 
 #include "boilerplate.h"
 #include "an-bool.h"
@@ -37,6 +38,7 @@
 #include "sip_qfits.h"
 #include "sip-utils.h"
 #include "wcs-rd2xy.h"
+#include "anwcs.h"
 #include "new-wcs.h"
 #include "scamp.h"
 
@@ -654,15 +656,13 @@ static void after_solved(augment_xylist_t* axy,
         }
     }
 
-    if (sf->scampfn && file_exists(axy->wcsfn)) {
-        //char* hdrfile = NULL;
-        qfits_header* imageheader = NULL;
+    if (file_exists(axy->wcsfn) && (file_exists(axy->corrfn) || sf->scampfn)) {
         starxy_t* xy;
         xylist_t* xyls;
 
         xyls = xylist_open(axy->axyfn);
         if (!xyls) {
-            ERROR("Failed to read xylist to write SCAMP catalog");
+            ERROR("Failed to read xylist to write SCAMP catalog and detect distractors");
             exit(-1);
         }
         if (axy->xcol)
@@ -674,32 +674,67 @@ static void after_solved(augment_xylist_t* axy,
         xy = xylist_read_field(xyls, NULL);
         xylist_close(xyls);
 
-        if (axy->fitsimgfn) {
-            //hdrfile = axy->fitsimgfn;
-            imageheader = anqfits_get_header2(axy->fitsimgfn, 0);
-        }
-        if (axy->xylsfn) {
-            char val[32];
-            //hdrfile = axy->xylsfn;
-            imageheader = anqfits_get_header2(axy->xylsfn, 0);
-            // Set NAXIS=2, NAXIS1=IMAGEW, NAXIS2=IMAGEH
-            fits_header_mod_int(imageheader, "NAXIS", 2, NULL);
-            sprintf(val, "%i", axy->W);
-            qfits_header_add_after(imageheader, "NAXIS",  "NAXIS1", val, "image width", NULL);
-            sprintf(val, "%i", axy->H);
-            qfits_header_add_after(imageheader, "NAXIS1", "NAXIS2", val, "image height", NULL);
-            //fits_header_add_int(imageheader, "NAXIS1", axy->W, NULL);
-            //fits_header_add_int(imageheader, "NAXIS2", axy->H, NULL);
-            logverb("Using NAXIS 1,2 = %i,%i\n", axy->W, axy->H);
+        if (sf->scampfn) {
+            //char* hdrfile = NULL;
+            qfits_header* imageheader = NULL;
+
+            if (axy->fitsimgfn) {
+                //hdrfile = axy->fitsimgfn;
+                imageheader = anqfits_get_header2(axy->fitsimgfn, 0);
+            }
+            if (axy->xylsfn) {
+                char val[32];
+                //hdrfile = axy->xylsfn;
+                imageheader = anqfits_get_header2(axy->xylsfn, 0);
+                // Set NAXIS=2, NAXIS1=IMAGEW, NAXIS2=IMAGEH
+                fits_header_mod_int(imageheader, "NAXIS", 2, NULL);
+                sprintf(val, "%i", axy->W);
+                qfits_header_add_after(imageheader, "NAXIS",  "NAXIS1", val, "image width", NULL);
+                sprintf(val, "%i", axy->H);
+                qfits_header_add_after(imageheader, "NAXIS1", "NAXIS2", val, "image height", NULL);
+                //fits_header_add_int(imageheader, "NAXIS1", axy->W, NULL);
+                //fits_header_add_int(imageheader, "NAXIS2", axy->H, NULL);
+                logverb("Using NAXIS 1,2 = %i,%i\n", axy->W, axy->H);
+            }
+
+            if (scamp_write_field(imageheader, &wcs, xy, sf->scampfn)) {
+                ERROR("Failed to write SCAMP catalog");
+                exit(-1);
+            }
+            if (imageheader)
+                qfits_header_destroy(imageheader);
         }
 
-        if (scamp_write_field(imageheader, &wcs, xy, sf->scampfn)) {
-            ERROR("Failed to write SCAMP catalog");
-            exit(-1);
+        if (file_exists(axy->corrfn)) {
+            const int MAX_DISTRACTORS_TO_MENTION = 5;
+
+            fitstable_t *const corrtab = fitstable_open(axy->corrfn);
+            const int corrnrows = fitstable_nrows(corrtab);
+            const int *const corrfieldids = fitstable_read_column(corrtab, "field_id", TFITS_BIN_TYPE_J);
+            fitstable_close(corrtab);
+
+            anwcs_t *const anwcs = anwcs_open(axy->wcsfn, 0);
+
+            // TODO: Use type that corresponds to FITS type (double is variably sized)
+            double xycoords[2];
+            printf("The %d brightest distractors are at (RA, DEC):\n", MAX_DISTRACTORS_TO_MENTION);
+            for (int xyrow=0, corrindex = 0, distractorsFound = 0;
+                distractorsFound < MAX_DISTRACTORS_TO_MENTION && corrindex < corrnrows;
+                xyrow++
+            ) {
+                if (corrfieldids[corrindex] == xyrow) {
+                    corrindex++;
+                    continue;
+                }
+                starxy_get(xy, xyrow, xycoords);
+                anwcs_pixelxy2radec(anwcs, xycoords[0], xycoords[1], &xycoords[0], &xycoords[1]);
+                printf("  %f, %f\n", xycoords[0], xycoords[1]);
+                distractorsFound++;
+            }
+            anwcs_free(anwcs);
         }
+
         starxy_free(xy);
-        if (imageheader)
-            qfits_header_destroy(imageheader);
     }
 
     if (sf->scampconfigfn) {
@@ -707,50 +742,6 @@ static void after_solved(augment_xylist_t* axy,
             ERROR("Failed to write SCAMP config file snippet to %s", sf->scampconfigfn);
             exit(-1);
         }
-    }
-
-    if (file_exists(axy->corrfn) && file_exists(axy->axyfn)) {
-        #define MAX_DISTRACTORS_TO_MENTION 5
-
-        xylist_t* xyls = xylist_open(axy->axyfn);
-        xylist_set_include_background(xyls, FALSE);
-        xylist_set_include_flux(xyls, FALSE);
-        // All detected object positions
-        starxy_t* xy = xylist_read_field(xyls, NULL);
-        xylist_close(xyls);
-
-        xylist_t* corrxyls = xylist_open(axy->corrfn);
-        xylist_set_include_background(corrxyls, FALSE);
-        xylist_set_include_flux(corrxyls, FALSE);
-        corrxyls->xname = "field_x";
-        corrxyls->yname = "field_y";
-        // Positions of all objects that could be mapped to objects in index
-        starxy_t* corrxy = xylist_read_field(corrxyls, NULL);
-        xylist_close(corrxyls);
-
-        // TODO: FIxed length types
-        double xycoords[2] = {0, 0};
-        double nextcorrcoords[2] = {0, 0};
-        printf("The %d brightest distractors (X, Y) are:\n", MAX_DISTRACTORS_TO_MENTION);
-        int unrecognizedObjsFound = 0;
-        for (int xyrow=0, nextcorrrow=0; nextcorrrow < corrxy->N; xyrow++) {
-            if (memcmp(xycoords, nextcorrcoords, 2*sizeof(double))) {
-                if (unrecognizedObjsFound<MAX_DISTRACTORS_TO_MENTION)
-                    printf("  %f, %f\n", xycoords[0], xycoords[1]);
-                unrecognizedObjsFound++;
-            } else {
-                starxy_get(corrxy, nextcorrrow, nextcorrcoords);
-                nextcorrrow++;
-            }
-
-            // Advance xy
-            starxy_get(xy, xyrow, xycoords);
-        }
-        starxy_free(xy);
-        printf("%d sources in total\n", xy->N);
-        printf("%d correspondences\n", corrxy->N);
-        printf("%d unrecognized objects\n", xy->N - corrxy->N);
-        printf("%d unrecognized objects brighter than the dimmest correspondence\n", unrecognizedObjsFound);
     }
 }
 
