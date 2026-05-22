@@ -6,6 +6,31 @@ if [ $# -lt 5 ]; then
   exit
 fi
 
+# Returns value of NDISTRACT field in .match file
+ndistract () {
+  tmpmatchfn="$1.match.tmp"
+
+  subtable -i "$1.match" -c "NDISTRACT" -o "$tmpmatchfn" 1>/dev/null
+  tablist -r "$tmpmatchfn" | xargs
+  rm "$tmpmatchfn"
+}
+
+# Outputs the number of unrecognized objects
+# that are brighter than the dimmest correspondence.
+# This is not always equal to NDISTRACT.
+bright_unrecognized() {
+  tmpcorrfn="$1.corr.tmp"
+
+  subtable -i "$1.corr" -c "field_id" -o "$tmpcorrfn" 1>/dev/null
+  corr_field_ids=$(tablist -r "$tmpcorrfn")
+  rm "$tmpcorrfn"
+
+  lastid="$(echo "$corr_field_ids" | tail -n 1 | xargs)"
+  corr_field_n="$(echo "$corr_field_ids" | wc -l)"
+  expected_n=$((lastid+1))
+  echo $((expected_n - corr_field_n))
+}
+
 statsfile="$7"
 if [ -e "$statsfile" ]; then
   echo "$statsfile already exists."
@@ -39,7 +64,6 @@ find "$1" -mindepth 1 -maxdepth 1 -type f -name "$2" | while read -r file; do
   t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
   td=$(((t1 - t0) / 1000))
 
-  # All of these rely on the console output of solve-field and are thus incredibly fragile, but they work for now.
   numsources="$(echo "$output" | grep "simplexy: found .* sources" | cut -d " " -f3)"
 
   # Write data
@@ -50,8 +74,9 @@ find "$1" -mindepth 1 -maxdepth 1 -type f -name "$2" | while read -r file; do
     echo "Solved $file in $td ms."
     solved=$((solved+1))
     timetaken=$((timetaken + td))
-    numcorrs="$(echo "$output" | grep "correspondences" | cut -d " " -f1)"
-    numbrightdistractors="$(echo "$output" | grep "brighter" | cut -d " " -f1)"
+    numcorrs="$(listhead "$noext.corr" | grep "NAXIS2" | xargs | cut -d " " -f3)"
+    numbrightunrecognized="$(bright_unrecognized "$noext")"
+    ndistract=$(ndistract "$noext")
     pxscale="$(echo "$output" | grep "pixel scale" | cut -d " " -f8)"
     {
       printf "\n      \"file\": \"%s\"," "$(basename "$file")"
@@ -60,7 +85,8 @@ find "$1" -mindepth 1 -maxdepth 1 -type f -name "$2" | while read -r file; do
       printf "\n      \"arcsec/px\": %s," "$pxscale"
       printf "\n      \"nsrc\": %s," "$numsources"
       printf "\n      \"ncorr\": %s," "$numcorrs"
-      printf "\n      \"nbrighter\": %s" "$numbrightdistractors"
+      printf "\n      \"ndistract\": %s," "$ndistract"
+      printf "\n      \"nbrighter\": %s" "$numbrightunrecognized"
     } >> "$statsfile"
   else
     echo "Could not solve $file."
