@@ -715,7 +715,8 @@ static void after_solved(augment_xylist_t* axy,
 
             anwcs_t *const anwcs = anwcs_open(axy->wcsfn, 0);
 
-            // TODO: Use type that corresponds to FITS type (double is variably sized)
+            // Using doubles is fine here despite them being variably sized,
+            // since starxy_t itself is using doubles
             double xycoords[2];
             printf("The %d brightest distractors are at (RA, DEC):\n", MAX_DISTRACTORS_TO_MENTION);
             for (int xyrow=0, corrindex = 0, distractorsFound = 0;
