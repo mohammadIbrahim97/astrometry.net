@@ -20,7 +20,6 @@
 #include <errors.h>
 #include <getopt.h>
 #include <assert.h>
-#include <sys/time.h>
 
 #include "boilerplate.h"
 #include "an-bool.h"
