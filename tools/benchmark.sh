@@ -54,7 +54,7 @@ printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n 
   "$downsample" "$scalelow" "$scalehigh" "$cpulimit" >> "$statsfile"
 printf ",\n  \"images\": [" >> "$statsfile"
 
-find "$1" -mindepth 1 -maxdepth 1 -type f -name "$2" | while read -r file; do
+find "$1" -mindepth 1 -maxdepth 1 -type f -name "$2" | sort | while read -r file; do
   echo "Solving $file..."
 
   # Gather data
