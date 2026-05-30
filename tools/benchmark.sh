@@ -79,6 +79,9 @@ while getopts "i:n:o:l:h:c:d:r:e:" opt; do
       if ! [[ "$OPTARG" =~ $intreg ]] ; then
         echo "ERROR: Amount of repeats (-r) needs to be an integer."; printhelp
       fi
+      if [ "$OPTARG" -lt 1 ]; then
+        echo "ERROR: Amount of repeats (-r) needs to be at least 1."; printhelp
+      fi
       repeats="$OPTARG"
       ;;
     e)
@@ -165,62 +168,112 @@ printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n 
 printf ",\n  \"images\": [" >> "$outfile"
 
 inputfiles=$(find "$indir" -mindepth 1 -maxdepth 1 -type f -name "$namescheme" | sort)
+
+# Each array's nth element corresponds to the nth input file.
+# Of these arrays, only timesSolvedAr and totalTimeAr have their values modified each run;
+# The others, like nsrc, are only written to once.
+timesSolvedAr=()
+totalTimeAr=()
+declare -A cmdResultsAr # [file, cmd]
+nsrcAr=()
+ncorrAr=()
+nbrighterAr=()
+ndistractAr=()
+scaleAr=()
+
+# Get data
+for runind in $(seq "$repeats"); do
+  echo "Starting iteration $runind."
+  fileind=0
+  while read -r file; do
+    echo "Solving $file..."
+
+    # Execute all commands from -e
+    if [ $runind -eq 1 ]; then
+      for i in $(seq 0 $((execind-1))); do
+        cmdout="$(${cmds[i]} "$file")"
+        cmdResultsAr[$fileind, $i]="$cmdout"
+      done
+    fi
+
+    t0=$( echo $EPOCHREALTIME | tr -dc "0-9")
+    output="$(solve-field --overwrite --no-plots --downsample "$downsample"\
+    --scale-units arcsecperpix --scale-low "$scalelow" --scale-high "$scalehigh" --cpulimit "$cpulimit" "$file" 2>/dev/null)"
+    t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
+    td=$((t1-t0))
+
+    noext="${file%.*}"
+    if [ $runind -eq 1 ]; then
+      nsrcAr[fileind]="$(listhead "$noext.axy" | grep "NAXIS2" | xargs | cut -d " " -f3)"
+    fi
+
+    if [ -f "$noext.solved" ]; then
+      echo "Solved $file in $((td / 1000))ms."
+      if [ -z "${timesSolvedAr[fileind]}" ]; then
+        timesSolvedAr[fileind]=1
+        totalTimeAr[fileind]=$td
+        ncorrAr[fileind]="$(listhead "$noext.corr" | grep "NAXIS2" | xargs | cut -d " " -f3)"
+        nbrighterAr[fileind]="$(bright_unrecognized "$noext")"
+        ndistractAr[fileind]=$(ndistract "$noext")
+        scaleAr[fileind]="$(listhead "$noext.wcs" | grep "COMMENT scale: .* arcsec/pix" | cut -d " " -f3)"
+      else
+        timesSolvedAr[fileind]=$((timesSolvedAr[fileind] + 1))
+        totalTimeAr[fileind]=$((totalTimeAr[fileind] + td))
+      fi
+    else
+      echo "Could not solve $file."
+    fi
+
+    echo "Cleaning up..."
+    $cleanscript "$indir" "$(basename "$noext")" 1>/dev/null
+
+    fileind=$((fileind+1))
+  done <<< "$inputfiles"
+done
+
+echo "Comparing and writing results to $outfile..."
+
+totalTotalTime=0
+totalTimesSolved=0
+
+fileind=0
 while read -r file; do
-  echo "Solving $file..."
 
-  printf "\n    {" >> "$outfile"
+  {
+    printf "\n    {"
+    printf "\n      \"file\": \"%s\"," "$(basename "$file")"
+    printf "\n      \"nsrc\": %s," "${nsrcAr[fileind]}"
+  } >> "$outfile"
 
-  # Execute all commands from -e
+  # Write command data from -e
   for i in $(seq 0 $((execind-1))); do
-    execout="$(${cmds[i]} "$file")"
-    printf "\n      \"%s\": \"%s\"," "${fieldnames[i]}" "$execout" >> "$outfile"
+    printf "\n      \"%s\": \"%s\"," "${fieldnames[i]}" "${cmdResultsAr[$fileind, $i]}" >> "$outfile"
   done
 
-  # Gather data
-  t0=$( echo $EPOCHREALTIME | tr -dc "0-9")
-  output="$(solve-field --overwrite --no-plots --downsample "$downsample"\
-  --scale-units arcsecperpix --scale-low "$scalelow" --scale-high "$scalehigh" --cpulimit "$cpulimit" "$file" 2>/dev/null)"
-  t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
-  td=$(((t1 - t0) / 1000))
-
-  noext="${file%.*}"
-  numsources="$(listhead "$noext.axy" | grep "NAXIS2" | xargs | cut -d " " -f3)"
-
-  if [ -f "$noext.solved" ]; then
-    echo "Solved $file in $td ms."
-    solved=$((solved+1))
-    timetaken=$((timetaken + td))
-    numcorrs="$(listhead "$noext.corr" | grep "NAXIS2" | xargs | cut -d " " -f3)"
-    numbrightunrecognized="$(bright_unrecognized "$noext")"
-    ndistract=$(ndistract "$noext")
-    pxscale="$(listhead "$noext.wcs" | grep "COMMENT scale: .* arcsec/pix" | cut -d " " -f3)"
+  if [ -n "${timesSolvedAr[fileind]}" ]; then
+    timesSolved="${timesSolvedAr[fileind]}"
+    totalTimesSolved=$((totalTimesSolved+timesSolved))
+    totalTime="${totalTimeAr[fileind]}"
+    totalTotalTime=$((totalTotalTime+totalTime))
     {
-      printf "\n      \"file\": \"%s\"," "$(basename "$file")"
-      printf "\n      \"solved\": true,"
-      printf "\n      \"time\": %s," $td
-      printf "\n      \"arcsec/px\": %s," "$pxscale"
-      printf "\n      \"nsrc\": %s," "$numsources"
-      printf "\n      \"ncorr\": %s," "$numcorrs"
-      printf "\n      \"ndistract\": %s," "$ndistract"
-      printf "\n      \"nbrighter\": %s" "$numbrightunrecognized"
+      printf "\n      \"solved\": %s," "$timesSolved"
+      printf "\n      \"time\": %s," "$((totalTime / timesSolved / 1000))"
+      printf "\n      \"ncorr\": %s," "${ncorrAr[fileind]}"
+      printf "\n      \"nbrighter\": %s," "${nbrighterAr[fileind]}"
+      printf "\n      \"ndistract\": %s," "${ndistractAr[fileind]}"
+      printf "\n      \"arcsec/px\": %s" "${scaleAr[fileind]}"
     } >> "$outfile"
   else
-    echo "Could not solve $file."
-    notsolved=$((notsolved+1))
-    {
-      printf "\n      \"file\": \"%s\"," "$(basename "$file")"
-      printf "\n      \"solved\": false,"
-      printf "\n      \"nsrc\": %s" "$numsources"
-    } >> "$outfile"
+    printf "\n      \"solved\": 0" >> "$outfile"
   fi
 
   printf "\n    }," >> "$outfile"
 
-  echo "Cleaning up..."
-  $cleanscript "$indir" "$(basename "$noext")" 1>/dev/null
-
+  fileind=$((fileind+1))
 done <<< "$inputfiles"
 
 truncate -s-1 "$outfile" # Remove the last , in the array
 printf "\n  ],\n  \"solved\": %s,\n  \"avgtime\": %s,\n  \"notsolved\": %s\n}\n"\
-  "$solved" "$((timetaken / solved))" "$notsolved" >> "$outfile"
+  "$totalTimesSolved" "$((totalTotalTime / totalTimesSolved / 1000))" "$((fileind * repeats - totalTimesSolved))" >> "$outfile"
+
+echo "Done."
