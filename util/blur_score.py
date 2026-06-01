@@ -12,6 +12,7 @@ not affect the score: the metric is local to detected stars, so a
 single bright trail on an otherwise sharp frame still scores high.
 """
 import os
+import shutil
 import subprocess
 import tempfile
 import warnings
@@ -28,6 +29,10 @@ FWHM_RANGE = (1.0, 30.0)
 SOURCE_EXTRACTOR = "source-extractor"
 FILTER_NAME = "/usr/share/source-extractor/gauss_3.0_5x5.conv"
 FITS_EXTS = (".fits", ".fit", ".fts")
+BACKEND_SOURCE_EXTRACTOR = "source-extractor"
+BACKEND_SIMPLEXY = "simplexy"
+BACKEND_SEP = "sep"
+SOURCE_BACKENDS = (BACKEND_SOURCE_EXTRACTOR, BACKEND_SIMPLEXY, BACKEND_SEP)
 
 
 class InsufficientSources(RuntimeError):
@@ -57,18 +62,99 @@ def to_grayscale(image):
 
 def _ensure_fits(image, workdir):
     if isinstance(image, str) and os.path.splitext(image)[1].lower() in FITS_EXTS:
-        return image
+        return os.path.abspath(image)
     from astropy.io import fits
     out = os.path.join(workdir, "in.fits")
     fits.PrimaryHDU(to_grayscale(image)).writeto(out, overwrite=True)
     return out
 
 
+def _image2xy_executable(image2xy_path=None):
+    if image2xy_path:
+        if os.path.sep in image2xy_path or (os.path.altsep and os.path.altsep in image2xy_path):
+            return os.path.abspath(image2xy_path)
+        return shutil.which(image2xy_path) or image2xy_path
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    candidate = os.path.join(repo_root, "solver", "image2xy")
+    if os.path.exists(candidate):
+        return candidate
+    found = shutil.which("image2xy")
+    if found:
+        return found
+    raise FileNotFoundError("image2xy executable not found; build solver/image2xy first")
+
+
+def _read_xyls_sources(cat_file):
+    from astropy.io import fits
+    fwhm_parts = []
+    ecc_parts = []
+    flux_parts = []
+
+    with fits.open(cat_file) as hdul:
+        for hdu in hdul[1:]:
+            data = hdu.data
+            if data is None or len(data) == 0:
+                continue
+            names = set(data.names or [])
+            if not {"FWHM_IMAGE", "ELLIPTICITY", "FLUX"}.issubset(names):
+                continue
+            fwhm_parts.append(np.asarray(data["FWHM_IMAGE"], dtype=np.float64))
+            ecc_parts.append(np.asarray(data["ELLIPTICITY"], dtype=np.float64))
+            flux_parts.append(np.asarray(data["FLUX"], dtype=np.float64))
+
+    if not fwhm_parts:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty, empty
+    return np.concatenate(fwhm_parts), np.concatenate(ecc_parts), np.concatenate(flux_parts)
+
+
+def _detect_sources_image2xy(image, backend,
+                             detect_thresh=DETECT_THRESH,
+                             downsample=0,
+                             downsample_as_required=3,
+                             image2xy_path=None):
+    with tempfile.TemporaryDirectory() as td:
+        fits_path = _ensure_fits(image, td)
+        cat_file = os.path.join(td, "image2xy.xyls")
+        cmd = [
+            _image2xy_executable(image2xy_path),
+            "--source-backend", backend,
+            "-O",
+            "-o", cat_file,
+            "-p", str(detect_thresh),
+        ]
+        if downsample:
+            cmd.extend(["-d", str(downsample)])
+        if downsample_as_required:
+            cmd.extend(["-D", str(downsample_as_required)])
+        cmd.append(fits_path)
+        subprocess.run(cmd, check=True, capture_output=True, cwd=td)
+        fwhm, ecc, flux = _read_xyls_sources(cat_file)
+
+    keep = (
+        np.isfinite(fwhm) & np.isfinite(ecc) & np.isfinite(flux) &
+        (fwhm > FWHM_RANGE[0]) & (fwhm < FWHM_RANGE[1])
+    )
+    return fwhm[keep], ecc[keep], flux[keep]
+
+
 def detect_sources(image,
                    detect_thresh=DETECT_THRESH,
-                   detect_minarea=DETECT_MINAREA):
+                   detect_minarea=DETECT_MINAREA,
+                   backend=BACKEND_SOURCE_EXTRACTOR,
+                   **kwargs):
     """Return (fwhm, ellipticity, flux) arrays for FLAGS==0 sources whose
     FWHM falls inside FWHM_RANGE."""
+    if backend not in SOURCE_BACKENDS:
+        raise ValueError(f"Unknown source extraction backend: {backend}")
+    if backend in (BACKEND_SIMPLEXY, BACKEND_SEP):
+        return _detect_sources_image2xy(
+            image,
+            backend,
+            detect_thresh=detect_thresh,
+            **kwargs
+        )
+
     with tempfile.TemporaryDirectory() as td:
         fits_path = _ensure_fits(image, td)
         param_file = os.path.join(td, "sex.param")
@@ -145,13 +231,18 @@ def _main(argv=None):
         description="Astro blur score (1 = sharp, 0 = blurred) via stellar PSF.",
     )
     p.add_argument("image")
+    p.add_argument("--backend", choices=SOURCE_BACKENDS, default=BACKEND_SOURCE_EXTRACTOR)
+    p.add_argument("--image2xy-path",
+                   help="Path to image2xy for simplexy/sep backends.")
     p.add_argument("--target-fwhm", type=float, default=DEFAULT_TARGET_FWHM)
     p.add_argument("--detect-thresh", type=float, default=DETECT_THRESH)
     p.add_argument("--raw", action="store_true",
                    help="Print 'fwhm=... ellipticity=... n_sources=...' instead of the score.")
     args = p.parse_args(argv)
     try:
-        f, e, n = measure_psf(args.image, detect_thresh=args.detect_thresh)
+        f, e, n = measure_psf(args.image, detect_thresh=args.detect_thresh,
+                              backend=args.backend,
+                              image2xy_path=args.image2xy_path)
     except InsufficientSources as ex:
         print(f"insufficient_sources: {ex}", file=sys.stderr)
         return 2

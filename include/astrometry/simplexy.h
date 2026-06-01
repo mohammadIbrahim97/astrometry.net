@@ -64,6 +64,9 @@ struct simplexy_t {
     float *y;
     float *flux;
     float *background;
+    // Moment-based source shape estimates, one per detected peak.
+    float *fwhm;
+    float *ellipticity;
     int npeaks;
 
     // Lanczos-interpolated flux and backgrounds;
