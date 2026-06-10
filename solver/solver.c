@@ -380,6 +380,7 @@ void solver_reset_counters(solver_t* s) {
     s->num_radec_skipped = 0;
     s->num_abscale_skipped = 0;
     s->num_verified = 0;
+    s->verify_timeused = 0.0;
 }
 
 double solver_field_width(const solver_t* s) {
@@ -1383,6 +1384,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
     double match_distance_in_pixels2;
     anbool solved;
     double logaccept;
+    double verify_t0;
 
     mo->indexid = sp->index->indexid;
     mo->healpix = sp->index->healpix;
@@ -1396,12 +1398,14 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
 
     logaccept = MIN(sp->logratio_tokeep, sp->logratio_totune);
 
+    verify_t0 = timenow();
     verify_hit(sp->index->starkd, sp->index->cutnside,
                mo, verifysip, sp->vf, match_distance_in_pixels2,
                sp->distractor_ratio, sp->field_maxx, sp->field_maxy,
                sp->logratio_bail_threshold, logaccept,
                sp->logratio_stoplooking,
                sp->distance_from_quad_bonus, fake_match);
+    sp->verify_timeused += timenow() - verify_t0;
     mo->nverified = sp->num_verified++;
 
     if (mo->logodds >= sp->best_logodds) {
@@ -1420,6 +1424,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
         // Since we tuned up this solution, we can't just accept the
         // resulting log-odds at face value.
         if (!fake_match) {
+            verify_t0 = timenow();
             verify_hit(sp->index->starkd, sp->index->cutnside,
                        mo, mo->sip, sp->vf, match_distance_in_pixels2,
                        sp->distractor_ratio,
@@ -1429,6 +1434,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                        sp->logratio_stoplooking,
                        sp->distance_from_quad_bonus,
                        fake_match);
+            sp->verify_timeused += timenow() - verify_t0;
             logverb("Checking tuned result: logodds = %g (%g)\n",
                     mo->logodds, exp(mo->logodds));
         }
