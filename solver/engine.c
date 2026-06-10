@@ -43,6 +43,32 @@
 #include "multiindex.h"
 #include "indexset.h"
 
+static anbool index_shard_trace_enabled(void) {
+    const char* env = getenv("ASTROMETRY_INDEX_SHARD_TRACE");
+    if (!env || !env[0])
+        return FALSE;
+    if (!strcmp(env, "0") || strcaseeq(env, "false") ||
+        strcaseeq(env, "no") || strcaseeq(env, "off"))
+        return FALSE;
+    return TRUE;
+}
+
+static const char* index_shard_string_or_null(const char* str) {
+    return str ? str : "(null)";
+}
+
+static void index_shard_log_index(const char* prefix, int order, anbool selected,
+                                  const char* selection, index_t* index) {
+    logmsg("[index-shard] %s order=%i selected=%i selection=%s index=%s file=%s "
+           "id=%i scale=[%g,%g] healpix=%i hpnside=%i sky=%s\n",
+           prefix, order, selected ? 1 : 0, selection,
+           index_shard_string_or_null(index->indexname),
+           index_shard_string_or_null(index->indexfn),
+           index->indexid, index->index_scale_lower,
+           index->index_scale_upper, index->healpix, index->hpnside,
+           (index->healpix < 0) ? "allsky" : "healpix");
+}
+
 void engine_add_search_path(engine_t* engine, const char* path) {
     sl_append(engine->index_paths, path);
 }
@@ -520,6 +546,9 @@ int engine_run_job(engine_t* engine, job_t* job) {
             double app_max, app_min;
             int k;
             il* indexlist;
+            il* selected_indices;
+            int fallback_selection = 0;
+            anbool trace_index_shards = index_shard_trace_enabled();
 
             // arcsec per pixel range
             app_min = dl_get(job->scales, j * 2);
@@ -560,14 +589,17 @@ int engine_run_job(engine_t* engine, job_t* job) {
                 il* list = NULL;
                 if (fmin > engine->sizebiggest) {
                     list = engine->ibiggest;
+                    fallback_selection = 1;
                 } else if (fmax < engine->sizesmallest) {
                     list = engine->ismallest;
+                    fallback_selection = -1;
                 } else {
                     assert(0);
                 }
                 il_append_list(indexlist, list);
             }
 
+            selected_indices = il_new(16);
             for (k=0; k<il_size(indexlist); k++) {
                 int ii = il_get(indexlist, k);
                 index_t* index = pl_get(engine->indexes, ii);
@@ -577,11 +609,54 @@ int engine_run_job(engine_t* engine, job_t* job) {
                 if (!inrange) {
                     logverb("Not using index %s because it's not within %g degrees of (RA,Dec) = (%g,%g)\n",
                             index->indexname, job->search_radius, job->ra_center, job->dec_center);
+                    if (trace_index_shards)
+                        index_shard_log_index("rejected", k, FALSE, "radec", index);
                     continue;
                 }
+                il_append(selected_indices, ii);
+            }
+
+            if (trace_index_shards) {
+                const char* scale_selection = "scale";
+                char selection[64];
+                if (fallback_selection > 0)
+                    scale_selection = "fallback-largest";
+                else if (fallback_selection < 0)
+                    scale_selection = "fallback-smallest";
+                if (job->use_radec_center)
+                    snprintf(selection, sizeof(selection), "%s+radec", scale_selection);
+                else
+                    snprintf(selection, sizeof(selection), "%s", scale_selection);
+                if (job->use_radec_center) {
+                    logmsg("[index-shard] job=%s candidates=%zu depth=[%i,%i] "
+                           "quad_scale=[%g,%g] arcsec_per_pix=[%g,%g] "
+                           "radec=[%g,%g,%g] selection=%s\n",
+                           index_shard_string_or_null(bp->fieldfname),
+                           il_size(selected_indices), startobj, endobj,
+                           fmin, fmax, app_min, app_max,
+                           job->ra_center, job->dec_center,
+                           job->search_radius, selection);
+                } else {
+                    logmsg("[index-shard] job=%s candidates=%zu depth=[%i,%i] "
+                           "quad_scale=[%g,%g] arcsec_per_pix=[%g,%g] "
+                           "radec=off selection=%s\n",
+                           index_shard_string_or_null(bp->fieldfname),
+                           il_size(selected_indices), startobj, endobj,
+                           fmin, fmax, app_min, app_max, selection);
+                }
+                for (k=0; k<il_size(selected_indices); k++) {
+                    int ii = il_get(selected_indices, k);
+                    index_t* index = pl_get(engine->indexes, ii);
+                    index_shard_log_index("candidate", k, TRUE, selection, index);
+                }
+            }
+
+            for (k=0; k<il_size(selected_indices); k++) {
+                int ii = il_get(selected_indices, k);
                 add_index_to_onefield(engine, bp, ii);
             }
 
+            il_free(selected_indices);
             il_free(indexlist);
 
             logverb("Running solver:\n");
@@ -1154,4 +1229,3 @@ int job_set_output_base_dir(job_t* job, const char* dir) {
     }
     return 0;
 }
-

@@ -99,3 +99,14 @@ report.txt
 .DS_Store
 .idea/
 .idea/
+
+# Generated solve-field/evaluation artifacts. Keep result summaries and code
+# such as .csv, .md, and .py files visible to Git.
+*.axy
+*.corr
+*.match
+*.new
+*.rdls
+*.solved
+*.wcs
+*.xyls

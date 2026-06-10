@@ -13,13 +13,19 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <libgen.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 #include <math.h>
 #include <assert.h>
+#include <limits.h>
 
 #include "os-features.h"
 #include "onefield.h"
@@ -43,18 +49,377 @@
 #include "scamp-catalog.h"
 #include "permutedsort.h"
 #include "bl-sort.h"
+#include "keywords.h"
+
+typedef enum index_shard_mode {
+    INDEX_SHARD_OFF = 0,
+    INDEX_SHARD_SERIAL_COMPAT = 1,
+    INDEX_SHARD_SERIAL_REDUCE = 2,
+    INDEX_SHARD_THREADS = 3
+} index_shard_mode_t;
+
+typedef struct onefield_index_shard {
+    int shard_id;
+    int index_start;
+    int index_end;
+    index_t* index;
+    double load_ms;
+} onefield_index_shard_t;
+
+typedef struct onefield_shard_result {
+    bl* solutions;
+    int nsolves_sofar;
+    anbool solved;
+    anbool have_best_match;
+    MatchObj best_match;
+    double best_logodds;
+    index_t* best_index;
+    int status;
+} onefield_shard_result_t;
+
+typedef struct onefield_index_metric {
+    int fieldnum;
+    int shard_id;
+    size_t index_order;
+    const char* index_name;
+    int index_id;
+    int healpix;
+    double scale_lower;
+    double scale_upper;
+    double load_ms;
+    double solve_ms;
+    double verify_ms;
+    int numtries;
+    int nummatches;
+    int num_verified;
+    double best_logodds;
+    anbool solved;
+    const char* exit_reason;
+} onefield_index_metric_t;
+
+typedef struct onefield_solve_metric_context {
+    int shard_id;
+    size_t index_order;
+    index_t* index;
+    double load_ms;
+    anbool solved_before;
+} onefield_solve_metric_context_t;
+
+typedef struct onefield_shard_context onefield_shard_context_t;
+typedef struct onefield_thread_pool onefield_thread_pool_t;
 
 static anbool record_match_callback(MatchObj* mo, void* userdata);
+static anbool record_match_shard_callback(MatchObj* mo, void* userdata);
 static time_t timer_callback(void* user_data);
+static time_t timer_shard_callback(void* user_data);
 static void add_onefield_params(onefield_t* bp, qfits_header* hdr);
 static void load_and_parse_wcsfiles(onefield_t* bp);
 static void solve_fields(onefield_t* bp, sip_t* verify_wcs);
+static void solve_fields_with_solver(onefield_t* bp, solver_t* sp,
+                                     sip_t* verify_wcs,
+                                     void* callback_userdata);
+static void solve_fields_with_solver_and_metrics(
+    onefield_t* bp, solver_t* sp, sip_t* verify_wcs,
+    void* callback_userdata, onefield_solve_metric_context_t* metric_ctx);
+static int make_one_index_shards(onefield_t* bp,
+                                 onefield_index_shard_t** out_shards);
+static int prepare_one_index_shards(onefield_t* bp,
+                                    onefield_index_shard_t* shards,
+                                    int Nshards);
+static void release_one_index_shards(onefield_t* bp,
+                                     onefield_index_shard_t* shards,
+                                     int Nshards);
+static int solver_init_shard_copy(solver_t* dst, const solver_t* src);
+static int onefield_shard_context_init(onefield_shard_context_t* ctx,
+                                       onefield_t* bp, solver_t* solver,
+                                       const onefield_index_shard_t* shard);
+static void onefield_shard_context_free(onefield_shard_context_t* ctx);
+static void onefield_shard_result_capture(onefield_shard_context_t* ctx);
+static void onefield_merge_shard_result(onefield_shard_context_t* ctx);
+static int onefield_run_index_shards_serial_compat(onefield_t* bp);
+static int onefield_run_index_shards_serial_reduce(onefield_t* bp);
+static int onefield_run_index_shards_threaded_reduce(onefield_t* bp,
+                                                     int workers);
+static int onefield_open_worker_xylist(onefield_t* bp);
+static void onefield_thread_pool_set_status(onefield_thread_pool_t* pool,
+                                            int status);
+static anbool onefield_index_loop_should_stop(onefield_t* bp);
+static void run_index_candidate(onefield_t* bp, solver_t* sp, size_t I,
+                                anbool trace_index_shards, int shard_id);
 static void remove_invalid_fields(il* fieldlist, int maxfield);
 static anbool is_field_solved(onefield_t* bp, int fieldnum);
 static int write_solutions(onefield_t* bp);
 static void solved_field(onefield_t* bp, int fieldnum);
+static void check_time_limits_for_solver(onefield_t* bp, solver_t* sp);
+static void matchobj_deep_copy_all(const MatchObj* mo, MatchObj* dest);
+static void onefield_write_index_metric(const onefield_index_metric_t* metric);
+static void onefield_write_index_metric_for_solver(onefield_t* bp,
+                                                   solver_t* sp,
+                                                   int shard_id,
+                                                   size_t index_order,
+                                                   index_t* index,
+                                                   double load_ms,
+                                                   double solve_ms,
+                                                   anbool solved,
+                                                   const char* exit_reason);
+static const char* onefield_index_exit_reason(onefield_t* bp, solver_t* sp);
+static void onefield_mark_reduced_solutions(onefield_t* bp);
+static void* onefield_index_shard_worker(void* arg);
 static int compare_matchobjs(const void* v1, const void* v2);
 static void remove_duplicate_solutions(onefield_t* bp);
+
+static anbool index_shard_trace_enabled(void) {
+    const char* env = getenv("ASTROMETRY_INDEX_SHARD_TRACE");
+    if (!env || !env[0])
+        return FALSE;
+    if (!strcmp(env, "0") || strcaseeq(env, "false") ||
+        strcaseeq(env, "no") || strcaseeq(env, "off"))
+        return FALSE;
+    return TRUE;
+}
+
+static const char* index_shard_string_or_null(const char* str) {
+    return str ? str : "(null)";
+}
+
+static const char* index_shard_mode_name(index_shard_mode_t mode) {
+    switch (mode) {
+    case INDEX_SHARD_OFF:
+        return "off";
+    case INDEX_SHARD_SERIAL_COMPAT:
+        return "serial-compat";
+    case INDEX_SHARD_SERIAL_REDUCE:
+        return "serial-reduce";
+    case INDEX_SHARD_THREADS:
+        return "threads";
+    }
+    return "unknown";
+}
+
+static index_shard_mode_t index_shard_mode_from_env(void) {
+    const char* env = getenv("ASTROMETRY_INDEX_SHARDS");
+    if (!env || !env[0])
+        return INDEX_SHARD_OFF;
+    if (!strcmp(env, "0") || strcaseeq(env, "false") ||
+        strcaseeq(env, "no") || strcaseeq(env, "off"))
+        return INDEX_SHARD_OFF;
+    if (strcaseeq(env, "serial-compat"))
+        return INDEX_SHARD_SERIAL_COMPAT;
+    if (strcaseeq(env, "serial-reduce"))
+        return INDEX_SHARD_SERIAL_REDUCE;
+    if (strcaseeq(env, "threads"))
+        return INDEX_SHARD_THREADS;
+    logerr("Unsupported ASTROMETRY_INDEX_SHARDS value \"%s\"; using off.\n", env);
+    return INDEX_SHARD_OFF;
+}
+
+static index_shard_mode_t get_index_shard_mode(onefield_t* bp) {
+    (void)bp;
+    return index_shard_mode_from_env();
+}
+
+static const char* index_shard_metrics_path(void) {
+    const char* env = getenv("ASTROMETRY_INDEX_SHARD_METRICS");
+    if (!env || !env[0])
+        return NULL;
+    if (!strcmp(env, "0") || strcaseeq(env, "false") ||
+        strcaseeq(env, "no") || strcaseeq(env, "off"))
+        return NULL;
+    return env;
+}
+
+static anbool index_shard_metrics_enabled(void) {
+    return index_shard_metrics_path() != NULL;
+}
+
+static int index_shard_workers_from_env(void) {
+    const char* env = getenv("ASTROMETRY_INDEX_SHARD_WORKERS");
+    char* end = NULL;
+    long workers;
+
+    if (!env || !env[0])
+        return 2;
+    errno = 0;
+    workers = strtol(env, &end, 10);
+    if (errno || (end == env) || (workers < 1)) {
+        logerr("Unsupported ASTROMETRY_INDEX_SHARD_WORKERS value \"%s\"; "
+               "using 1.\n", env);
+        return 1;
+    }
+    if (workers > INT_MAX)
+        return INT_MAX;
+    return (int)workers;
+}
+
+static const char* index_shard_metrics_run_id(void) {
+    static char run_id[64];
+    if (!run_id[0])
+        snprintf(run_id, sizeof(run_id), "%ld-%ld",
+                 (long)time(NULL), (long)getpid());
+    return run_id;
+}
+
+static int index_shard_metrics_lock(int fd, short type) {
+    struct flock lock;
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = type;
+    lock.l_whence = SEEK_SET;
+    while (fcntl(fd, F_SETLKW, &lock) == -1) {
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+    return 0;
+}
+
+static pthread_mutex_t index_shard_metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void index_shard_metrics_csv_string(FILE* fid, const char* str) {
+    const char* p;
+    fputc('"', fid);
+    if (str) {
+        for (p=str; *p; p++) {
+            if (*p == '"')
+                fputc('"', fid);
+            if ((*p == '\n') || (*p == '\r'))
+                fputc(' ', fid);
+            else
+                fputc(*p, fid);
+        }
+    }
+    fputc('"', fid);
+}
+
+static void onefield_write_index_metric(const onefield_index_metric_t* metric) {
+    static anbool warned = FALSE;
+    const char* path = index_shard_metrics_path();
+    struct stat st;
+    FILE* fid;
+    int fd;
+    anbool need_header = FALSE;
+
+    if (!path)
+        return;
+
+    pthread_mutex_lock(&index_shard_metrics_mutex);
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd == -1) {
+        if (!warned) {
+            SYSERROR("Failed to open index shard metrics file");
+            warned = TRUE;
+        }
+        pthread_mutex_unlock(&index_shard_metrics_mutex);
+        return;
+    }
+    if (index_shard_metrics_lock(fd, F_WRLCK)) {
+        if (!warned) {
+            SYSERROR("Failed to lock index shard metrics file");
+            warned = TRUE;
+        }
+        close(fd);
+        pthread_mutex_unlock(&index_shard_metrics_mutex);
+        return;
+    }
+    if (fstat(fd, &st) == 0)
+        need_header = (st.st_size == 0);
+
+    fid = fdopen(fd, "a");
+    if (!fid) {
+        if (!warned) {
+            SYSERROR("Failed to fdopen index shard metrics file");
+            warned = TRUE;
+        }
+        index_shard_metrics_lock(fd, F_UNLCK);
+        close(fd);
+        pthread_mutex_unlock(&index_shard_metrics_mutex);
+        return;
+    }
+
+    if (need_header) {
+        fprintf(fid, "run_id,fieldnum,shard_id,index_order,index_name,"
+                "index_id,healpix,scale_lower,scale_upper,load_ms,solve_ms,"
+                "verify_ms,numtries,nummatches,num_verified,best_logodds,"
+                "solved,exit_reason\n");
+    }
+
+    index_shard_metrics_csv_string(fid, index_shard_metrics_run_id());
+    fprintf(fid, ",%i,%i,%zu,", metric->fieldnum, metric->shard_id,
+            metric->index_order);
+    index_shard_metrics_csv_string(fid, metric->index_name);
+    fprintf(fid, ",%i,%i,%.17g,%.17g,%.3f,%.3f,%.3f,%i,%i,%i,%.17g,%i,",
+            metric->index_id, metric->healpix,
+            metric->scale_lower, metric->scale_upper,
+            metric->load_ms, metric->solve_ms, metric->verify_ms,
+            metric->numtries, metric->nummatches, metric->num_verified,
+            metric->best_logodds, metric->solved ? 1 : 0);
+    index_shard_metrics_csv_string(fid, metric->exit_reason);
+    fprintf(fid, "\n");
+
+    fflush(fid);
+    index_shard_metrics_lock(fd, F_UNLCK);
+    fclose(fid);
+    pthread_mutex_unlock(&index_shard_metrics_mutex);
+}
+
+static const char* onefield_index_exit_reason(onefield_t* bp, solver_t* sp) {
+    if (bp->cancelled)
+        return "cancelled";
+    if (bp->hit_total_timelimit)
+        return "total_timelimit";
+    if (bp->hit_total_cpulimit)
+        return "total_cpulimit";
+    if (bp->hit_timelimit)
+        return "timelimit";
+    if (bp->hit_cpulimit)
+        return "cpulimit";
+    if (sp && sp->best_match_solves)
+        return "solved";
+    if (bp->single_field_solved)
+        return "solved";
+    if (sp && sp->maxquads && (sp->numtries >= sp->maxquads))
+        return "maxquads";
+    if (sp && sp->maxmatches && (sp->nummatches >= sp->maxmatches))
+        return "maxmatches";
+    if (sp && sp->quit_now)
+        return "quit";
+    return "exhausted";
+}
+
+static void onefield_write_index_metric_for_solver(onefield_t* bp,
+                                                   solver_t* sp,
+                                                   int shard_id,
+                                                   size_t index_order,
+                                                   index_t* index,
+                                                   double load_ms,
+                                                   double solve_ms,
+                                                   anbool solved,
+                                                   const char* exit_reason) {
+    onefield_index_metric_t metric;
+
+    if (!index_shard_metrics_enabled())
+        return;
+
+    memset(&metric, 0, sizeof(metric));
+    metric.fieldnum = bp->fieldnum;
+    metric.shard_id = shard_id;
+    metric.index_order = index_order;
+    metric.index_name = index && index->indexname ? index->indexname : "(null)";
+    metric.index_id = index ? index->indexid : -1;
+    metric.healpix = index ? index->healpix : -1;
+    metric.scale_lower = index ? index->index_scale_lower : 0.0;
+    metric.scale_upper = index ? index->index_scale_upper : 0.0;
+    metric.load_ms = load_ms;
+    metric.solve_ms = solve_ms;
+    metric.verify_ms = sp ? sp->verify_timeused * 1000.0 : 0.0;
+    metric.numtries = sp ? sp->numtries : 0;
+    metric.nummatches = sp ? sp->nummatches : 0;
+    metric.num_verified = sp ? sp->num_verified : 0;
+    metric.best_logodds = sp ? sp->best_logodds : 0.0;
+    metric.solved = solved;
+    metric.exit_reason = exit_reason ? exit_reason : "unknown";
+
+    onefield_write_index_metric(&metric);
+}
 
 // A tag-along column for index rdls / correspondence file.
 struct tagalong {
@@ -70,6 +435,33 @@ struct tagalong {
     int colnum;
 };
 typedef struct tagalong tagalong_t;
+
+typedef struct record_match_context {
+    onefield_t* bp;
+    solver_t* sp;
+    bl* solutions;
+    int* nsolves_sofar;
+} record_match_context_t;
+
+struct onefield_shard_context {
+    onefield_t* bp;
+    solver_t* solver;
+    onefield_index_shard_t shard;
+    onefield_shard_result_t result;
+    record_match_context_t callback_ctx;
+};
+
+struct onefield_thread_pool {
+    onefield_t* bp;
+    onefield_index_shard_t* shards;
+    onefield_shard_context_t* contexts;
+    int Nshards;
+    int next_shard;
+    anbool metrics;
+    anbool trace;
+    int status;
+    pthread_mutex_t lock;
+};
 
 static anbool grab_tagalong_data(startree_t* starkd, MatchObj* mo, onefield_t* bp,
                                  const int* starinds, int N) {
@@ -193,6 +585,736 @@ static size_t n_indexes(onefield_t* bp) {
     return sl_size(bp->indexnames) + pl_size(bp->indexes);
 }
 
+static int make_one_index_shards(onefield_t* bp,
+                                 onefield_index_shard_t** out_shards) {
+    onefield_index_shard_t* shards;
+    size_t Nindexes = n_indexes(bp);
+    int i;
+
+    *out_shards = NULL;
+    if (Nindexes > INT_MAX) {
+        ERROR("Too many candidate indexes for one-index shards: %zu", Nindexes);
+        return -1;
+    }
+    if (!Nindexes)
+        return 0;
+
+    shards = calloc(Nindexes, sizeof(onefield_index_shard_t));
+    if (!shards) {
+        SYSERROR("Failed to allocate index shards");
+        return -1;
+    }
+
+    for (i=0; i<(int)Nindexes; i++) {
+        shards[i].shard_id = i;
+        shards[i].index_start = i;
+        shards[i].index_end = i + 1;
+    }
+
+    *out_shards = shards;
+    return (int)Nindexes;
+}
+
+static int prepare_one_index_shards(onefield_t* bp,
+                                    onefield_index_shard_t* shards,
+                                    int Nshards) {
+    int s;
+    for (s=0; s<Nshards; s++) {
+        onefield_index_shard_t* shard = shards + s;
+        double load_t0 = timenow();
+        if (shard->index_start < 0 || shard->index_start >= (int)n_indexes(bp)) {
+            ERROR("Invalid shard index range [%i,%i)",
+                  shard->index_start, shard->index_end);
+            return -1;
+        }
+        shard->index = get_index(bp, shard->index_start);
+        shard->load_ms = 1000.0 * (timenow() - load_t0);
+    }
+    return 0;
+}
+
+static void release_one_index_shards(onefield_t* bp,
+                                     onefield_index_shard_t* shards,
+                                     int Nshards) {
+    int s;
+    for (s=0; s<Nshards; s++) {
+        onefield_index_shard_t* shard = shards + s;
+        if (!shard->index)
+            continue;
+        done_with_index(bp, shard->index_start, shard->index);
+        shard->index = NULL;
+    }
+}
+
+static int solver_init_shard_copy(solver_t* dst, const solver_t* src) {
+    solver_set_default_values(dst);
+
+    dst->pixel_xscale = src->pixel_xscale;
+    if (src->predistort) {
+        dst->predistort = sip_create();
+        if (!dst->predistort) {
+            SYSERROR("Failed to allocate shard predistortion");
+            solver_cleanup(dst);
+            return -1;
+        }
+        sip_copy(dst->predistort, src->predistort);
+    }
+
+    dst->funits_lower = src->funits_lower;
+    dst->funits_upper = src->funits_upper;
+    dst->logratio_toprint = src->logratio_toprint;
+    dst->logratio_tokeep = src->logratio_tokeep;
+    dst->logratio_totune = src->logratio_totune;
+    dst->distance_from_quad_bonus = src->distance_from_quad_bonus;
+    dst->verify_uniformize = src->verify_uniformize;
+    dst->verify_dedup = src->verify_dedup;
+    dst->do_tweak = src->do_tweak;
+    dst->tweak_aborder = src->tweak_aborder;
+    dst->tweak_abporder = src->tweak_abporder;
+
+    dst->verify_pix = src->verify_pix;
+    dst->distractor_ratio = src->distractor_ratio;
+    dst->codetol = src->codetol;
+    dst->quadsize_min = src->quadsize_min;
+    dst->quadsize_max = src->quadsize_max;
+    dst->startobj = src->startobj;
+    dst->endobj = src->endobj;
+    dst->parity = src->parity;
+    dst->use_radec = src->use_radec;
+    memcpy(dst->centerxyz, src->centerxyz, sizeof(dst->centerxyz));
+    dst->r2 = src->r2;
+    dst->logratio_bail_threshold = src->logratio_bail_threshold;
+    dst->logratio_stoplooking = src->logratio_stoplooking;
+    dst->maxquads = src->maxquads;
+    dst->maxmatches = src->maxmatches;
+    dst->set_crpix = src->set_crpix;
+    dst->set_crpix_center = src->set_crpix_center;
+    memcpy(dst->crpix, src->crpix, sizeof(dst->crpix));
+
+    dst->field_minx = src->field_minx;
+    dst->field_maxx = src->field_maxx;
+    dst->field_miny = src->field_miny;
+    dst->field_maxy = src->field_maxy;
+    dst->field_diag = src->field_diag;
+
+    return 0;
+}
+
+static void onefield_free_matchobj_list(bl* solutions) {
+    int i;
+    for (i=0; i<bl_size(solutions); i++) {
+        MatchObj* mo = bl_access(solutions, i);
+        verify_free_matchobj(mo);
+        onefield_free_matchobj(mo);
+    }
+    bl_remove_all(solutions);
+}
+
+static int onefield_shard_context_init(onefield_shard_context_t* ctx,
+                                       onefield_t* bp, solver_t* solver,
+                                       const onefield_index_shard_t* shard) {
+    memset(ctx, 0, sizeof(onefield_shard_context_t));
+    ctx->bp = bp;
+    ctx->solver = solver;
+    ctx->shard = *shard;
+    ctx->result.solutions = bl_new(16, sizeof(MatchObj));
+    if (!ctx->result.solutions)
+        return -1;
+    ctx->callback_ctx.bp = bp;
+    ctx->callback_ctx.sp = solver;
+    ctx->callback_ctx.solutions = ctx->result.solutions;
+    ctx->callback_ctx.nsolves_sofar = &(ctx->result.nsolves_sofar);
+    return 0;
+}
+
+static void onefield_shard_result_capture(onefield_shard_context_t* ctx) {
+    solver_t* sp = ctx->solver;
+    onefield_shard_result_t* result = &(ctx->result);
+    onefield_t* bp = ctx->bp;
+    double best_logodds = 0.0;
+    int max_solved_count = 0;
+    anbool solved = FALSE;
+    int best = -1;
+    int i;
+
+    if (result->have_best_match) {
+        verify_free_matchobj(&(result->best_match));
+        onefield_free_matchobj(&(result->best_match));
+        result->have_best_match = FALSE;
+    }
+
+    result->status = 0;
+
+    /*
+     * solve_fields_with_solver_and_metrics() cleans up field-local solver
+     * state before returning, so the shard's durable result is the local
+     * MatchObj list populated by the callback.
+     */
+    for (i=0; i<bl_size(result->solutions); i++) {
+        MatchObj* mo = bl_access(result->solutions, i);
+        if ((best < 0) || (mo->logodds > best_logodds)) {
+            best = i;
+            best_logodds = mo->logodds;
+        }
+        if (mo->logodds >= bp->logratio_tosolve) {
+            int field_solved_count = 0;
+            int j;
+            for (j=0; j<bl_size(result->solutions); j++) {
+                MatchObj* candidate = bl_access(result->solutions, j);
+                if (candidate->fieldnum != mo->fieldnum)
+                    continue;
+                if (candidate->logodds >= bp->logratio_tosolve)
+                    field_solved_count++;
+            }
+            if (field_solved_count > max_solved_count)
+                max_solved_count = field_solved_count;
+            if (field_solved_count >= bp->nsolves)
+                solved = TRUE;
+        }
+    }
+
+    result->nsolves_sofar = max_solved_count;
+    result->solved = solved;
+    result->best_logodds = best_logodds;
+    result->best_index = sp->best_index;
+    if (best >= 0) {
+        MatchObj* mo = bl_access(result->solutions, best);
+        matchobj_deep_copy_all(mo, &(result->best_match));
+        result->have_best_match = TRUE;
+    } else if (sp->have_best_match) {
+        result->best_logodds = sp->best_logodds;
+        result->best_index = sp->best_index;
+        matchobj_deep_copy_all(&(sp->best_match), &(result->best_match));
+        result->have_best_match = TRUE;
+    } else {
+        result->best_logodds = sp->best_logodds;
+    }
+}
+
+static void onefield_merge_shard_result(onefield_shard_context_t* ctx) {
+    onefield_t* bp = ctx->bp;
+    bl* local_solutions = ctx->result.solutions;
+    int i;
+
+    for (i=0; i<bl_size(local_solutions); i++) {
+        MatchObj* mo = bl_access(local_solutions, i);
+        MatchObj copy;
+        matchobj_deep_copy_all(mo, &copy);
+        bl_insert_sorted(bp->solutions, &copy, compare_matchobjs);
+    }
+}
+
+static void onefield_shard_context_free(onefield_shard_context_t* ctx) {
+    if (ctx->result.solutions) {
+        onefield_free_matchobj_list(ctx->result.solutions);
+        bl_free(ctx->result.solutions);
+        ctx->result.solutions = NULL;
+    }
+    if (ctx->result.have_best_match) {
+        verify_free_matchobj(&(ctx->result.best_match));
+        onefield_free_matchobj(&(ctx->result.best_match));
+        ctx->result.have_best_match = FALSE;
+    }
+}
+
+static void onefield_mark_reduced_solutions(onefield_t* bp) {
+    il* solved_fields;
+    int i, j;
+
+    if (!bl_size(bp->solutions))
+        return;
+
+    solved_fields = il_new(16);
+    for (i=0; i<bl_size(bp->solutions); i++) {
+        MatchObj* mo = bl_access(bp->solutions, i);
+        int fieldnum = mo->fieldnum;
+        int nsolves = 0;
+
+        if (il_contains(solved_fields, fieldnum))
+            continue;
+        if (mo->logodds < bp->logratio_tosolve)
+            continue;
+
+        for (j=0; j<bl_size(bp->solutions); j++) {
+            MatchObj* candidate = bl_access(bp->solutions, j);
+            if (candidate->fieldnum != fieldnum)
+                continue;
+            if (candidate->logodds >= bp->logratio_tosolve)
+                nsolves++;
+            if (nsolves >= bp->nsolves)
+                break;
+        }
+        if (nsolves >= bp->nsolves) {
+            solved_field(bp, fieldnum);
+            il_insert_unique_ascending(solved_fields, fieldnum);
+        }
+    }
+    il_free(solved_fields);
+}
+
+static anbool onefield_index_loop_should_stop(onefield_t* bp) {
+    if (bp->hit_total_timelimit || bp->hit_total_cpulimit)
+        return TRUE;
+    if (bp->single_field_solved)
+        return TRUE;
+    if (bp->cancelled)
+        return TRUE;
+    return FALSE;
+}
+
+static void run_index_candidate(onefield_t* bp, solver_t* sp, size_t I,
+                                anbool trace_index_shards, int shard_id) {
+    index_t* index;
+    anbool metrics = index_shard_metrics_enabled();
+    onefield_solve_metric_context_t metric_ctx;
+    onefield_solve_metric_context_t* metricp = NULL;
+    double load_t0 = 0.0;
+    double load_ms = 0.0;
+
+    if (metrics)
+        load_t0 = timenow();
+    index = get_index(bp, I);
+    if (metrics)
+        load_ms = 1000.0 * (timenow() - load_t0);
+    solver_add_index(sp, index);
+    if (trace_index_shards) {
+        if (shard_id >= 0)
+            logmsg("[index-shard] processing shard=%i candidate_order=%zu index=%s\n",
+                   shard_id, I, index_shard_string_or_null(index->indexname));
+        else
+            logmsg("[index-shard] processing order=%zu index=%s\n",
+                   I, index_shard_string_or_null(index->indexname));
+    }
+    logverb("Trying index %s...\n", index->indexname);
+
+    // Record current CPU usage.
+    bp->cpu_start = get_cpu_usage();
+    // Record current wall-clock time.
+    bp->time_start = time(NULL);
+
+    // Do it!
+    if (metrics) {
+        memset(&metric_ctx, 0, sizeof(metric_ctx));
+        metric_ctx.shard_id = shard_id;
+        metric_ctx.index_order = I;
+        metric_ctx.index = index;
+        metric_ctx.load_ms = load_ms;
+        metric_ctx.solved_before = bp->single_field_solved;
+        metricp = &metric_ctx;
+    }
+    solve_fields_with_solver_and_metrics(bp, sp, NULL, bp, metricp);
+
+    // Clean up this index...
+    done_with_index(bp, I, index);
+    solver_clear_indexes(sp);
+}
+
+static int onefield_run_index_shards_serial_compat(onefield_t* bp) {
+    onefield_index_shard_t* shards = NULL;
+    size_t Nindexes = n_indexes(bp);
+    int Nshards = make_one_index_shards(bp, &shards);
+    int s;
+    anbool trace_index_shards =
+        index_shard_trace_enabled() ||
+        (get_index_shard_mode(bp) == INDEX_SHARD_SERIAL_COMPAT);
+    anbool metrics = index_shard_metrics_enabled();
+
+    if (Nshards < 0)
+        return -1;
+
+    if (trace_index_shards) {
+        logmsg("[index-shard] serial-compat shards=%i candidates=%zu "
+               "granularity=one-index\n", Nshards, Nindexes);
+        for (s=0; s<Nshards; s++) {
+            onefield_index_shard_t* shard = shards + s;
+            logmsg("[index-shard] shard=%i range=[%i,%i) "
+                   "candidate_order=%i index=%s\n",
+                   shard->shard_id, shard->index_start, shard->index_end,
+                   shard->index_start,
+                   index_shard_string_or_null(
+                       get_index_name(bp, shard->index_start)));
+        }
+    }
+
+    for (s=0; s<Nshards; s++) {
+        onefield_index_shard_t* shard = shards + s;
+        solver_t local_solver;
+        onefield_shard_context_t shard_ctx;
+        anbool solved_before;
+        size_t solutions_before;
+        anbool stop;
+        size_t I;
+
+        if (onefield_index_loop_should_stop(bp))
+            break;
+        if (solver_init_shard_copy(&local_solver, &(bp->solver))) {
+            free(shards);
+            return -1;
+        }
+        if (onefield_shard_context_init(&shard_ctx, bp, &local_solver, shard)) {
+            solver_cleanup(&local_solver);
+            free(shards);
+            return -1;
+        }
+
+        solved_before = bp->single_field_solved;
+        solutions_before = bl_size(bp->solutions);
+
+        if (trace_index_shards) {
+            logmsg("[index-shard] shard=%i start range=[%i,%i)\n",
+                   shard->shard_id, shard->index_start, shard->index_end);
+        }
+
+        for (I=(size_t)shard->index_start; I<(size_t)shard->index_end; I++) {
+            index_t* index;
+            onefield_solve_metric_context_t metric_ctx;
+            onefield_solve_metric_context_t* metricp = NULL;
+            double load_t0 = 0.0;
+            double load_ms = 0.0;
+
+            if (onefield_index_loop_should_stop(bp))
+                break;
+
+            if (metrics)
+                load_t0 = timenow();
+            index = get_index(bp, I);
+            if (metrics)
+                load_ms = 1000.0 * (timenow() - load_t0);
+            solver_add_index(&local_solver, index);
+            if (trace_index_shards)
+                logmsg("[index-shard] processing shard=%i "
+                       "candidate_order=%zu index=%s\n",
+                       shard->shard_id, I,
+                       index_shard_string_or_null(index->indexname));
+            logverb("Trying index %s...\n", index->indexname);
+
+            // Record current CPU usage.
+            bp->cpu_start = get_cpu_usage();
+            // Record current wall-clock time.
+            bp->time_start = time(NULL);
+
+            if (metrics) {
+                memset(&metric_ctx, 0, sizeof(metric_ctx));
+                metric_ctx.shard_id = shard->shard_id;
+                metric_ctx.index_order = I;
+                metric_ctx.index = index;
+                metric_ctx.load_ms = load_ms;
+                metric_ctx.solved_before = solved_before;
+                metricp = &metric_ctx;
+            }
+            solve_fields_with_solver_and_metrics(
+                bp, &local_solver, NULL, &(shard_ctx.callback_ctx), metricp);
+
+            done_with_index(bp, I, index);
+            solver_clear_indexes(&local_solver);
+        }
+
+        onefield_shard_result_capture(&shard_ctx);
+        onefield_merge_shard_result(&shard_ctx);
+        stop = onefield_index_loop_should_stop(bp);
+        if (trace_index_shards) {
+            logmsg("[index-shard] shard=%i end solved=%i "
+                   "solutions_delta=%zu stop=%i\n",
+                   shard->shard_id,
+                   shard_ctx.result.solved ||
+                   (!solved_before && bp->single_field_solved) ? 1 : 0,
+                   bl_size(bp->solutions) - solutions_before,
+                   stop ? 1 : 0);
+        }
+        onefield_shard_context_free(&shard_ctx);
+        solver_cleanup(&local_solver);
+        if (stop)
+            break;
+    }
+
+    free(shards);
+    return 0;
+}
+
+static int onefield_open_worker_xylist(onefield_t* bp) {
+    bp->xyls = xylist_open(bp->fieldfname);
+    if (!bp->xyls) {
+        ERROR("Failed to read worker xylist");
+        return -1;
+    }
+    xylist_set_xname(bp->xyls, bp->xcolname);
+    xylist_set_yname(bp->xyls, bp->ycolname);
+    xylist_set_include_flux(bp->xyls, FALSE);
+    xylist_set_include_background(bp->xyls, FALSE);
+    return 0;
+}
+
+static void onefield_thread_pool_set_status(onefield_thread_pool_t* pool,
+                                            int status) {
+    pthread_mutex_lock(&(pool->lock));
+    if (status && !pool->status)
+        pool->status = status;
+    pthread_mutex_unlock(&(pool->lock));
+}
+
+static void onefield_thread_pool_merge_flags(onefield_thread_pool_t* pool,
+                                             onefield_t* local_bp) {
+    pthread_mutex_lock(&(pool->lock));
+    pool->bp->cancelled |= local_bp->cancelled;
+    pool->bp->hit_cpulimit |= local_bp->hit_cpulimit;
+    pool->bp->hit_timelimit |= local_bp->hit_timelimit;
+    pool->bp->hit_total_cpulimit |= local_bp->hit_total_cpulimit;
+    pool->bp->hit_total_timelimit |= local_bp->hit_total_timelimit;
+    pthread_mutex_unlock(&(pool->lock));
+}
+
+static void* onefield_index_shard_worker(void* arg) {
+    onefield_thread_pool_t* pool = arg;
+
+    while (TRUE) {
+        int s;
+        onefield_index_shard_t* shard;
+        onefield_shard_context_t* ctx;
+        solver_t local_solver;
+        onefield_t local_bp;
+        onefield_solve_metric_context_t metric_ctx;
+        onefield_solve_metric_context_t* metricp = NULL;
+        anbool context_initialized = FALSE;
+
+        pthread_mutex_lock(&(pool->lock));
+        s = pool->next_shard++;
+        pthread_mutex_unlock(&(pool->lock));
+
+        if (s >= pool->Nshards)
+            break;
+
+        shard = pool->shards + s;
+        ctx = pool->contexts + s;
+        local_bp = *(pool->bp);
+        local_bp.xyls = NULL;
+        local_bp.solved_out = NULL;
+        local_bp.single_field_solved = FALSE;
+        local_bp.cancelled = FALSE;
+        local_bp.hit_cpulimit = FALSE;
+        local_bp.hit_timelimit = FALSE;
+        local_bp.hit_total_cpulimit = FALSE;
+        local_bp.hit_total_timelimit = FALSE;
+
+        if (pool->trace) {
+            logmsg("[index-shard] shard=%i thread-start range=[%i,%i) "
+                   "candidate_order=%i index=%s\n",
+                   shard->shard_id, shard->index_start, shard->index_end,
+                   shard->index_start,
+                   index_shard_string_or_null(
+                       shard->index ? shard->index->indexname : NULL));
+        }
+
+        if (onefield_open_worker_xylist(&local_bp)) {
+            ctx->result.status = -1;
+            onefield_thread_pool_set_status(pool, -1);
+            continue;
+        }
+        if (solver_init_shard_copy(&local_solver, &(pool->bp->solver))) {
+            xylist_close(local_bp.xyls);
+            ctx->result.status = -1;
+            onefield_thread_pool_set_status(pool, -1);
+            continue;
+        }
+        if (onefield_shard_context_init(ctx, pool->bp, &local_solver, shard)) {
+            solver_cleanup(&local_solver);
+            xylist_close(local_bp.xyls);
+            ctx->result.status = -1;
+            onefield_thread_pool_set_status(pool, -1);
+            continue;
+        }
+        context_initialized = TRUE;
+
+        ctx->callback_ctx.bp = &local_bp;
+        ctx->callback_ctx.sp = &local_solver;
+        ctx->solver = &local_solver;
+
+        solver_add_index(&local_solver, shard->index);
+        if (pool->trace) {
+            logmsg("[index-shard] processing shard=%i candidate_order=%i "
+                   "index=%s\n",
+                   shard->shard_id, shard->index_start,
+                   index_shard_string_or_null(
+                       shard->index ? shard->index->indexname : NULL));
+        }
+        if (shard->index && shard->index->indexname)
+            logverb("Trying index %s...\n", shard->index->indexname);
+
+        local_bp.cpu_start = get_cpu_usage();
+        local_bp.time_start = time(NULL);
+
+        if (pool->metrics) {
+            memset(&metric_ctx, 0, sizeof(metric_ctx));
+            metric_ctx.shard_id = shard->shard_id;
+            metric_ctx.index_order = shard->index_start;
+            metric_ctx.index = shard->index;
+            metric_ctx.load_ms = shard->load_ms;
+            metric_ctx.solved_before = FALSE;
+            metricp = &metric_ctx;
+        }
+
+        solve_fields_with_solver_and_metrics(
+            &local_bp, &local_solver, NULL, &(ctx->callback_ctx), metricp);
+        onefield_shard_result_capture(ctx);
+        onefield_thread_pool_merge_flags(pool, &local_bp);
+
+        if (pool->trace) {
+            logmsg("[index-shard] shard=%i thread-end solved=%i "
+                   "solutions=%zu status=%i\n",
+                   shard->shard_id, ctx->result.solved ? 1 : 0,
+                   bl_size(ctx->result.solutions), ctx->result.status);
+        }
+
+        solver_clear_indexes(&local_solver);
+        solver_cleanup(&local_solver);
+        xylist_close(local_bp.xyls);
+
+        if (!context_initialized)
+            ctx->result.status = -1;
+    }
+
+    return NULL;
+}
+
+static int onefield_run_index_shards_threaded_reduce(onefield_t* bp,
+                                                     int workers) {
+    onefield_index_shard_t* shards = NULL;
+    onefield_shard_context_t* contexts = NULL;
+    pthread_t* threads = NULL;
+    onefield_thread_pool_t pool;
+    int Nshards = make_one_index_shards(bp, &shards);
+    int s;
+    int started = 0;
+    int status = 0;
+    anbool trace_index_shards =
+        index_shard_trace_enabled() ||
+        (get_index_shard_mode(bp) != INDEX_SHARD_OFF);
+    anbool metrics = index_shard_metrics_enabled();
+
+    if (Nshards < 0)
+        return -1;
+    if (!Nshards)
+        return 0;
+    if (prepare_one_index_shards(bp, shards, Nshards)) {
+        release_one_index_shards(bp, shards, Nshards);
+        free(shards);
+        return -1;
+    }
+
+    contexts = calloc(Nshards, sizeof(onefield_shard_context_t));
+    if (!contexts) {
+        SYSERROR("Failed to allocate index shard contexts");
+        release_one_index_shards(bp, shards, Nshards);
+        free(shards);
+        return -1;
+    }
+
+    if (workers < 1)
+        workers = 1;
+    if (workers > Nshards)
+        workers = Nshards;
+
+    if (trace_index_shards) {
+        logmsg("[index-shard] threaded-reduce shards=%i workers=%i "
+               "granularity=one-index\n", Nshards, workers);
+        for (s=0; s<Nshards; s++) {
+            onefield_index_shard_t* shard = shards + s;
+            logmsg("[index-shard] shard=%i range=[%i,%i) "
+                   "candidate_order=%i index=%s load_ms=%.3f\n",
+                   shard->shard_id, shard->index_start, shard->index_end,
+                   shard->index_start,
+                   index_shard_string_or_null(
+                       shard->index ? shard->index->indexname : NULL),
+                   shard->load_ms);
+        }
+    }
+
+    memset(&pool, 0, sizeof(pool));
+    pool.bp = bp;
+    pool.shards = shards;
+    pool.contexts = contexts;
+    pool.Nshards = Nshards;
+    pool.metrics = metrics;
+    pool.trace = trace_index_shards;
+
+    {
+        int err = pthread_mutex_init(&(pool.lock), NULL);
+        if (err) {
+            errno = err;
+            SYSERROR("Failed to initialize index shard thread lock");
+            release_one_index_shards(bp, shards, Nshards);
+            free(contexts);
+            free(shards);
+            return -1;
+        }
+    }
+
+    if (workers > 1)
+        threads = calloc(workers, sizeof(pthread_t));
+    if ((workers > 1) && !threads) {
+        SYSERROR("Failed to allocate index shard threads; falling back to one worker");
+        workers = 1;
+    }
+
+    if (workers == 1) {
+        onefield_index_shard_worker(&pool);
+    } else {
+        for (started=0; started<workers; started++) {
+            int err = pthread_create(threads + started, NULL,
+                                     onefield_index_shard_worker, &pool);
+            if (err) {
+                errno = err;
+                SYSERROR("Failed to start index shard worker; "
+                         "main thread will finish remaining shards");
+                break;
+            }
+        }
+        if (!started)
+            onefield_index_shard_worker(&pool);
+        else if (started < workers)
+            onefield_index_shard_worker(&pool);
+
+        for (s=0; s<started; s++) {
+            int err = pthread_join(threads[s], NULL);
+            if (err) {
+                errno = err;
+                SYSERROR("Failed to join index shard worker");
+                status = -1;
+            }
+        }
+    }
+
+    if (pool.status)
+        status = pool.status;
+
+    if (!status) {
+        for (s=0; s<Nshards; s++) {
+            onefield_merge_shard_result(contexts + s);
+            if (trace_index_shards) {
+                logmsg("[index-shard] shard=%i reduce-merge solved=%i "
+                       "solutions=%zu\n",
+                       contexts[s].shard.shard_id,
+                       contexts[s].result.solved ? 1 : 0,
+                       bl_size(contexts[s].result.solutions));
+            }
+        }
+        onefield_mark_reduced_solutions(bp);
+    }
+
+    for (s=0; s<Nshards; s++)
+        onefield_shard_context_free(contexts + s);
+
+    free(threads);
+    pthread_mutex_destroy(&(pool.lock));
+    release_one_index_shards(bp, shards, Nshards);
+    free(contexts);
+    free(shards);
+    return status;
+}
+
+static int onefield_run_index_shards_serial_reduce(onefield_t* bp) {
+    return onefield_run_index_shards_threaded_reduce(bp, 1);
+}
+
 
 
 void onefield_clear_verify_wcses(onefield_t* bp) {
@@ -295,7 +1417,7 @@ void onefield_add_field_range(onefield_t* bp, int lo, int hi) {
     }
 }
 
-static void check_time_limits(onefield_t* bp) {
+static void check_time_limits_for_solver(onefield_t* bp, solver_t* sp) {
     if (bp->total_timelimit || bp->timelimit) {
         double now = timenow();
         if (bp->total_timelimit && (now - bp->time_total_start > bp->total_timelimit)) {
@@ -324,13 +1446,23 @@ static void check_time_limits(onefield_t* bp) {
         bp->hit_total_cpulimit ||
         bp->hit_timelimit ||
         bp->hit_cpulimit)
-        bp->solver.quit_now = TRUE;
+        sp->quit_now = TRUE;
+}
+
+static void check_time_limits(onefield_t* bp) {
+    check_time_limits_for_solver(bp, &(bp->solver));
 }
 
 void onefield_run(onefield_t* bp) {
     solver_t* sp = &(bp->solver);
     size_t i, I;
     size_t Nindexes;
+    index_shard_mode_t shard_mode = get_index_shard_mode(bp);
+    anbool trace_index_shards =
+        index_shard_trace_enabled() || (shard_mode != INDEX_SHARD_OFF);
+    anbool use_serial_compat_shards;
+    anbool use_serial_reduce_shards;
+    anbool use_threaded_shards;
 
     // Record current time for total wall-clock time limit.
     bp->time_total_start = timenow();
@@ -357,6 +1489,32 @@ void onefield_run(onefield_t* bp) {
     remove_invalid_fields(bp->fieldlist, xylist_n_fields(bp->xyls));
 
     Nindexes = n_indexes(bp);
+    use_serial_compat_shards =
+        ((shard_mode == INDEX_SHARD_SERIAL_COMPAT) && !bp->indexes_inparallel);
+    use_serial_reduce_shards =
+        ((shard_mode == INDEX_SHARD_SERIAL_REDUCE) && !bp->indexes_inparallel);
+    use_threaded_shards =
+        ((shard_mode == INDEX_SHARD_THREADS) && !bp->indexes_inparallel);
+    if (trace_index_shards) {
+        logmsg("[index-shard] mode=%s active=%i indexes_inparallel=%i "
+               "candidates=%zu job=%s workers=%i\n",
+               index_shard_mode_name(shard_mode),
+               (use_serial_compat_shards ||
+                use_serial_reduce_shards ||
+                use_threaded_shards) ? 1 : 0,
+               bp->indexes_inparallel ? 1 : 0, Nindexes,
+               index_shard_string_or_null(bp->fieldfname),
+               (shard_mode == INDEX_SHARD_THREADS) ?
+               index_shard_workers_from_env() : 0);
+        for (I=0; I<Nindexes; I++) {
+            logmsg("[index-shard] candidate order=%zu index=%s\n",
+                   I, index_shard_string_or_null(get_index_name(bp, I)));
+        }
+        if ((shard_mode != INDEX_SHARD_OFF) &&
+            bp->indexes_inparallel)
+            logmsg("[index-shard] shard mode requested but "
+                   "indexes_inparallel=1; keeping existing inparallel path\n");
+    }
 
     // Verify any WCS estimates we have.
     if (bl_size(bp->verify_wcs_list)) {
@@ -438,6 +1596,9 @@ void onefield_run(onefield_t* bp) {
         // Add all the indexes...
         for (I=0; I<Nindexes; I++) {
             index_t* index = get_index(bp, I);
+            if (trace_index_shards)
+                logmsg("[index-shard] processing order=%zu index=%s\n",
+                       I, index_shard_string_or_null(index->indexname));
             solver_add_index(sp, index);
         }
 
@@ -456,34 +1617,26 @@ void onefield_run(onefield_t* bp) {
         }
         solver_clear_indexes(sp);
 
+    } else if (use_serial_compat_shards) {
+        if (onefield_run_index_shards_serial_compat(bp))
+            exit(-1);
+
+    } else if (use_serial_reduce_shards) {
+        if (onefield_run_index_shards_serial_reduce(bp))
+            exit(-1);
+
+    } else if (use_threaded_shards) {
+        if (onefield_run_index_shards_threaded_reduce(
+                bp, index_shard_workers_from_env()))
+            exit(-1);
+
     } else {
 
         for (I=0; I<Nindexes; I++) {
-            index_t* index;
-
-            if (bp->hit_total_timelimit || bp->hit_total_cpulimit)
-                break;
-            if (bp->single_field_solved)
-                break;
-            if (bp->cancelled)
+            if (onefield_index_loop_should_stop(bp))
                 break;
 
-            // Load the index...
-            index = get_index(bp, I);
-            solver_add_index(sp, index);
-            logverb("Trying index %s...\n", index->indexname);
-
-            // Record current CPU usage.
-            bp->cpu_start = get_cpu_usage();
-            // Record current wall-clock time.
-            bp->time_start = time(NULL);
-
-            // Do it!
-            solve_fields(bp, NULL);
-
-            // Clean up this index...
-            done_with_index(bp, I, index);
-            solver_clear_indexes(sp);
+            run_index_candidate(bp, sp, I, trace_index_shards, -1);
         }
     }
 
@@ -711,17 +1864,17 @@ static int sort_rdls(MatchObj* mymo, onefield_t* bp) {
     return 0;
 }
 
-static anbool record_match_callback(MatchObj* mo, void* userdata) {
-    onefield_t* bp = userdata;
-    solver_t* sp = &(bp->solver);
+static anbool record_match_common(MatchObj* mo, record_match_context_t* ctx) {
+    onefield_t* bp = ctx->bp;
+    solver_t* sp = ctx->sp;
     MatchObj* mymo;
     int ind;
 
-    check_time_limits(bp);
+    check_time_limits_for_solver(bp, sp);
 
     // Copy "mo" to "mymo".
-    ind = bl_insert_sorted(bp->solutions, mo, compare_matchobjs);
-    mymo = bl_access(bp->solutions, ind);
+    ind = bl_insert_sorted(ctx->solutions, mo, compare_matchobjs);
+    mymo = bl_access(ctx->solutions, ind);
 
     // steal these arrays from "mo" (prevent them from being free()'d
     // by the caller)
@@ -756,7 +1909,7 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
 
         mymo->fieldxy = malloc(mymo->nfield * 2 * sizeof(double));
         // whew!
-        memcpy(mymo->fieldxy, bp->solver.vf->xy, mymo->nfield * 2 * sizeof(double));
+        memcpy(mymo->fieldxy, sp->vf->xy, mymo->nfield * 2 * sizeof(double));
 
         // Tweak was here...
 
@@ -777,13 +1930,13 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
 
     // this match is considered a solution.
 
-    bp->nsolves_sofar++;
-    if (bp->nsolves_sofar < bp->nsolves) {
+    (*(ctx->nsolves_sofar))++;
+    if (*(ctx->nsolves_sofar) < bp->nsolves) {
         logmsg("Found a quad that solves the image; that makes %i of %i required.\n",
-               bp->nsolves_sofar, bp->nsolves);
+               *(ctx->nsolves_sofar), bp->nsolves);
     } else {
-        if (bp->solver.index) {
-            char* base = basename_safe(bp->solver.index->indexname);
+        if (sp->index) {
+            char* base = basename_safe(sp->index->indexname);
             logmsg("Field %i: solved with index %s.\n", mymo->fieldnum, base);
             free(base);
         } else {
@@ -798,10 +1951,42 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
     return FALSE;
 }
 
+static anbool record_match_callback(MatchObj* mo, void* userdata) {
+    onefield_t* bp = userdata;
+    record_match_context_t ctx;
+    ctx.bp = bp;
+    ctx.sp = &(bp->solver);
+    ctx.solutions = bp->solutions;
+    ctx.nsolves_sofar = &(bp->nsolves_sofar);
+    return record_match_common(mo, &ctx);
+}
+
+static anbool record_match_shard_callback(MatchObj* mo, void* userdata) {
+    record_match_context_t* ctx = userdata;
+    return record_match_common(mo, ctx);
+}
+
 static time_t timer_callback(void* user_data) {
     onefield_t* bp = user_data;
 
     check_time_limits(bp);
+
+    // check if the field has already been solved...
+    if (is_field_solved(bp, bp->fieldnum))
+        return 0;
+    if (bp->cancelfname && file_exists(bp->cancelfname)) {
+        bp->cancelled = TRUE;
+        logmsg("File \"%s\" exists: cancelling.\n", bp->cancelfname);
+        return 0;
+    }
+    return 1; // wait 1 second... FIXME config?
+}
+
+static time_t timer_shard_callback(void* user_data) {
+    record_match_context_t* ctx = user_data;
+    onefield_t* bp = ctx->bp;
+
+    check_time_limits_for_solver(bp, ctx->sp);
 
     // check if the field has already been solved...
     if (is_field_solved(bp, bp->fieldnum))
@@ -886,7 +2071,19 @@ static void remove_invalid_fields(il* fieldlist, int maxfield) {
 }
 
 static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
-    solver_t* sp = &(bp->solver);
+    solve_fields_with_solver(bp, &(bp->solver), verify_wcs, bp);
+}
+
+static void solve_fields_with_solver(onefield_t* bp, solver_t* sp,
+                                     sip_t* verify_wcs,
+                                     void* callback_userdata) {
+    solve_fields_with_solver_and_metrics(bp, sp, verify_wcs,
+                                         callback_userdata, NULL);
+}
+
+static void solve_fields_with_solver_and_metrics(
+    onefield_t* bp, solver_t* sp, sip_t* verify_wcs,
+    void* callback_userdata, onefield_solve_metric_context_t* metric_ctx) {
     double last_utime, last_stime;
     double utime, stime;
     struct timeval wtime, last_wtime;
@@ -899,6 +2096,7 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
         int fieldnum;
         MatchObj template ;
         qfits_header* fieldhdr = NULL;
+        double metric_solve_t0 = 0.0;
 
         fieldnum = il_get(bp->fieldlist, fi);
 
@@ -934,13 +2132,25 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
         solver_reset_best_match(sp);
 
         sp->mo_template = &template;
-        sp->record_match_callback = record_match_callback;
-        sp->timer_callback = timer_callback;
-        sp->userdata = bp;
+        if (sp == &(bp->solver)) {
+            sp->record_match_callback = record_match_callback;
+            sp->timer_callback = timer_callback;
+        } else {
+            sp->record_match_callback = record_match_shard_callback;
+            sp->timer_callback = timer_shard_callback;
+        }
+        sp->userdata = callback_userdata;
 
         bp->fieldnum = fieldnum;
         bp->nsolves_sofar = 0;
+        if (sp != &(bp->solver)) {
+            record_match_context_t* ctx = callback_userdata;
+            if (ctx && ctx->nsolves_sofar)
+                *(ctx->nsolves_sofar) = 0;
+        }
 
+        if (metric_ctx)
+            metric_solve_t0 = timenow();
         solver_preprocess_field(sp);
 
         if (verify_wcs) {
@@ -975,26 +2185,39 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
             solved_field(bp, fieldnum);
         } else if (!verify_wcs) {
             // Field unsolved.
-            logerr("Field %i did not solve", fieldnum);
-            if (bp->solver.index && bp->solver.index->indexname) {
+            if (sp->index && sp->index->indexname) {
                 char* copy;
                 char* base;
-                copy = strdup(bp->solver.index->indexname);
+                copy = strdup(sp->index->indexname);
                 base = strdup(basename(copy));
                 free(copy);
-                logerr(" (index %s", base);
+                if (sp->endobj)
+                    logerr("Field %i did not solve (index %s, "
+                           "field objects %i-%i).\n",
+                           fieldnum, base, sp->startobj+1, sp->endobj);
+                else
+                    logerr("Field %i did not solve (index %s).\n",
+                           fieldnum, base);
                 free(base);
-                if (bp->solver.endobj)
-                    logerr(", field objects %i-%i", bp->solver.startobj+1, bp->solver.endobj);
-                logerr(")");
+            } else {
+                logerr("Field %i did not solve.\n", fieldnum);
             }
-            logerr(".\n");
             if (sp->have_best_match) {
                 logverb("Best match encountered: ");
                 matchobj_print(&(sp->best_match), log_get_level());
             } else {
                 logverb("Best odds encountered: %g\n", exp(sp->best_logodds));
             }
+        }
+
+        if (metric_ctx) {
+            double solve_ms = 1000.0 * (timenow() - metric_solve_t0);
+            anbool solved = sp->best_match_solves ||
+                (!metric_ctx->solved_before && bp->single_field_solved);
+            onefield_write_index_metric_for_solver(
+                bp, sp, metric_ctx->shard_id, metric_ctx->index_order,
+                metric_ctx->index, metric_ctx->load_ms, solve_ms, solved,
+                onefield_index_exit_reason(bp, sp));
         }
 
         solver_free_field(sp);
@@ -1043,6 +2266,27 @@ static void solved_field(onefield_t* bp, int fieldnum) {
         bp->single_field_solved = TRUE;
 }
 
+static bl* copy_tagalong_list(bl* src) {
+    bl* dst;
+    int i;
+    if (!src)
+        return NULL;
+    dst = bl_new(16, sizeof(tagalong_t));
+    for (i=0; i<bl_size(src); i++) {
+        tagalong_t* tag = bl_access(src, i);
+        tagalong_t tagcopy;
+        memcpy(&tagcopy, tag, sizeof(tagalong_t));
+        tagcopy.name = strdup_safe(tag->name);
+        tagcopy.units = strdup_safe(tag->units);
+        if (tag->data) {
+            tagcopy.data = malloc((size_t)tag->Ndata * (size_t)tag->itemsize);
+            memcpy(tagcopy.data, tag->data, (size_t)tag->Ndata * (size_t)tag->itemsize);
+        }
+        bl_append(dst, &tagcopy);
+    }
+    return dst;
+}
+
 void onefield_matchobj_deep_copy(const MatchObj* mo, MatchObj* dest) {
     if (!mo || !dest)
         return;
@@ -1058,24 +2302,26 @@ void onefield_matchobj_deep_copy(const MatchObj* mo, MatchObj* dest) {
         dest->fieldxy = malloc(mo->nfield * 2 * sizeof(double));
         memcpy(dest->fieldxy, mo->fieldxy, mo->nfield * 2 * sizeof(double));
     }
-    if (mo->tagalong) {
-        int i;
-        dest->tagalong = bl_new(16, sizeof(tagalong_t));
-        for (i=0; i<bl_size(mo->tagalong); i++) {
-            tagalong_t* tag = bl_access(mo->tagalong, i);
-            tagalong_t tagcopy;
-            memcpy(&tagcopy, tag, sizeof(tagalong_t));
-            tagcopy.name = strdup_safe(tag->name);
-            tagcopy.units = strdup_safe(tag->units);
-            if (tag->data) {
-                tagcopy.data = malloc((size_t)tag->Ndata * (size_t)tag->itemsize);
-                memcpy(tagcopy.data, tag->data, (size_t)tag->Ndata * (size_t)tag->itemsize);
-            }
-            bl_append(dest->tagalong, &tagcopy);
-        }
-    }
-    // NOT SUPPORTED (yet)
-    assert(!mo->field_tagalong);
+    dest->tagalong = copy_tagalong_list(mo->tagalong);
+    dest->field_tagalong = copy_tagalong_list(mo->field_tagalong);
+}
+
+static void matchobj_deep_copy_all(const MatchObj* mo, MatchObj* dest) {
+    memcpy(dest, mo, sizeof(MatchObj));
+    dest->sip = NULL;
+    dest->refradec = NULL;
+    dest->fieldxy = NULL;
+    dest->fieldxy_orig = NULL;
+    dest->tagalong = NULL;
+    dest->field_tagalong = NULL;
+    dest->theta = NULL;
+    dest->matchodds = NULL;
+    dest->testperm = NULL;
+    dest->refxyz = NULL;
+    dest->refxy = NULL;
+    dest->refstarid = NULL;
+    onefield_matchobj_deep_copy(mo, dest);
+    verify_matchobj_deep_copy(mo, dest);
 }
 
 // Free the things I added to the mo.

@@ -1,7 +1,7 @@
-# Contents that are appended to Dockerfile.common for dev builds.
+# Contents that are appended to common.dockerfile for dev builds.
 # This file is not a functioning Dockerfile by itself.
 
-# In images for quick local testing, do optimize for the build computer's CPU
+# In images for quick local testing, do optimize for the build computer's CPU.
 ENV ARCH_FLAGS=-march=native
 
 ADD . /src/astrometry

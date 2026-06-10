@@ -5,4 +5,4 @@ doc
 docker
 .gitignore
 
-# Contents of .gitignore will automatically be appended during the build process
+# Contents of .gitignore will automatically be appended during the build process.

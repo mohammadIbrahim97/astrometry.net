@@ -63,7 +63,8 @@ WORKDIR /src
 RUN git config --global --add safe.directory /src/astrometry
 
 RUN mkdir /usr/local/data && cd /usr/local/data \
-	&& for i in $(seq -w 7 19); do \
+    && for i in $(seq -w 7 19); do \
     wget -nv https://data.astrometry.net/4100/index-41$i.fits; done
 
-# dev.dockerfile, release.dockerfile or test.dockerfile respectively, will be appended during the build process using the shell script.
+# dev.dockerfile, release.dockerfile or test.dockerfile will be appended
+# during the build process using the shell script.

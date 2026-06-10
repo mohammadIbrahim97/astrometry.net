@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <getopt.h>
 
 #include "os-features.h"
 #include "image2xy-files.h"
@@ -17,6 +18,17 @@
 #include "ioutils.h"
 
 static const char* OPTIONS = "hi:Oo:8Hd:D:ve:B:S:M:s:p:P:bU:g:C:m:a:G:w:L:";
+
+enum {
+    OPT_SOURCE_BACKEND = 256,
+    OPT_USE_SEP
+};
+
+static struct option long_options[] = {
+    {"source-backend", required_argument, NULL, OPT_SOURCE_BACKEND},
+    {"use-sep", no_argument, NULL, OPT_USE_SEP},
+    {0, 0, 0, 0}
+};
 
 static void printHelp() {
     fprintf(stderr,
@@ -42,6 +54,8 @@ static void printHelp() {
             "   [-b]: don't do (median-based) background subtraction\n"
             "   [-G <background>]: subtract this 'global' background value; implies -b\n"
             "   [-m]: set maximum extended object size for deblending (default %i pixels)\n"
+            "   [--source-backend simplexy|sep]: source extraction backend (default: simplexy)\n"
+            "   [--use-sep]: shorthand for --source-backend sep\n"
             "\n"
             "   [-S <background-subtracted image>]: save background-subtracted image to this filename (FITS float image)\n"
             "   [-B <background image>]: save background image to filename\n"
@@ -74,14 +88,28 @@ int main(int argc, char *argv[]) {
     int downsample_as_reqd = 0;
     int extension = 0;
     int plane = 0;
+    int use_sep = 0;
 
     simplexy_t sparams;
     simplexy_t* params = &sparams;
 
     memset(params, 0, sizeof(simplexy_t));
 
-    while ((argchar = getopt (argc, argv, OPTIONS)) != -1) {
+    while ((argchar = getopt_long(argc, argv, OPTIONS, long_options, NULL)) != -1) {
         switch (argchar) {
+        case OPT_SOURCE_BACKEND:
+            if (streq(optarg, "simplexy")) {
+                use_sep = 0;
+            } else if (streq(optarg, "sep")) {
+                use_sep = 1;
+            } else {
+                ERROR("Unknown image2xy source backend \"%s\".  Choices are: simplexy, sep", optarg);
+                exit(-1);
+            }
+            break;
+        case OPT_USE_SEP:
+            use_sep = 1;
+            break;
         case 'L':
             params->Lorder = atoi(optarg);
             break;
@@ -186,8 +214,11 @@ int main(int argc, char *argv[]) {
     if (downsample)
         logverb("Downsampling by %i\n", downsample);
 
-    if (image2xy_files(infn, outfn, do_u8, downsample, downsample_as_reqd,
-                       extension, plane, params)) {
+    if ((use_sep ?
+         image2xy_files_sep(infn, outfn, downsample, downsample_as_reqd,
+                            extension, plane, params) :
+         image2xy_files(infn, outfn, do_u8, downsample, downsample_as_reqd,
+                        extension, plane, params))) {
         ERROR("image2xy failed.");
         exit(-1);
     }
