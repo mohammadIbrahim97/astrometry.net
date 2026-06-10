@@ -5,7 +5,7 @@ Although it's entirely feasible to manually follow the instructions in the `net`
 However, it's important to note that these Docker files are primarily designed for quick trials and development.
 If you're planning to use them for production, they'll require further refinement, particularly in terms of security settings.
 
-This folder contains two Docker files.
+This folder contains two sub-folders.
 The first is for the solver, which provides the command line tools for Astrometry.net.
 The second is for the web service, which includes the Django-based web server and API server. 
 
@@ -29,11 +29,23 @@ See http://data.astrometry.net/ for details.
 Check out [this link](http://astrometry.net/doc/readme.html#getting-index-files) to understand whether it's possible to only download and use part of all the files.
 Otherwise, downloading all the files will also work.
 
-Optionally, you can build a local version of the Docker image:
+Optionally, you can build a local version of the Docker image, using one of
+the provided shell scripts:
 ```
-docker build -t astrometrynet/solver:latest -f docker/solver/Dockerfile .
+docker/solver/build-release.sh
 ```
-Again note the command should be executed in the repo root folder, not the current folder.
+or:
+```
+docker/solver/build-dev.sh
+```
+or, for an image that also includes the Astrometry testing data:
+```
+docker/solver/build-test.sh
+```
+The difference between these scripts is that `build-release.sh` will clone the
+remote Astrometry.net repository, while `build-dev.sh` and `build-test.sh` use
+your local checkout and compile the solver from there. Use `build-test.sh` when
+you want the image to contain the real test data repository.
 
 Then use this command to log into the container to use the command lines:
 ```
@@ -42,6 +54,10 @@ docker run -v ~/astrometry_indexes:/usr/local/data -it astrometrynet/solver /bin
 Here `~/astrometry_indexes` is the host folder holding the indexes downloaded from the first step.
 In the `solver` container, the command line tools are available for use.
 For example, `solve-field`.
+
+At the moment, the 4107 through 4119 index files are automatically downloaded
+into the solver images, so you do not need to download them manually nor mount a
+volume for those tests.
 
 ## webservice
 
@@ -102,4 +118,3 @@ For something closer to the production `nova.astrometry.net` service, you probab
 2. Perhaps use the `systemctl` services to run the `nova-uwsgi` and `nova-jobs` services
 3. Use `uwsgi` (eg via the `nova-uwsgi` service) rather than the Django built-in `manage.py runserver`
 4. Use apache2 or nginx as a front-end and SSL terminator
-

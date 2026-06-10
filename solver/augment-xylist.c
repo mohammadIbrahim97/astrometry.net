@@ -141,6 +141,12 @@ static an_option_t options[] = {
      "odds ratio at which to stop adding stars when evaluating a hypothesis (default: LARGE_VAL)"},
     {'^', "use-source-extractor", no_argument, NULL,
      "use SourceExtractor rather than built-in image2xy to find sources"},
+    {'\x95', "use-sep", no_argument, NULL,
+     "use the SEP library rather than built-in image2xy to find sources.  "
+     "Requires building with HAVE_SEP=yes."},
+    {'\x96', "source-backend", required_argument, "simplexy|sep|source-extractor",
+     "source extraction backend.  Default: simplexy.  This is the preferred "
+     "form of --use-sep and --use-source-extractor."},
     {'&', "source-extractor-config", required_argument, "filename",
      "use the given SourceExtractor config file.  "
      "Note that CATALOG_NAME and CATALOG_TYPE values will be over-ridden by command-line values.  "
@@ -327,6 +333,24 @@ int augment_xylist_parse_option(char argchar, char* optarg,
         break;
     case '^':
         axy->use_source_extractor = TRUE;
+        break;
+    case '\x95':
+        axy->use_sep = TRUE;
+        break;
+    case '\x96':
+        if (streq(optarg, "simplexy")) {
+            axy->use_sep = FALSE;
+            axy->use_source_extractor = FALSE;
+        } else if (streq(optarg, "sep")) {
+            axy->use_sep = TRUE;
+            axy->use_source_extractor = FALSE;
+        } else if (streq(optarg, "source-extractor")) {
+            axy->use_sep = FALSE;
+            axy->use_source_extractor = TRUE;
+        } else {
+            ERROR("Unknown source backend \"%s\".  Choices are: simplexy, sep, source-extractor", optarg);
+            return -1;
+        }
         break;
     case '&':
         axy->source_extractor_config = optarg;
@@ -682,6 +706,11 @@ int augment_xylist(augment_xylist_t* axy,
     tempfiles = sl_new(4);
     scales = dl_new(4);
 
+    if (axy->use_sep && axy->use_source_extractor) {
+        ERROR("Choose only one source extraction backend: --use-sep or --use-source-extractor");
+        return -1;
+    }
+
     if (axy->imagefn) {
         // if --image is given:
         //       -run image2pnm
@@ -865,7 +894,31 @@ int augment_xylist(augment_xylist_t* axy,
         xylsfn = create_temp_file("xyls", axy->tempdir);
         sl_append_nocopy(tempfiles, xylsfn);
 
-        if (axy->use_source_extractor) {
+        if (axy->use_sep) {
+            simplexy_t sxyparams;
+            logverb("Running SEP image2xy: input=%s, output=%s, ext=%i\n",
+                    fitsimgfn, xylsfn, axy->fitsimgext);
+
+            // we have to delete the temp file because otherwise image2xy is too timid to overwrite it.
+            if (unlink(xylsfn)) {
+                SYSERROR("Failed to delete temp file %s", xylsfn);
+                exit(-1);
+            }
+
+            memset(&sxyparams, 0, sizeof(simplexy_t));
+            sxyparams.nobgsub = axy->no_bg_subtraction;
+            sxyparams.sigma = axy->image_sigma;
+            sxyparams.invert = axy->invert_image;
+            sxyparams.plim = axy->image_nsigma;
+
+            // MAGIC 3: downsample by a factor of 2, up to 3 times.
+            if (image2xy_files_sep(fitsimgfn, xylsfn, axy->downsample, 3,
+                                   axy->fitsimgext, 0, &sxyparams)) {
+                ERROR("SEP source extraction failed");
+                exit(-1);
+            }
+
+        } else if (axy->use_source_extractor) {
             if (axy->source_extractor_path)
                 sl_append(cmd, axy->source_extractor_path);
             else
@@ -881,7 +934,7 @@ int augment_xylist(augment_xylist_t* axy,
 
                 paramfn = create_temp_file("param", axy->tempdir);
                 sl_append_nocopy(tempfiles, paramfn);
-                paramstr = "X_IMAGE\nY_IMAGE\nMAG_AUTO\nFLUX_AUTO";
+                paramstr = "X_IMAGE\nY_IMAGE\nMAG_AUTO\nFLUX_AUTO\nFWHM_IMAGE\nELLIPTICITY";
                 if (write_file(paramfn, paramstr, strlen(paramstr))) {
                     ERROR("Failed to write Source Extractor parameters to temp file \"%s\"", paramfn);
                     exit(-1);
@@ -1602,4 +1655,3 @@ static int parse_fields_string(il* fields, const char* str) {
     }
     return 0;
 }
-
