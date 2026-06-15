@@ -23,25 +23,26 @@
 
 #include "math.h"
 
-#include "mathutil.h"
-#include "ioutils.h"
-#include "fileutils.h"
-#include "bl.h"
 #include "an-bool.h"
-#include "solver.h"
-#include "fitsioutils.h"
-#include "solverutils.h"
-#include "os-features.h"
-#include "onefield.h"
-#include "log.h"
 #include "anqfits.h"
-#include "errors.h"
+#include "astrometry/index_shard.h"
+#include "bl.h"
 #include "engine.h"
-#include "tic.h"
+#include "errors.h"
+#include "fileutils.h"
+#include "fitsioutils.h"
 #include "healpix.h"
-#include "sip-utils.h"
-#include "multiindex.h"
 #include "indexset.h"
+#include "ioutils.h"
+#include "log.h"
+#include "mathutil.h"
+#include "multiindex.h"
+#include "onefield.h"
+#include "os-features.h"
+#include "sip-utils.h"
+#include "solver.h"
+#include "solverutils.h"
+#include "tic.h"
 
 void engine_add_search_path(engine_t* engine, const char* path) {
     sl_append(engine->index_paths, path);
@@ -61,7 +62,7 @@ char* engine_find_index(engine_t* engine, const char* name) {
             }
         else
             asprintf_safe(&path, "%s/%s", sl_get(engine->index_paths, j), name);
-        
+
         logverb("Trying path %s...\n", path);
         if (index_is_file_index(path))
             return path;
@@ -206,11 +207,19 @@ int engine_add_index(engine_t* engine, char* path) {
     pl_append(engine->free_indexes, ind);
     return 0;
 }
-
+// SECTION INDEX-SHARD: engine-lifecycle
 static void add_index_to_onefield(engine_t* engine, onefield_t* bp,
                                int i) {
     index_t* index;
     index = pl_get(engine->indexes, i);
+    /*
+     * In pthread mode, workers load/close indexes through the normal onefield
+     * ownership path.  Do not share loaded index_t across workers.
+     */
+    if (index_shard_pthread_enabled()) {
+      onefield_add_index(bp, index->indexname);
+      return;
+    }
     if (engine->inparallel) {
         // The "indexset" feature means that we can get here without having
         // actually loaded the index yet.
@@ -370,7 +379,7 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
             }
             pl_append(engine->free_indexes, indx);
             logverb("Added index %s from indexset %s\n", indx->indexfn, ind);
-            
+
             i++;
         }
         pl_free(indexes);
@@ -477,21 +486,34 @@ static double job_imageh(job_t* job) {
 int engine_run_job(engine_t* engine, job_t* job) {
     onefield_t* bp = &(job->bp);
     solver_t* sp = &(bp->solver);
-    
+
     int i;
     double app_min_default;
     double app_max_default;
     anbool solved = FALSE;
+    anbool index_shard_pool_started = FALSE;
 
     if (onefield_is_run_obsolete(bp, sp)) {
         goto finish;
+    }
+    // SECTION INDEX-SHARD: engine-lifecycle
+    bp->time_total_start = timenow();
+    bp->cpu_total_start = get_cpu_usage();
+
+    if (index_shard_pthread_enabled()) {
+      if (index_shard_pool_start(bp, sp)) {
+        ERROR("Failed to start index-shard pthread pool");
+        return -1;
+      }
+
+      index_shard_pool_started = TRUE;
     }
 
     app_min_default = deg2arcsec(engine->minwidth) / job_imagew(job);
     app_max_default = deg2arcsec(engine->maxwidth) / job_imagew(job);
 
-    if (engine->inparallel)
-        bp->indexes_inparallel = TRUE;
+    if (engine->inparallel && !index_shard_pthread_enabled())
+      bp->indexes_inparallel = TRUE;
 
     if (job->use_radec_center) {
         logmsg("Only searching for solutions within %g degrees of RA,Dec (%g,%g)\n",
@@ -611,9 +633,12 @@ int engine_run_job(engine_t* engine, job_t* job) {
     logverb("AB scale constraints: %i\n", sp->num_abscale_skipped);
 
  finish:
-    solver_cleanup(sp);
-    onefield_cleanup(bp);
-    return 0;
+   // SECTION INDEX-SHARD: engine-lifecycle
+   if (index_shard_pool_started)
+     index_shard_pool_stop(bp);
+   solver_cleanup(sp);
+   onefield_cleanup(bp);
+   return 0;
 }
 
 static void parse_sip_coeffs(const qfits_header* hdr, const char* prefix, sip_t* wcs) {
@@ -758,7 +783,7 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
     sp->set_crpix_center = qfits_header_getboolean(hdr, "ANCRPIXC", FALSE);
     sp->crpix[0] = qfits_header_getdouble(hdr, "ANCRPIX1", sp->crpix[0]);
     sp->crpix[1] = qfits_header_getdouble(hdr, "ANCRPIX2", sp->crpix[1]);
-    sp->set_crpix = (sp->set_crpix_center || 
+    sp->set_crpix = (sp->set_crpix_center ||
                      // were the values set?
                      qfits_header_getstr(hdr, "ANCRPIX1") ||
                      qfits_header_getstr(hdr, "ANCRPIX2"));
@@ -954,7 +979,7 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
     } while (0);
 
     sp->pixel_xscale = qfits_header_getdouble(hdr, "ANPXSCAL", 0.);
-    
+
     run = qfits_header_getboolean(hdr, "ANRUN", FALSE);
 
     // Default: solve first field.
@@ -1053,16 +1078,83 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
     }
 
     // The job can only decrease the CPU limit.
-    if ((bp->cpulimit == 0.0) || bp->cpulimit > engine->cpulimit) {
-        logverb("Decreasing CPU time limit to the engine's limit of %g seconds\n",
-                engine->cpulimit);
-        bp->cpulimit = engine->cpulimit;
+    // SECTION INDEX-SHARD: cpu-limit-precedence
+    /*
+     * Upstream-compatible CPU-limit handling.
+     *
+     * Sources:
+     *   - bp->cpulimit      job/ANCLIM limit, normally produced by solve-field
+     *                       --cpulimit
+     *   - engine->cpulimit  backend/config limit from astrometry.cfg
+     *
+     * Semantics:
+     *   - if both exist, use the smaller one
+     *   - if only one exists, use that one
+     *   - if neither exists, run without a CPU limit
+     *
+     * This preserves the original astrometry.net behavior: solve-field may
+     * reduce a backend/config CPU limit but must not increase it.
+     *
+     * pthread index-sharding detail:
+     *   In pthread mode the effective limit is stored in bp->total_cpulimit and
+     *   bp->cpulimit is cleared.  This prevents worker-local onefield copies
+     * from treating the same budget as an independent per-index/per-worker
+     * limit.
+     */
+    {
+      double job_cpulimit = bp->cpulimit;
+      double cfg_cpulimit = engine->cpulimit;
+      double effective_cpulimit = 0.0;
+
+      if (job_cpulimit > 0.0 && cfg_cpulimit > 0.0) {
+        effective_cpulimit =
+            (job_cpulimit < cfg_cpulimit) ? job_cpulimit : cfg_cpulimit;
+      } else if (job_cpulimit > 0.0) {
+        effective_cpulimit = job_cpulimit;
+      } else if (cfg_cpulimit > 0.0) {
+        effective_cpulimit = cfg_cpulimit;
+      }
+
+      if (effective_cpulimit > 0.0) {
+        logverb("Using effective CPU time limit of %g seconds "
+                "(job=%g, config=%g)\n",
+                effective_cpulimit, job_cpulimit, cfg_cpulimit);
+      } else {
+        logverb("No CPU time limit set for this job "
+                "(job=%g, config=%g)\n",
+                job_cpulimit, cfg_cpulimit);
+      }
+
+      if (index_shard_pthread_enabled()) {
+        /*
+         * pthread path:
+         * total_cpulimit is the process-wide budget checked by
+         * index_shard_check_global_cpu_limit().
+         */
+        bp->total_cpulimit = effective_cpulimit;
+        bp->cpulimit = 0.0;
+      } else {
+        /*
+         * Original/non-pthread path:
+         * keep bp->cpulimit as the ordinary effective run limit.
+         */
+        bp->cpulimit = effective_cpulimit;
+
+        /*
+         * Preserve the original total-limit behavior outside the old
+         * indexes-inparallel engine path.
+         */
+        if (!engine->inparallel)
+          bp->total_cpulimit = effective_cpulimit;
+      }
+
+      bp->total_timelimit = bp->timelimit;
     }
-    // If not running inparallel, set total limits = limits.
-    if (!engine->inparallel) {
-        bp->total_timelimit = bp->timelimit;
-        bp->total_cpulimit  = bp->cpulimit ;
-    }
+
+    logmsg("[index-shard] engine limits after setup: "
+           "cpulimit=%f total_cpulimit=%f timelimit=%li total_timelimit=%li\n",
+           bp->cpulimit, bp->total_cpulimit, (long)bp->timelimit,
+           (long)bp->total_timelimit);
 
     // If the job didn't specify depths, set defaults.
     if (il_size(job->depths) == 0) {

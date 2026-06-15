@@ -21,28 +21,29 @@
 #include <math.h>
 #include <assert.h>
 
-#include "os-features.h"
-#include "onefield.h"
-#include "tweak.h"
-#include "tweak2.h"
-#include "sip_qfits.h"
-#include "starutil.h"
-#include "mathutil.h"
-#include "quadfile.h"
-#include "solvedfile.h"
-#include "starkd.h"
-#include "codekd.h"
+#include "anqfits.h"
+#include "astrometry/index_shard.h"
+#include "bl-sort.h"
 #include "boilerplate.h"
+#include "codekd.h"
+#include "errors.h"
 #include "fitsioutils.h"
-#include "verify.h"
 #include "index.h"
 #include "log.h"
-#include "tic.h"
-#include "anqfits.h"
-#include "errors.h"
-#include "scamp-catalog.h"
+#include "mathutil.h"
+#include "onefield.h"
+#include "os-features.h"
 #include "permutedsort.h"
-#include "bl-sort.h"
+#include "quadfile.h"
+#include "scamp-catalog.h"
+#include "sip_qfits.h"
+#include "solvedfile.h"
+#include "starkd.h"
+#include "starutil.h"
+#include "tic.h"
+#include "tweak.h"
+#include "tweak2.h"
+#include "verify.h"
 
 static anbool record_match_callback(MatchObj* mo, void* userdata);
 static time_t timer_callback(void* user_data);
@@ -55,7 +56,9 @@ static int write_solutions(onefield_t* bp);
 static void solved_field(onefield_t* bp, int fieldnum);
 static int compare_matchobjs(const void* v1, const void* v2);
 static void remove_duplicate_solutions(onefield_t* bp);
-
+// SECTION INDEX-SHARD: forward
+static index_t *get_index(onefield_t *bp, size_t i);
+static void done_with_index(onefield_t *bp, size_t i, index_t *ind);
 // A tag-along column for index rdls / correspondence file.
 struct tagalong {
     tfits_type type;
@@ -326,6 +329,316 @@ static void check_time_limits(onefield_t* bp) {
         bp->hit_cpulimit)
         bp->solver.quit_now = TRUE;
 }
+// SECTION INDEX-SHARD: bridge
+
+// ANCHOR INDEX-SHARD: bridge-get-index
+static index_t *onefield_index_shard_get_index(onefield_t *bp,
+                                               size_t index_order) {
+  return get_index(bp, index_order);
+}
+
+// ANCHOR INDEX-SHARD: bridge-done-with-index
+static void onefield_index_shard_done_with_index(onefield_t *bp,
+                                                 size_t index_order,
+                                                 index_t *index) {
+  done_with_index(bp, index_order, index);
+}
+
+// ANCHOR INDEX-SHARD: bridge-get-index-name
+static const char *onefield_index_shard_get_index_name(onefield_t *bp,
+                                                       size_t index_order) {
+  /*
+   * Use the same candidate index-name container that get_index() uses.
+   * If your local get_index() uses a different field than bp->indexnames,
+   * adapt only this function.
+   */
+  if (!bp || !bp->indexnames)
+    return NULL;
+
+  if (index_order >= (size_t)sl_size(bp->indexnames))
+    return NULL;
+
+  return sl_get(bp->indexnames, index_order);
+}
+
+// ANCHOR INDEX-SHARD: bridge-load-index-by-name
+static index_t *
+onefield_index_shard_load_index_by_name(const char *index_name) {
+  index_t *index;
+
+  if (!index_name)
+    return NULL;
+
+  index = calloc(1, sizeof(index_t));
+  if (!index) {
+    SYSERROR("Failed to allocate cached index");
+    return NULL;
+  }
+
+  /*
+   * REVIEW INDEX-SHARD: index allocation contract
+   *
+   * This mirrors the normal onefield get_index() behavior but creates an
+   * independently owned worker-local index_t.  If local get_index() uses
+   * index_new() or extra initialization, copy that exact setup here.
+   */
+  if (!index_load(index_name, 0, index)) {
+    ERROR("Failed to load cached index %s", index_name);
+    free(index);
+    return NULL;
+  }
+
+  return index;
+}
+
+// ANCHOR INDEX-SHARD: bridge-free-cached-index
+static void onefield_index_shard_free_cached_index(index_t *index) {
+  if (!index)
+    return;
+
+  /*
+   * REVIEW INDEX-SHARD: index close/free contract
+   *
+   * If original done_with_index() uses a different close/free sequence,
+   * copy that exact sequence here.
+   */
+  index_close(index);
+  free(index);
+}
+
+// ANCHOR INDEX-SHARD: bridge-prepare-local-context
+static int onefield_index_shard_prepare_local_context(onefield_t *local_bp,
+                                                      onefield_t *master_bp,
+                                                      const solver_t *base_sp) {
+  memset(local_bp, 0, sizeof(onefield_t));
+  memcpy(local_bp, master_bp, sizeof(onefield_t));
+
+  memcpy(&local_bp->solver, base_sp, sizeof(solver_t));
+
+  local_bp->solver.indexes = pl_new(1);
+  if (!local_bp->solver.indexes) {
+    SYSERROR("Failed to allocate worker-local solver index list");
+    return -1;
+  }
+
+  local_bp->solver.fieldxy = NULL;
+  local_bp->solver.fieldxy_orig = NULL;
+  local_bp->solver.vf = NULL;
+  local_bp->solver.index = NULL;
+  local_bp->solver.mo_template = NULL;
+  local_bp->solver.record_match_callback = NULL;
+  local_bp->solver.timer_callback = NULL;
+  local_bp->solver.userdata = NULL;
+  local_bp->solver.quit_now = FALSE;
+
+  solver_reset_counters(&local_bp->solver);
+  solver_reset_best_match(&local_bp->solver);
+
+  local_bp->solutions = NULL;
+  local_bp->solved_out = NULL;
+
+  local_bp->single_field_solved = FALSE;
+  local_bp->nsolves_sofar = 0;
+
+  local_bp->hit_cpulimit = FALSE;
+  local_bp->hit_total_cpulimit = FALSE;
+  local_bp->hit_timelimit = FALSE;
+  local_bp->hit_total_timelimit = FALSE;
+  local_bp->cancelled = FALSE;
+
+  local_bp->cpulimit = 0.0;
+  local_bp->total_cpulimit = 0.0;
+
+  local_bp->xyls = xylist_open(master_bp->fieldfname);
+  if (!local_bp->xyls) {
+    ERROR("Failed to open worker-local xylist %s", master_bp->fieldfname);
+    pl_free(local_bp->solver.indexes);
+    local_bp->solver.indexes = NULL;
+    return -1;
+  }
+
+  xylist_set_xname(local_bp->xyls, local_bp->xcolname);
+  xylist_set_yname(local_bp->xyls, local_bp->ycolname);
+  xylist_set_include_flux(local_bp->xyls, FALSE);
+  xylist_set_include_background(local_bp->xyls, FALSE);
+
+  return 0;
+}
+
+// ANCHOR INDEX-SHARD: bridge-reset-local-context
+static void
+onefield_index_shard_reset_local_context_for_task(onefield_t *local_bp,
+                                                  bl *local_solutions) {
+  local_bp->solutions = local_solutions;
+
+  local_bp->single_field_solved = FALSE;
+  local_bp->nsolves_sofar = 0;
+
+  local_bp->hit_cpulimit = FALSE;
+  local_bp->hit_total_cpulimit = FALSE;
+  local_bp->hit_timelimit = FALSE;
+  local_bp->hit_total_timelimit = FALSE;
+  local_bp->cancelled = FALSE;
+
+  local_bp->solver.quit_now = FALSE;
+  local_bp->solver.index = NULL;
+
+  solver_reset_counters(&local_bp->solver);
+  solver_reset_best_match(&local_bp->solver);
+
+  solver_clear_indexes(&local_bp->solver);
+}
+
+// ANCHOR INDEX-SHARD: bridge-cleanup-local-context
+static void onefield_index_shard_cleanup_local_context(onefield_t *local_bp) {
+  if (!local_bp)
+    return;
+
+  solver_clear_indexes(&local_bp->solver);
+
+  if (local_bp->xyls) {
+    xylist_close(local_bp->xyls);
+    local_bp->xyls = NULL;
+  }
+
+  if (local_bp->solver.indexes) {
+    pl_free(local_bp->solver.indexes);
+    local_bp->solver.indexes = NULL;
+  }
+
+  local_bp->solutions = NULL;
+}
+
+// ANCHOR INDEX-SHARD: bridge-solve-one-index
+static int onefield_index_shard_solve_one_index(onefield_t *local_bp,
+                                                index_t *index) {
+  solver_add_index(&local_bp->solver, index);
+
+  local_bp->cpu_start = get_cpu_usage();
+  local_bp->time_start = time(NULL);
+
+  solve_fields(local_bp, NULL);
+
+  solver_clear_indexes(&local_bp->solver);
+  return 0;
+}
+
+// ANCHOR INDEX-SHARD: bridge-analyze-solutions
+static anbool onefield_index_shard_analyze_solutions(onefield_t *master_bp,
+                                                     bl *solutions,
+                                                     double *best_logodds,
+                                                     int *best_fieldnum) {
+  int i;
+  anbool solved = FALSE;
+
+  if (best_logodds)
+    *best_logodds = -HUGE_VAL;
+
+  if (best_fieldnum)
+    *best_fieldnum = -1;
+
+  if (!solutions)
+    return FALSE;
+
+  for (i = 0; i < bl_size(solutions); i++) {
+    MatchObj *mo = bl_access(solutions, i);
+
+    if (best_logodds && mo->logodds > *best_logodds) {
+      *best_logodds = mo->logodds;
+
+      if (best_fieldnum)
+        *best_fieldnum = mo->fieldnum;
+    }
+
+    if (mo->logodds >= master_bp->logratio_tosolve)
+      solved = TRUE;
+  }
+
+  return solved;
+}
+
+// ANCHOR INDEX-SHARD: bridge-disown-matchobj
+static void onefield_index_shard_disown_matchobj(MatchObj *mo) {
+  if (!mo)
+    return;
+
+  mo->sip = NULL;
+  mo->refradec = NULL;
+  mo->fieldxy = NULL;
+  mo->theta = NULL;
+  mo->matchodds = NULL;
+  mo->refxyz = NULL;
+  mo->refxy = NULL;
+  mo->refstarid = NULL;
+  mo->testperm = NULL;
+  mo->tagalong = NULL;
+  mo->field_tagalong = NULL;
+}
+
+// ANCHOR INDEX-SHARD: bridge-merge-solutions
+static int onefield_index_shard_merge_solutions(onefield_t *master_bp,
+                                                bl *solutions,
+                                                anbool *solved_out) {
+  int i;
+  anbool solved = FALSE;
+
+  if (solved_out)
+    *solved_out = FALSE;
+
+  if (!solutions)
+    return 0;
+
+  for (i = 0; i < bl_size(solutions); i++) {
+    MatchObj *src = bl_access(solutions, i);
+
+    bl_insert_sorted(master_bp->solutions, src, compare_matchobjs);
+
+    if (src->logodds >= master_bp->logratio_tosolve) {
+      solved_field(master_bp, src->fieldnum);
+      master_bp->single_field_solved = TRUE;
+      solved = TRUE;
+    }
+
+    onefield_index_shard_disown_matchobj(src);
+  }
+
+  bl_remove_all(solutions);
+
+  if (solved_out)
+    *solved_out = solved;
+
+  return 0;
+}
+
+// ANCHOR INDEX-SHARD: bridge-free-solutions
+static void onefield_index_shard_free_solutions(bl *solutions) {
+  int i;
+
+  if (!solutions)
+    return;
+
+  for (i = 0; i < bl_size(solutions); i++) {
+    MatchObj *mo = bl_access(solutions, i);
+    verify_free_matchobj(mo);
+    onefield_free_matchobj(mo);
+  }
+
+  bl_free(solutions);
+}
+
+// ANCHOR INDEX-SHARD: bridge-hooks
+static const index_shard_hooks_t onefield_index_shard_hooks = {
+    onefield_index_shard_get_index,
+    onefield_index_shard_done_with_index,
+
+    onefield_index_shard_prepare_local_context,
+    onefield_index_shard_reset_local_context_for_task,
+    onefield_index_shard_cleanup_local_context,
+
+    onefield_index_shard_solve_one_index,
+    onefield_index_shard_analyze_solutions,
+    onefield_index_shard_merge_solutions,
+    onefield_index_shard_free_solutions};
 
 void onefield_run(onefield_t* bp) {
     solver_t* sp = &(bp->solver);
@@ -431,6 +744,19 @@ void onefield_run(onefield_t* bp) {
 
     if (bp->single_field_solved)
         goto cleanup;
+    // SECTION INDEX-SHARD: onefield-entry
+    if (index_shard_pthread_enabled() && index_shard_pool_active(bp)) {
+      int shard_rc;
+
+      shard_rc = index_shard_solve(bp, sp, Nindexes, &onefield_index_shard_hooks);
+
+      if (shard_rc < 0) {
+        logmsg("[index-shard] pthread solve failed; falling back to original "
+               "path\n");
+      } else {
+        goto cleanup;
+      }
+    }
 
     // Start solving...
     if (bp->indexes_inparallel) {
@@ -556,11 +882,20 @@ int onefield_parameters_are_okay(onefield_t* bp, solver_t* sp) {
 }
 
 int onefield_is_run_obsolete(onefield_t* bp, solver_t* sp) {
-    // If we're just solving one field, check to see if it's already
-    // solved before doing a bunch of work and spewing tons of output.
-    if ((il_size(bp->fieldlist) == 1) && bp->solved_in) {
-        if (is_field_solved(bp, il_get(bp->fieldlist, 0)))
-            return 1;
+  // SECTION INDEX-SHARD: obsolete
+  if (bp->single_field_solved)
+    return 1;
+
+  if (bp->cancelled)
+    return 1;
+
+  if (bp->hit_total_cpulimit || bp->hit_total_timelimit)
+    return 1;
+  // If we're just solving one field, check to see if it's already
+  // solved before doing a bunch of work and spewing tons of output.
+  if ((il_size(bp->fieldlist) == 1) && bp->solved_in) {
+    if (is_field_solved(bp, il_get(bp->fieldlist, 0)))
+      return 1;
     }
     // Early check to see if this job was cancelled.
     if (bp->cancelfname) {
@@ -713,6 +1048,8 @@ static int sort_rdls(MatchObj* mymo, onefield_t* bp) {
 
 static anbool record_match_callback(MatchObj* mo, void* userdata) {
     onefield_t* bp = userdata;
+    // shard poll
+    index_shard_poll_from_callback(bp);
     solver_t* sp = &(bp->solver);
     MatchObj* mymo;
     int ind;
@@ -800,7 +1137,8 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
 
 static time_t timer_callback(void* user_data) {
     onefield_t* bp = user_data;
-
+    // shard poll
+    index_shard_poll_from_callback(bp);
     check_time_limits(bp);
 
     // check if the field has already been solved...
@@ -841,10 +1179,12 @@ static void add_onefield_params(onefield_t* bp, qfits_header* hdr) {
     fits_add_long_comment(hdr, "Y col name: %s", bp->ycolname?bp->ycolname:"(null)");
     fits_add_long_comment(hdr, "Start obj: %i", sp->startobj);
     fits_add_long_comment(hdr, "End obj: %i", sp->endobj);
-	
+
     // 'Solved_in' is often a NULL pointer.
-    // If %s is a NULL pointer, vasprintf() causes a segmentation fault (due to strlen()) on Solaris -> added treatment of this case for portability. 
-    // GNU/Linux implementation of vasprintf() catches NULL pointer and prints "(null)" in header. Seems to be an issue on Solaris only.
+    // If %s is a NULL pointer, vasprintf() causes a segmentation fault (due to
+    // strlen()) on Solaris -> added treatment of this case for portability.
+    // GNU/Linux implementation of vasprintf() catches NULL pointer and prints
+    // "(null)" in header. Seems to be an issue on Solaris only.
     fits_add_long_comment(hdr, "Solved_in: %s", bp->solved_in?bp->solved_in:"(null)");
     fits_add_long_comment(hdr, "Solved_out: %s", bp->solved_out?bp->solved_out:"(null)");
 
@@ -1306,7 +1646,7 @@ static int write_wcs_file(onefield_t* bp) {
 
         if (strlen(mo->fieldname))
             qfits_header_add(hdr, bp->fieldid_key, mo->fieldname, "Field name (copied from input field)", NULL);
-			
+
         if (qfits_header_dump(hdr, fout)) {
             logerr("Failed to write FITS WCS header.\n");
             return -1;
@@ -1409,7 +1749,7 @@ static int write_corr_file(onefield_t* bp) {
         fitstable_add_write_column(tab, itype, "index_id", "none");
         fitstable_add_write_column(tab, itype, "field_id", "none");
         fitstable_add_write_column(tab, dubl, "match_weight", "none");
-		
+
         if (mo->tagalong) {
             for (j=0; j<bl_size(mo->tagalong); j++) {
                 tagalong_t* tag = bl_access(mo->tagalong, j);
@@ -1497,7 +1837,7 @@ static int write_corr_file(onefield_t* bp) {
                 }
             }
         }
-		
+
         if (fitstable_fix_header(tab)) {
             ERROR("Failed to fix correspondence file header.");
             return -1;

@@ -43,6 +43,7 @@ ENGINE_SO := libastrometry.$(SO)
 LDFLAGS := $(LDFLAGS_DEF)
 
 LDLIBS := $(LDLIBS_DEF)
+LDLIBS += -pthread
 LDLIBS += $(ANFILES_LIB)
 
 SLIB := $(ENGINE_LIB)
@@ -50,6 +51,7 @@ SLIB += $(CATS_SLIB)
 SLIB += $(ANFILES_SLIB)
 
 CFLAGS += $(CFLAGS_DEF)
+CFLAGS += -pthread
 CFLAGS += $(CATS_INC)
 CFLAGS += $(ANFILES_CFLAGS)
 CFLAGS += $(ANFILES_INC)
@@ -72,7 +74,7 @@ ALL_WCSLIB_TARGETS :=
 # 	echo ZLIB_INC: $(ZLIB_INC)
 
 CFITS_UTILS := fitscopy imcopy
-# fitstomatlab 
+# fitstomatlab
 
 # The following are not usually distributed through cfitsio packaged in
 # major linux distributions
@@ -83,7 +85,7 @@ MISC_EXECS := project-usnob diffractionFlag_check hpgrid resort-xylist
 
 resort-xylist: resort-xylist-main.o resort-xylist.o $(SLIB)
 
-UTIL_OBJS := 
+UTIL_OBJS :=
 
 OTHER_OBJS := catalog.o codefile.o verify.o \
 	solver.o solvedfile.o pnpoly.o tweak.o \
@@ -115,7 +117,7 @@ ANLIBS := $(ANFILES_LIB) $(LIBKD_LIB) $(ANUTILS_LIB) $(GSL_LIB) $(QFITS_LIB)
 INSTALL_LIB := $(ENGINE_LIB) $(ENGINE_SO)
 
 ENGINE_OBJS := \
-		engine.o solverutils.o onefield.o solver.o quad-utils.o \
+		engine.o solverutils.o onefield.o index_shard.o solver.o quad-utils.o \
 		solvedfile.o tweak2.o \
 		verify.o tweak.o
 
@@ -125,7 +127,7 @@ ENGINE_OBJS += new-wcs.o fits-guess-scale.o cut-table.o \
 
 BUILD_INDEX_OBJS := build-index.o uniformize-catalog.o startree.o hpquads.o \
 	quad-builder.o quad-utils.o codefile.o codetree.o unpermute-stars.o \
-	unpermute-quads.o merge-index.o 
+	unpermute-quads.o merge-index.o
 ENGINE_OBJS += $(BUILD_INDEX_OBJS)
 
 #augment-xylist.o
@@ -193,7 +195,7 @@ simplexy: image2xy
 PY_INSTALL_DIR := $(PY_BASE_INSTALL_DIR)/solver
 LINK_DIR := $(PY_BASE_LINK_DIR)/solver
 
-PYTHON_EXECS := 
+PYTHON_EXECS :=
 PYTHON_INSTALL := $(PYTHON_EXECS) __init__.py
 
 install: $(INSTALL_EXECS) $(INSTALL_LIB)
