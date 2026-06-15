@@ -14,6 +14,7 @@ printhelp() {
   echo "  -h <scale-higher> [default: 999999]"
   echo "  -c <cpulimit> [default: 300]"
   echo "  -d <downsample> [default: 0]"
+  echo "  -b <object-limit>: Corresponds to --objs parameter in solve-field [default: 999999]"
   echo "  -r <number-of-runs> [default: 1]"
   echo "  -e <command-string>: Allows to call external tools and add their data to the generated file."
   echo "    <command-string> must consist of two parts separated by a colon (:)."
@@ -34,7 +35,7 @@ numreg="^([0-9]+(\.[0-9]+)?|\.[0-9]+)$"
 
 execind=0
 
-while getopts "i:n:o:l:h:c:d:r:e:" opt; do
+while getopts "i:n:o:l:h:c:d:b:r:e:" opt; do
   case $opt in
     i)
       if ! [ -d "$OPTARG" ]; then
@@ -74,6 +75,12 @@ while getopts "i:n:o:l:h:c:d:r:e:" opt; do
         echo "ERROR: Downsampling degree (-d) needs to be an integer."; printhelp
       fi
       downsample="$OPTARG"
+      ;;
+    b)
+      if ! [[ "$OPTARG" =~ $intreg ]] ; then
+        echo "ERROR: Object limit (-b) needs to be an integer."; printhelp
+      fi
+      objs="$OPTARG"
       ;;
     r)
       if ! [[ "$OPTARG" =~ $intreg ]] ; then
@@ -122,6 +129,7 @@ if [ -z "$scalehigh" ]; then scalehigh=999999; fi
 if [ -z "$scalelow" ]; then scalelow=0; fi
 if [ -z "$cpulimit" ]; then cpulimit=300; fi
 if [ -z "$downsample" ]; then downsample=0; fi
+if [ -z "$objs" ]; then objs=999999; fi
 if [ -z "$repeats" ]; then repeats=1; fi
 
 if [ "$EUID" -eq 0 ] && [ -z "$AN_ALLOW_ROOT" ]; then
@@ -163,8 +171,8 @@ notsolved=0
 timetaken=0
 shopt -s lastpipe
 
-printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n  \"cpulimit\": %s,\n  \"repeats\": %s"\
-  "$downsample" "$scalelow" "$scalehigh" "$cpulimit" "$repeats" >> "$outfile"
+printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n  \"cpulimit\": %s,\n  \"objs\": %s,\n  \"repeats\": %s"\
+  "$downsample" "$scalelow" "$scalehigh" "$cpulimit" "$objs" "$repeats" >> "$outfile"
 printf ",\n  \"images\": [" >> "$outfile"
 
 inputfiles=$(find "$indir" -mindepth 1 -maxdepth 1 -type f -name "$namescheme" | sort)
@@ -197,8 +205,8 @@ for runind in $(seq "$repeats"); do
     fi
 
     t0=$( echo $EPOCHREALTIME | tr -dc "0-9")
-    output="$(solve-field --overwrite --no-plots --downsample "$downsample"\
-    --scale-units arcsecperpix --scale-low "$scalelow" --scale-high "$scalehigh" --cpulimit "$cpulimit" "$file" 2>/dev/null)"
+    output="$(solve-field --overwrite --no-plots -z "$downsample"\
+    -u app -L "$scalelow" -H "$scalehigh" -l "$cpulimit" --objs "$objs" "$file" 2>/dev/null)"
     t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
     td=$((t1-t0))
 
