@@ -14,7 +14,7 @@ printhelp() {
   echo "  -h <scale-higher> [default: 999999]"
   echo "  -c <cpulimit> [default: 300]"
   echo "  -d <downsample> [default: 0]"
-  echo "  -r <number-of-runs> [default: 1] NOT YET IMPLEMENTED"
+  echo "  -r <number-of-runs> [default: 1]"
   echo "  -e <command-string>: Allows to call external tools and add their data to the generated file."
   echo "    <command-string> must consist of two parts separated by a colon (:)."
   echo "    The first part is a command to be run, while the second part is the corresponding field name."
