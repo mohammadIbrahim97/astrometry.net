@@ -29,3 +29,45 @@
 ```
   Ergebnis: .solved, .wcs, .match, .corr, .rdls und normalisierte Logs matchen. Kein CLI-Verhalten geaendert, keine neue Parallelitaet. make zeigt weiterhin die bestehende git describe-Warnung fatal: No names found, cannot
   describe anything.
+
+  ```bash
+  docker run --rm \
+    -v "$PWD:/work" \
+    -v /tmp:/hosttmp \
+    -w /work \
+    astrometrynet/solver:test \
+    bash -lc '
+      set -e
+      printf "%s\n" \
+        "add_path /usr/local/data" \
+        "index index-4119.fits" \
+        "index index-4118.fits" \
+        "index index-4117.fits" \
+        "index index-4116.fits" \
+        "index index-4115.fits" \
+        "index index-4114.fits" \
+        "index index-4113.fits" \
+        "index index-4112.fits" \
+        "index index-4111.fits" \
+        "index index-4110.fits" \
+        "index index-4109.fits" \
+        "index index-4108.fits" \
+        "index index-4107.fits" \
+        > /tmp/indexes.cfg
+
+      rm -rf /hosttmp/best-frame-solve
+
+      eval/solve_best_blur_frame.sh \
+        --images-dir /src/Astrometry-testing-data/data/20260303200006652 \
+        --out-dir /hosttmp/best-frame-solve \
+        --solve-workers 4 \
+        --allow-best-below-threshold \
+        --solve-field solve-field \
+        -- \
+        --config /tmp/indexes.cfg \
+        --depth 10-20 \
+        -L 2.5 -H 3.2 -u arcsecperpix
+    '
+
+
+  ```
