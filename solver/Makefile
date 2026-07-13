@@ -21,6 +21,7 @@ export SYSTEM_GSL
 include $(COMMON)/makefile.common
 include $(COMMON)/makefile.anfiles
 include $(COMMON)/makefile.cfitsio
+include $(COMMON)/makefile.sep
 # only for tweak-main.c
 include $(COMMON)/makefile.png
 include $(COMMON)/makefile.cairo
@@ -44,6 +45,7 @@ LDFLAGS := $(LDFLAGS_DEF)
 
 LDLIBS := $(LDLIBS_DEF)
 LDLIBS += $(ANFILES_LIB)
+LDLIBS += $(SEP_LIB)
 
 SLIB := $(ENGINE_LIB)
 SLIB += $(CATS_SLIB)
@@ -53,6 +55,8 @@ CFLAGS += $(CFLAGS_DEF)
 CFLAGS += $(CATS_INC)
 CFLAGS += $(ANFILES_CFLAGS)
 CFLAGS += $(ANFILES_INC)
+CFLAGS += $(SEP_CFLAGS)
+CFLAGS += $(SEP_INC)
 # boilerplate.h
 CFLAGS += -I$(ANUTILS_DIR)
 # wcs-resample.h

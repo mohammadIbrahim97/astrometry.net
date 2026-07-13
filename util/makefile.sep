@@ -1,0 +1,16 @@
+# Optional SEP (Source Extraction and Photometry) support.
+#
+# Autodetect when a pkg-config file exists, or force it with:
+#   make HAVE_SEP=yes SEP_INC="-I/path/include" SEP_LIB="-L/path/lib -lsep"
+
+HAVE_SEP ?= $(shell pkg-config --exists sep 2>/dev/null && echo yes || echo no)
+
+ifeq ($(HAVE_SEP),yes)
+SEP_INC ?= $(shell pkg-config --cflags sep 2>/dev/null)
+SEP_LIB ?= $(shell pkg-config --libs sep 2>/dev/null || echo -lsep)
+SEP_CFLAGS := -DHAVE_SEP
+else
+SEP_INC :=
+SEP_LIB :=
+SEP_CFLAGS :=
+endif

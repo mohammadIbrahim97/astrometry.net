@@ -115,6 +115,87 @@ static void write_fits_i16_image(const int16_t* img, int nx, int ny, const char*
     if (fits_write_i16_image(img, nx, ny, fn)) exit(-1);
 }
 
+static float bgsub_value(const float* bgsub, const int16_t* bgsub_i16, int ind) {
+    if (bgsub)
+        return bgsub[ind];
+    return bgsub_i16[ind];
+}
+
+static void measure_source_shape(const float* bgsub, const int16_t* bgsub_i16,
+                                 int nx, int ny, float x, float y,
+                                 float dpsf, float* fwhm, float* ellipticity) {
+    const double fwhm_factor = 2.3548200450309493;
+    int radius = (int)ceil(MAX(4.0, 6.0 * (double)dpsf));
+    int ix = (int)(x + 0.5);
+    int iy = (int)(y + 0.5);
+    int xlo, xhi, ylo, yhi;
+    int i, j;
+    double sum = 0.0;
+    double sumx = 0.0;
+    double sumy = 0.0;
+    double xbar, ybar;
+    double mxx = 0.0;
+    double myy = 0.0;
+    double mxy = 0.0;
+    double trace, det, disc, lambda1, lambda2;
+
+    *fwhm = 0.0;
+    *ellipticity = 1.0;
+
+    radius = MIN(radius, 20);
+    xlo = MAX(0, ix - radius);
+    xhi = MIN(nx - 1, ix + radius);
+    ylo = MAX(0, iy - radius);
+    yhi = MIN(ny - 1, iy + radius);
+
+    for (j = ylo; j <= yhi; j++) {
+        for (i = xlo; i <= xhi; i++) {
+            double w = bgsub_value(bgsub, bgsub_i16, i + j * nx);
+            if (w <= 0.0)
+                continue;
+            sum += w;
+            sumx += w * i;
+            sumy += w * j;
+        }
+    }
+    if (sum <= 0.0)
+        return;
+
+    xbar = sumx / sum;
+    ybar = sumy / sum;
+
+    for (j = ylo; j <= yhi; j++) {
+        for (i = xlo; i <= xhi; i++) {
+            double dx, dy;
+            double w = bgsub_value(bgsub, bgsub_i16, i + j * nx);
+            if (w <= 0.0)
+                continue;
+            dx = i - xbar;
+            dy = j - ybar;
+            mxx += w * dx * dx;
+            myy += w * dy * dy;
+            mxy += w * dx * dy;
+        }
+    }
+
+    mxx /= sum;
+    myy /= sum;
+    mxy /= sum;
+
+    trace = mxx + myy;
+    det = mxx * myy - mxy * mxy;
+    disc = trace * trace - 4.0 * det;
+    if (disc < 0.0)
+        disc = 0.0;
+    lambda1 = 0.5 * (trace + sqrt(disc));
+    lambda2 = 0.5 * (trace - sqrt(disc));
+    if (lambda1 <= 0.0 || lambda2 < 0.0)
+        return;
+
+    *fwhm = (float)(fwhm_factor * sqrt((lambda1 + lambda2) / 2.0));
+    *ellipticity = (float)(1.0 - sqrt(lambda2 / lambda1));
+}
+
 
 void simplexy_fill_in_defaults(simplexy_t* s) {
     if (s->dpsf == 0)
@@ -166,6 +247,10 @@ void simplexy_free_contents(simplexy_t* s) {
     s->flux = NULL;
     free(s->background);
     s->background = NULL;
+    free(s->fwhm);
+    s->fwhm = NULL;
+    free(s->ellipticity);
+    s->ellipticity = NULL;
     free(s->fluxL);
     free(s->backgroundL);
     s->fluxL = s->backgroundL = NULL;
@@ -404,6 +489,8 @@ int simplexy_run(simplexy_t* s) {
     s->y   = realloc(s->y, s->npeaks * sizeof(float));
     s->flux       = malloc(s->npeaks * sizeof(float));
     s->background = malloc(s->npeaks * sizeof(float));
+    s->fwhm        = malloc(s->npeaks * sizeof(float));
+    s->ellipticity = malloc(s->npeaks * sizeof(float));
 
     if (s->Lorder) {
         s->fluxL       = malloc(s->npeaks * sizeof(float));
@@ -434,6 +521,8 @@ int simplexy_run(simplexy_t* s) {
 
         s->flux[i] -= s->globalbg;
         s->background[i] += s->globalbg;
+        measure_source_shape(bgsub, bgsub_i16, nx, ny, s->x[i], s->y[i],
+                             s->dpsf, s->fwhm + i, s->ellipticity + i);
 
         if (s->Lorder) {
             lanczos_args_t L;
@@ -494,4 +583,3 @@ int simplexy_run(simplexy_t* s) {
 void simplexy_clean_cache() {
     dselip_cleanup();
 }
-

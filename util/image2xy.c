@@ -103,6 +103,8 @@ int image2xy_run(simplexy_t* s,
         // center of the lower-left pixel is (1,1).
         (s->x)[jj] = ((s->x)[jj] + 0.5) * (double)S + 0.5;
         (s->y)[jj] = ((s->y)[jj] + 0.5) * (double)S + 0.5;
+        if (s->fwhm)
+            (s->fwhm)[jj] *= (float)S;
     }
 
     dselip_cleanup();
@@ -114,4 +116,3 @@ int image2xy_run(simplexy_t* s,
     }
     return rtn;
 }
-

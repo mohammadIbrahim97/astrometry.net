@@ -166,6 +166,8 @@ struct solver_t {
     int num_abscale_skipped;
     // The number of times we ran verification on a quad.
     int num_verified;
+    // Wall-clock seconds spent inside verify_hit() calls for this field.
+    double verify_timeused;
 
     // INTERNAL PARAMETERS; DO NOT MODIFY
     // ==================================

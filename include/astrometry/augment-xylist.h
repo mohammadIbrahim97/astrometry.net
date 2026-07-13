@@ -82,6 +82,7 @@ struct augment_xylist_s {
     anbool force_ppm;
 
     anbool use_source_extractor;
+    anbool use_sep;
     char* source_extractor_path;
     char* source_extractor_config;
 
@@ -172,5 +173,4 @@ void augment_xylist_print_special_opts(an_option_t* opt, bl* opts,
                                        FILE* fid, void* extra);
 
 #endif
-
 

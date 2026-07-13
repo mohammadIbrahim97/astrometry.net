@@ -27,4 +27,13 @@ int image2xy_files(const char* infn, const char* outfn,
                    int extension, int plane,
                    simplexy_t* params);
 
+/**
+ Optional SEP-backed source extraction.  This function is always available
+ as a symbol, but returns an error unless the binary was built with HAVE_SEP.
+ */
+int image2xy_files_sep(const char* infn, const char* outfn,
+                       int downsample, int downsample_as_required,
+                       int extension, int plane,
+                       simplexy_t* params);
+
 #endif
