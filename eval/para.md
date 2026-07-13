@@ -71,3 +71,6 @@
 
 
   ```
+
+
+      docker run --rm -v "$PWD:/work" -w /work astrometrynet/solver:test ./eval/solve_best_overall_frame.sh
