@@ -40,7 +40,9 @@ def _run(backends, files, jobs):
 
 
 def main():
-    backends = ["source-extractor", "simplexy", "sep"]
+    # _run_all is backend-agnostic; generic labels keep this test decoupled
+    # from which backends currently exist.
+    backends = ["b1", "b2", "b3"]
 
     # 3 backends x 1 image, pool of 4 -> all 3 run at once.
     summary, _wall, peak, rows = _run(backends, ["/img.png"], jobs=4)
@@ -58,8 +60,8 @@ def main():
     assert len(rows1) == 3
 
     # per-backend aggregation over multiple images.
-    summary, _w, _p, rows = _run(["sep"], ["/a.png", "/b.png"], jobs=2)
-    assert summary["sep"]["ok"] == 2, summary
+    summary, _w, _p, rows = _run(["b1"], ["/a.png", "/b.png"], jobs=2)
+    assert summary["b1"]["ok"] == 2, summary
     assert len(rows) == 2
 
     print("ok: _run_all pools backends concurrently and aggregates per backend")

@@ -31,8 +31,7 @@ FILTER_NAME = "/usr/share/source-extractor/gauss_3.0_5x5.conv"
 FITS_EXTS = (".fits", ".fit", ".fts")
 BACKEND_SOURCE_EXTRACTOR = "source-extractor"
 BACKEND_SIMPLEXY = "simplexy"
-BACKEND_SEP = "sep"
-SOURCE_BACKENDS = (BACKEND_SOURCE_EXTRACTOR, BACKEND_SIMPLEXY, BACKEND_SEP)
+SOURCE_BACKENDS = (BACKEND_SOURCE_EXTRACTOR, BACKEND_SIMPLEXY)
 
 
 class InsufficientSources(RuntimeError):
@@ -147,7 +146,7 @@ def detect_sources(image,
     FWHM falls inside FWHM_RANGE."""
     if backend not in SOURCE_BACKENDS:
         raise ValueError(f"Unknown source extraction backend: {backend}")
-    if backend in (BACKEND_SIMPLEXY, BACKEND_SEP):
+    if backend == BACKEND_SIMPLEXY:
         return _detect_sources_image2xy(
             image,
             backend,
@@ -233,7 +232,7 @@ def _main(argv=None):
     p.add_argument("image")
     p.add_argument("--backend", choices=SOURCE_BACKENDS, default=BACKEND_SOURCE_EXTRACTOR)
     p.add_argument("--image2xy-path",
-                   help="Path to image2xy for simplexy/sep backends.")
+                   help="Path to image2xy for the simplexy backend.")
     p.add_argument("--target-fwhm", type=float, default=DEFAULT_TARGET_FWHM)
     p.add_argument("--detect-thresh", type=float, default=DETECT_THRESH)
     p.add_argument("--raw", action="store_true",

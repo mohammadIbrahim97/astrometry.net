@@ -8,7 +8,7 @@ Usage:
     python -m astrometry.util.blur_score_benchmark \
         --paths img1.png img2.fits ...
     python -m astrometry.util.blur_score_benchmark \
-        --images-dir /src/Astrometry-testing-data/data --backend sep --jobs 4
+        --images-dir /src/Astrometry-testing-data/data --backend simplexy --jobs 4
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -152,7 +152,7 @@ def main(argv=None):
     p.add_argument("--downsample", type=int, default=0)
     p.add_argument("--downsample-as-required", type=int, default=3)
     p.add_argument("--image2xy-path",
-                   help="Path to image2xy for simplexy/sep backends.")
+                   help="Path to image2xy for the simplexy backend.")
     p.add_argument("--max-images", type=int,
                    help="Limit the number of images for quick benchmark runs.")
     p.add_argument("--jobs", type=int, default=4,
