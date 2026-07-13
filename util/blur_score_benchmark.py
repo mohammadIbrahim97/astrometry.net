@@ -8,7 +8,7 @@ Usage:
     python -m astrometry.util.blur_score_benchmark \
         --paths img1.png img2.fits ...
     python -m astrometry.util.blur_score_benchmark \
-        --images-dir /src/Astrometry-testing-data/data --backend sep --jobs 4
+        --images-dir /src/Astrometry-testing-data/data --backend simplexy --jobs 4
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -106,9 +106,14 @@ def _write_result(writer, result):
     ])
 
 
-def _run_backend(backend, files, opts, jobs, writer):
-    summary = {"ok": 0, "insufficient": 0, "error": 0, "elapsed": 0.0}
-    tasks = [(backend, path, opts) for path in files]
+def _run_all(backends, files, opts, jobs, writer):
+    """Run every (backend x image) task in a single shared pool, so multiple
+    backends on the same image run concurrently. Returns (per-backend summary
+    dict, overall wall seconds). CSV rows are written in submission order
+    (backend-major), so single-backend output is unchanged."""
+    summary = {b: {"ok": 0, "insufficient": 0, "error": 0, "elapsed": 0.0}
+               for b in backends}
+    tasks = [(backend, path, opts) for backend in backends for path in files]
     start = time.perf_counter()
 
     if jobs == 1:
@@ -119,20 +124,20 @@ def _run_backend(backend, files, opts, jobs, writer):
 
     try:
         for result in results:
+            item = summary[result["backend"]]
             if result["status"] == "ok":
-                summary["ok"] += 1
+                item["ok"] += 1
             elif result["status"] == "insufficient_sources":
-                summary["insufficient"] += 1
+                item["insufficient"] += 1
             else:
-                summary["error"] += 1
-            summary["elapsed"] += result["elapsed"]
+                item["error"] += 1
+            item["elapsed"] += result["elapsed"]
             _write_result(writer, result)
     finally:
         if jobs != 1:
             pool.shutdown()
 
-    summary["wall"] = time.perf_counter() - start
-    return summary
+    return summary, time.perf_counter() - start
 
 
 def main(argv=None):
@@ -147,7 +152,7 @@ def main(argv=None):
     p.add_argument("--downsample", type=int, default=0)
     p.add_argument("--downsample-as-required", type=int, default=3)
     p.add_argument("--image2xy-path",
-                   help="Path to image2xy for simplexy/sep backends.")
+                   help="Path to image2xy for the simplexy backend.")
     p.add_argument("--max-images", type=int,
                    help="Limit the number of images for quick benchmark runs.")
     p.add_argument("--jobs", type=int, default=4,
@@ -184,19 +189,23 @@ def main(argv=None):
         "image2xy_path": args.image2xy_path,
         "target_fwhm": args.target_fwhm,
     }
-    summary = {}
+    summary, wall = _run_all(backends, files, opts, args.jobs, writer)
     for backend in backends:
-        summary[backend] = _run_backend(backend, files, opts, args.jobs, writer)
         item = summary[backend]
         total = item["ok"] + item["insufficient"] + item["error"]
         print(
             "# summary "
             f"backend={backend} total={total} ok={item['ok']} "
             f"insufficient={item['insufficient']} error={item['error']} "
-            f"elapsed_s={item['elapsed']:.3f} wall_s={item['wall']:.3f} "
-            f"jobs={args.jobs}",
+            f"elapsed_s={item['elapsed']:.3f} jobs={args.jobs}",
             file=sys.stderr
         )
+    print(
+        "# summary_all "
+        f"backends={len(backends)} images={len(files)} "
+        f"tasks={len(backends) * len(files)} wall_s={wall:.3f} jobs={args.jobs}",
+        file=sys.stderr
+    )
     return 0
 
 

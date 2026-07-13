@@ -110,3 +110,5 @@ report.txt
 *.solved
 *.wcs
 *.xyls
+*.log
+*.csv
