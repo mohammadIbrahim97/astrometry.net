@@ -19,6 +19,7 @@ if ! [[ "$2" =~ $numreg ]] || ! [[ "$3" =~ $numreg ]]; then
 fi
 
 thisdir="$(realpath "$(dirname "$0")")"
+cleantool="$(realpath "$(dirname "$thisdir")")/tools/clean.sh"
 tmpfn="$thisdir/astrometry_streaming_tmp.txt"
 
 if ! touch "$tmpfn"; then
@@ -42,7 +43,8 @@ while true; do
     continue
   fi
   output="$($1 "$fn" --overwrite -p -l 5 -z 2 -L $2 -H $3)"
-  if [ -f "${fn%.*}.solved" ]; then
+  noext="${fn%.*}"
+  if [ -f "$noext.solved" ]; then
     echo "$output" | grep "Field center: (RA,Dec) ="
     distline="$(echo "$output" | grep -n -m 1 "brightest distractors are" | cut -d: -f1)"
     echo "$output" | tail -n +$distline
@@ -51,7 +53,7 @@ while true; do
   fi
   last_tried="$fn"
 
-  # TODO: Clean
+  eval "$cleantool $(dirname "$fn") $(basename "$noext")" >/dev/null
 done &
 
 while true; do
