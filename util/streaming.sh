@@ -58,9 +58,7 @@ done &
 
 while true; do
   read -r infn
-  bs="0.3" # Mock
-  # bs="$(python3 "$thisdir/blur_score.py $infn")"
-  # TODO: Connect with actual blur score
+  bs="$(python3 "$thisdir/blur_score.py" "$infn")"
   echo "Blurscore for $infn is $bs" >&2
   if (( $(echo "$bs < 0.7" | bc -l) )); then
     echo "Acceptable" >&2
