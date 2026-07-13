@@ -44,9 +44,13 @@ RUN apt-get -y update && apt-get install -y apt-utils && \
 #    scipy \
 #    matplotlib \
 # Pip installs
+# Pin astropy<7: astropy 8.x demands numpy>=2 and packaging>=25, which pip cannot
+# install over the dpkg-managed distro numpy/packaging (no RECORD file) and which
+# would break the apt-built scipy/matplotlib ABI. astropy 6.x is satisfied by the
+# distro numpy 1.26 / packaging 24, so pip upgrades nothing.
 RUN for x in \
     fitsio \
-    astropy \
+    'astropy<7' \
     ; do pip3 install --no-cache --break-system-packages $x; done
 
 # to help astrometry.net find netpbm (yuck)
