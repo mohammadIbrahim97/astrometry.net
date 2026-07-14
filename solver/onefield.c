@@ -745,15 +745,36 @@ void onefield_run(onefield_t* bp) {
     if (bp->single_field_solved)
         goto cleanup;
     // SECTION INDEX-SHARD: onefield-entry
-    if (index_shard_pthread_enabled() && index_shard_pool_active(bp)) {
-      int shard_rc;
+     if (index_shard_pthread_enabled() && index_shard_pool_active(bp)) {
+      index_shard_solve_status_t shard_status;
 
-      shard_rc = index_shard_solve(bp, sp, Nindexes, &onefield_index_shard_hooks);
+      shard_status =
+          index_shard_solve(bp, sp, Nindexes,
+                            &onefield_index_shard_hooks);
 
-      if (shard_rc < 0) {
-        logmsg("[index-shard] pthread solve failed; falling back to original "
-               "path\n");
-      } else {
+      switch (shard_status) {
+      case INDEX_SHARD_SOLVE_HANDLED:
+        goto cleanup;
+
+      case INDEX_SHARD_SOLVE_UNAVAILABLE:
+        logmsg("[index-shard] pthread path unavailable; using original "
+               "serial path\n");
+        break;
+
+      case INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE:
+        logmsg("[index-shard] pthread solve failed before master commit; "
+               "using original serial path\n");
+        break;
+
+      case INDEX_SHARD_SOLVE_TERMINAL_FAILURE:
+        logerr("[index-shard] pthread solve failed after master commit; "
+               "serial fallback suppressed\n");
+        goto cleanup;
+
+      default:
+        logerr("[index-shard] unexpected solve status %i; "
+               "serial fallback suppressed\n",
+               (int)shard_status);
         goto cleanup;
       }
     }
