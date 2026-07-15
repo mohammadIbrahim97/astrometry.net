@@ -59,6 +59,8 @@ CFLAGS += $(ANFILES_INC)
 CFLAGS += -I$(ANUTILS_DIR)
 # wcs-resample.h
 CFLAGS += -I.
+# private Product-KD/executor interfaces
+CFLAGS += -I$(BASEDIR)/libkd
 CFLAGS += $(CFITS_INC)
 
 SHAREDLIBFLAGS := $(SHAREDLIBFLAGS_DEF)
@@ -118,7 +120,7 @@ INSTALL_LIB := $(ENGINE_LIB) $(ENGINE_SO)
 
 ENGINE_OBJS := \
 		engine.o solverutils.o onefield.o index_shard.o solver.o quad-utils.o \
-		solvedfile.o tweak2.o \
+		solvedfile.o tweak2.o index_shard_config.o \
 		verify.o tweak.o
 
 # These are required by solve-field and friends

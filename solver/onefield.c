@@ -22,7 +22,7 @@
 #include <assert.h>
 
 #include "anqfits.h"
-#include "astrometry/index_shard.h"
+#include "index_shard_internal.h"
 #include "bl-sort.h"
 #include "boilerplate.h"
 #include "codekd.h"
@@ -594,6 +594,15 @@ static int onefield_index_shard_merge_solutions(onefield_t *master_bp,
     bl_insert_sorted(master_bp->solutions, src, compare_matchobjs);
 
     if (src->logodds >= master_bp->logratio_tosolve) {
+      /*
+       * Preserve the original Astrometry.net solved-match presentation at
+       * the authoritative master commit point. Print only the first solving
+       * MatchObj transferred by this reduction.
+       */
+      if (!solved) {
+        matchobj_print(src, log_get_level());
+      }
+
       solved_field(master_bp, src->fieldnum);
       master_bp->single_field_solved = TRUE;
       solved = TRUE;
@@ -768,6 +777,11 @@ void onefield_run(onefield_t* bp) {
 
       case INDEX_SHARD_SOLVE_TERMINAL_FAILURE:
         logerr("[index-shard] pthread solve failed after master commit; "
+               "serial fallback suppressed\n");
+        goto cleanup;
+
+      case INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT:
+        logerr("[index-shard] pthread lifecycle conflict; "
                "serial fallback suppressed\n");
         goto cleanup;
 

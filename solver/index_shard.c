@@ -34,15 +34,14 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <sched.h>
 
-#include "astrometry/index_shard.h"
+#include "index_shard_internal.h"
+#include "index_shard_config.h"
 #include "astrometry/bl.h"
 #include "astrometry/errors.h"
 #include "astrometry/log.h"
 #include "astrometry/tic.h"
-#include "astrometry/kdtree_phase_a.h"
-
+#include "kdtree_phase_a_internal.h"
 /*
  * SECTION INDEX-SHARD: types
  */
@@ -194,11 +193,11 @@ struct index_shard_aux_group {
   int pending;
   int failed;
   int closed;
+  unsigned long progress;
 };
 
 typedef struct index_shard_aux_queue {
   pthread_mutex_t mutex;
-  pthread_cond_t cv;
 
   index_shard_aux_task_t *head;
   index_shard_aux_task_t *tail;
@@ -209,9 +208,20 @@ typedef struct index_shard_aux_queue {
   unsigned long long submitted_total;
   unsigned long long executed_total;
   unsigned long long rejected_total;
+  unsigned long long cancelled_total;
 
   int stopping;
 } index_shard_aux_queue_t;
+
+typedef struct index_shard_aux_metrics_snapshot {
+  unsigned long long submitted;
+  unsigned long long executed;
+  unsigned long long rejected;
+  unsigned long long cancelled;
+
+  size_t pending;
+  size_t max_pending;
+} index_shard_aux_metrics_snapshot_t;
 // ANCHOR INDEX-SHARD: pool-state
 /*
  * Persistent worker pool for one engine job.
@@ -221,8 +231,8 @@ typedef struct index_shard_aux_queue {
  * generation.
  */
 struct index_shard_pool {
-  onefield_t *bp;
-  solver_t *base_sp;
+  onefield_t *owner_bp;
+  solver_t *owner_sp;
 
   int worker_count;
   pthread_t *threads;
@@ -232,16 +242,13 @@ struct index_shard_pool {
   pthread_cond_t work_cv;
 
   int shutdown;
+  int stopping;
+  int pass_active;
   unsigned long generation; // pass submission counter
 
   index_shard_thread_state_t shared;
   index_shard_aux_queue_t auxq;
 
-  pthread_mutex_t aux_mutex;
-  pthread_cond_t aux_cv;
-  index_shard_aux_task_t *aux_head;
-  index_shard_aux_task_t *aux_tail;
-  int aux_stopping;
 } ;
 
 static index_shard_pool_t *index_shard_global_pool = NULL;
@@ -253,18 +260,17 @@ static pthread_once_t index_shard_tls_once = PTHREAD_ONCE_INIT;
 static int index_shard_aux_queue_init(index_shard_aux_queue_t *q,
                                       size_t max_pending);
 static void index_shard_aux_queue_destroy(index_shard_aux_queue_t *q);
-static int index_shard_aux_queue_push(index_shard_aux_queue_t *q,
+static int index_shard_aux_queue_push(index_shard_pool_t *pool,
                                       index_shard_aux_task_t *task);
-static index_shard_aux_task_t *index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q);
-static index_shard_aux_task_t *index_shard_aux_try_pop(index_shard_pool_t *pool);
+static index_shard_aux_task_t *
+index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q);
+static void index_shard_aux_group_done(index_shard_aux_group_t *group,
+                                       int failed);
+static void index_shard_aux_cancel_list(index_shard_aux_task_t *task);
 static void index_shard_aux_execute_one(index_shard_aux_task_t *task);
-static void index_shard_aux_execute(index_shard_aux_task_t *task);
-static int index_shard_aux_submit(index_shard_aux_group_t *group,
-                                  kdtree_task_fn fn,
-                                  void *userdata);
+static int index_shard_kdtree_wait(void *userdata);
 static int index_shard_kdtree_capacity(void *userdata,
                                        kdtree_task_capacity_t *capacity);
-static int index_shard_aux_wait(index_shard_aux_group_t *group);
 
 /*
  * SECTION INDEX-SHARD: tls - thread logical singleton
@@ -292,68 +298,21 @@ static index_shard_worker_context_t *index_shard_get_tls(void) {
 }
 
 /*
- * SECTION INDEX-SHARD: env
+ * SECTION INDEX-SHARD: configuration
  *
- * Runtime controls:
- *   ASTROMETRY_INDEX_SHARDING=pthread  -> enable pthread shard mode
- *   ASTROMETRY_INDEX_SHARD_WORKERS=N   -> requested worker count
- *   ASTROMETRY_INDEX_SHARD_TRACE=1     -> verbose per-task diagnostics
- *
- * Avoid adding more env knobs unless the behavior is truly experimental.
+ * Process environment and platform defaults are resolved once by the private
+ * configuration module. Hot execution paths consume immutable values only.
  */
 anbool index_shard_pthread_enabled(void) {
-  const char *mode = getenv("ASTROMETRY_INDEX_SHARDING");
-  return mode && !strcmp(mode, "pthread");
+  return index_shard_config_get()->pthread_enabled;
 }
 
 anbool index_shard_trace_enabled(void) {
-  const char *trace = getenv("ASTROMETRY_INDEX_SHARD_TRACE");
-
-  if (!trace || !trace[0])
-    return FALSE;
-
-  return (!strcmp(trace, "1") || !strcasecmp(trace, "true") || !strcasecmp(trace, "yes"));
+  return index_shard_config_get()->trace_enabled;
 }
 
 static int index_shard_get_worker_count(size_t nindexes) {
-  // cap by nindexes for small passes
-  // default to online CPU count, fallback to 2 if sysconf is unavailable
-  const char *env = getenv("ASTROMETRY_INDEX_SHARD_WORKERS");
-  long n = 0;
-
-  if (env && env[0]) {
-    char *end = NULL;
-
-    errno = 0;
-    n = strtol(env, &end, 10);
-
-    if (errno || end == env || n <= 0) {
-      logmsg("[index-shard] invalid ASTROMETRY_INDEX_SHARD_WORKERS=%s; using default\n", env);
-      n = 0;
-    }
-  }
-
-  if (n <= 0) {
-#ifdef _SC_NPROCESSORS_ONLN
-    n = sysconf(_SC_NPROCESSORS_ONLN);
-#else
-    n = 2;
-#endif
-  }
-
-  if (n <= 0)
-    n = 2;
-
-  if (nindexes && (size_t)n > nindexes)
-    n = (long)nindexes;
-
-  if (n < 1)
-    n = 1;
-
-  if (n > INT_MAX)
-    n = INT_MAX;
-
-  return (int)n;
+  return index_shard_config_effective_workers(nindexes);
 }
 
 typedef struct index_shard_pass_state_snapshot {
@@ -362,6 +321,14 @@ typedef struct index_shard_pass_state_snapshot {
   int solved_published;
   int master_committed;
 } index_shard_pass_state_snapshot_t;
+
+typedef struct index_shard_pass_metrics_snapshot {
+  size_t reduced;
+
+  double wall_seconds;
+  float cpu_seconds;
+  double cpu_percent;
+} index_shard_pass_metrics_snapshot_t;
 
 // ANCHOR INDEX-SHARD: pass-state-snapshot
 /*
@@ -384,6 +351,56 @@ static void index_shard_pass_state_snapshot(index_shard_thread_state_t *shared,
   snapshot->master_committed = shared->master_committed;
 
   pthread_mutex_unlock(&shared->state_mutex);
+}
+
+/*
+ * Snapshot completed-pass metrics.
+ *
+ * This function is called only after index_shard_pool_reduce_online() has
+ * returned and all participating workers have left the pass.
+ */
+static void index_shard_pass_metrics_snapshot(
+    index_shard_thread_state_t *shared,
+    index_shard_pass_metrics_snapshot_t *snapshot) {
+  assert(shared);
+  assert(snapshot);
+
+  snapshot->reduced = shared->next_reduce;
+  snapshot->wall_seconds =
+      timenow() - shared->pass_wall_start;
+  snapshot->cpu_seconds =
+      get_cpu_usage() - shared->pass_cpu_start;
+  snapshot->cpu_percent = 0.0;
+
+  if (snapshot->wall_seconds > 0.0) {
+    snapshot->cpu_percent =
+        (100.0 * (double)snapshot->cpu_seconds) /
+        snapshot->wall_seconds;
+  }
+}
+
+/*
+ * Take one synchronized snapshot of auxiliary queue accounting.
+ *
+ * submitted counts accepted tasks only. Rejected tasks are therefore
+ * deliberately excluded from the accepted-task completion equation.
+ */
+static void index_shard_aux_metrics_snapshot(
+    index_shard_aux_queue_t *queue,
+    index_shard_aux_metrics_snapshot_t *snapshot) {
+  assert(queue);
+  assert(snapshot);
+
+  pthread_mutex_lock(&queue->mutex);
+
+  snapshot->submitted = queue->submitted_total;
+  snapshot->executed = queue->executed_total;
+  snapshot->rejected = queue->rejected_total;
+  snapshot->cancelled = queue->cancelled_total;
+  snapshot->pending = queue->pending;
+  snapshot->max_pending = queue->max_pending;
+
+  pthread_mutex_unlock(&queue->mutex);
 }
 
 // ANCHOR INDEX-SHARD: wake-pass-waiters
@@ -409,9 +426,17 @@ static void index_shard_wake_pass_waiters(index_shard_thread_state_t *shared) {
  * This is intentionally not pthread_cancel.
  */
 static void index_shard_request_stop(index_shard_thread_state_t *shared) {
+  int was_stopped;
+
   pthread_mutex_lock(&shared->state_mutex);
+  was_stopped = shared->stop_requested;
   shared->stop_requested = TRUE;
   pthread_mutex_unlock(&shared->state_mutex);
+
+  if (!was_stopped && index_shard_trace_enabled()) {
+    logmsg("[index-shard] stop-request pass_wall=%.3f\n",
+           timenow() - shared->pass_wall_start);
+  }
 
   index_shard_wake_pass_waiters(shared);
 }
@@ -840,8 +865,12 @@ static int index_shard_claim_one(index_shard_thread_state_t *shared,
   shared->running_tasks++;
 
   if (index_shard_trace_enabled()) {
-    logmsg("[index-shard] claim index_order=%zu running=%i active_limit=%i\n",
-           *index_order, shared->running_tasks, shared->active_limit);
+    logmsg("[index-shard] claim index_order=%zu running=%i active_limit=%i "
+           "wall_since_pass=%.3f\n",
+           *index_order,
+           shared->running_tasks,
+           shared->active_limit,
+           timenow() - shared->pass_wall_start);
   }
 
   pthread_mutex_unlock(&shared->queue_mutex);
@@ -1029,16 +1058,24 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   // analyze before reducer so worker can trigger fast stop
   index_shard_capture_solution_analysis(shared, result);
 
-  if (ctx->local_bp.single_field_solved)
+    if (ctx->local_bp.single_field_solved) {
     result->solved = TRUE;
+  }
 
-  // release through original onefield ownership hook
-  if (shared->hooks->done_with_index)
-    shared->hooks->done_with_index(shared->bp, index_order, index);
-
+  /*
+   * Log the index name before done_with_index() releases index ownership.
+   */
   if (index_shard_trace_enabled()) {
-    logmsg("[index-shard] worker=%i start index_order=%zu index=%s\n", ctx->worker_id, index_order,
+    logmsg("[index-shard] worker=%i finish index_order=%zu index=%s\n",
+           ctx->worker_id,
+           index_order,
            index->indexname ? index->indexname : "(null)");
+  }
+
+  // Release through the original onefield ownership hook.
+  if (shared->hooks->done_with_index) {
+    shared->hooks->done_with_index(shared->bp, index_order, index);
+    index = NULL;
   }
 
   if (rc) {
@@ -1075,49 +1112,65 @@ static void *index_shard_worker_main(void *userdata) {
   index_shard_worker_context_t *ctx = userdata;
   index_shard_pool_t *pool;
 
-  if (!ctx)
+  if (!ctx) {
     return NULL;
+  }
 
   pool = ctx->pool;
-  if (!pool)
+  if (!pool) {
     return NULL;
+  }
 
   index_shard_current_worker_pool = pool;
 
   while (1) {
-    index_shard_thread_state_t *shared;
+    index_shard_thread_state_t *shared = NULL;
     size_t index_order;
-    index_shard_aux_task_t *aux_task;
-
-    /*
-     * Unified pool: run pending inner work before claiming new outer work.
-     * This is not a reserved helper thread; every worker follows this rule.
-     */
-    aux_task = index_shard_aux_queue_try_pop(&pool->auxq);
-    if (aux_task) {
-      index_shard_aux_execute_one(aux_task);
-      continue;
-    }
+    index_shard_aux_task_t *aux_task = NULL;
+    int run_pass = FALSE;
 
     pthread_mutex_lock(&pool->control_mutex);
 
-    while (!pool->shutdown && ctx->generation_seen == pool->generation)
+    while (!pool->shutdown) {
+      /*
+       * A new outer pass always wins over queued inner work.
+       *
+       * Both pass submission and auxiliary enqueue notify work_cv while
+       * holding control_mutex. This is the worker lost-wakeup boundary.
+       */
+      if (ctx->generation_seen != pool->generation) {
+        ctx->generation_seen = pool->generation;
+        shared = &pool->shared;
+
+        if (ctx->worker_id < shared->worker_count) {
+          run_pass = TRUE;
+        }
+        break;
+      }
+
+      aux_task = index_shard_aux_queue_try_pop(&pool->auxq);
+      if (aux_task) {
+        break;
+      }
+
       pthread_cond_wait(&pool->work_cv, &pool->control_mutex);
+    }
 
     if (pool->shutdown) {
       pthread_mutex_unlock(&pool->control_mutex);
       break;
     }
 
-    ctx->generation_seen = pool->generation;
-    shared = &pool->shared;
+    pthread_mutex_unlock(&pool->control_mutex);
 
-    if (ctx->worker_id >= shared->worker_count) {
-      pthread_mutex_unlock(&pool->control_mutex);
+    if (aux_task) {
+      index_shard_aux_execute_one(aux_task);
       continue;
     }
 
-    pthread_mutex_unlock(&pool->control_mutex);
+    if (!run_pass) {
+      continue;
+    }
 
     if (index_shard_worker_prepare_pass(ctx, shared)) {
       index_shard_request_fatal_stop(shared);
@@ -1137,8 +1190,11 @@ static void *index_shard_worker_main(void *userdata) {
         index_shard_mark_result_completed(shared, index_order);
         break;
       }
-      if (index_shard_run_one_with_worker_context(ctx, shared,
-                                                  index_order, result)) {
+
+      if (index_shard_run_one_with_worker_context(ctx,
+                                                  shared,
+                                                  index_order,
+                                                  result)) {
         index_shard_mark_result_completed(shared, index_order);
         index_shard_request_fatal_stop(shared);
         break;
@@ -1147,12 +1203,27 @@ static void *index_shard_worker_main(void *userdata) {
       if (result->solved) {
         logmsg("[index-shard] solved-candidate worker=%i index_order=%zu "
                "best_logodds=%.3f field=%i wall=%.3f cpu=%.3f\n",
-               ctx->worker_id, index_order,
-               result->best_logodds, result->best_fieldnum,
-               result->wall_seconds, (double)result->cpu_seconds);
+               ctx->worker_id,
+               index_order,
+               result->best_logodds,
+               result->best_fieldnum,
+               result->wall_seconds,
+               (double)result->cpu_seconds);
 
         index_shard_publish_solved(shared, index_order);
         index_shard_request_stop(shared);
+      }
+
+      if (index_shard_trace_enabled()) {
+        logmsg("[index-shard] complete worker=%i index_order=%zu solved=%i "
+               "failed=%i wall=%.3f cpu=%.3f pass_wall=%.3f\n",
+               ctx->worker_id,
+               index_order,
+               result->solved,
+               result->failed,
+               result->wall_seconds,
+               (double)result->cpu_seconds,
+               timenow() - shared->pass_wall_start);
       }
 
       index_shard_check_global_cpu_limit(shared);
@@ -1161,13 +1232,6 @@ static void *index_shard_worker_main(void *userdata) {
 
     index_shard_worker_cleanup_pass(ctx, shared);
     index_shard_worker_done(shared);
-
-    /*
-     * After pass accounting is complete, this worker can again help inner work.
-     */
-    aux_task = index_shard_aux_queue_try_pop(&pool->auxq);
-    if (aux_task)
-      index_shard_aux_execute_one(aux_task);
   }
 
   index_shard_current_worker_pool = NULL;
@@ -1417,6 +1481,91 @@ static void index_shard_shared_destroy(index_shard_thread_state_t *shared) {
   pthread_mutex_destroy(&shared->limit_mutex);
 }
 
+typedef enum index_shard_pool_acquire_status {
+  INDEX_SHARD_POOL_ACQUIRE_CONFLICT = -1,
+  INDEX_SHARD_POOL_ACQUIRE_OK = 0,
+  INDEX_SHARD_POOL_ACQUIRE_UNAVAILABLE = 1
+} index_shard_pool_acquire_status_t;
+
+/*
+ * Reserve the persistent pool for one submitted pass.
+ *
+ * Lock order:
+ *   index_shard_global_pool_mutex -> pool->control_mutex
+ *
+ * This prevents a second submission from overwriting shared pass pointers and
+ * also keeps pool_stop() from destroying the pool while the caller still uses
+ * it.
+ */
+static index_shard_pool_acquire_status_t
+index_shard_pool_acquire_pass(onefield_t *bp,
+                              solver_t *sp,
+                              index_shard_pool_t **pool_out) {
+  index_shard_pool_t *pool;
+
+  if (!pool_out) {
+    return INDEX_SHARD_POOL_ACQUIRE_CONFLICT;
+  }
+
+  *pool_out = NULL;
+
+  pthread_mutex_lock(&index_shard_global_pool_mutex);
+
+  pool = index_shard_global_pool;
+
+  if (!pool) {
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return INDEX_SHARD_POOL_ACQUIRE_UNAVAILABLE;
+  }
+
+  if (pool->owner_bp != bp || pool->owner_sp != sp) {
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return INDEX_SHARD_POOL_ACQUIRE_CONFLICT;
+  }
+
+  pthread_mutex_lock(&pool->control_mutex);
+
+  if (pool->shutdown || pool->stopping || pool->pass_active) {
+    pthread_mutex_unlock(&pool->control_mutex);
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return INDEX_SHARD_POOL_ACQUIRE_CONFLICT;
+  }
+
+  pool->pass_active = TRUE;
+  *pool_out = pool;
+
+  pthread_mutex_unlock(&pool->control_mutex);
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+
+  return INDEX_SHARD_POOL_ACQUIRE_OK;
+}
+
+/*
+ * Release one pass reservation after all caller-side work that dereferences
+ * the pool has completed.
+ */
+static void index_shard_pool_release_pass(index_shard_pool_t *pool) {
+  if (!pool) {
+    return;
+  }
+
+  pthread_mutex_lock(&pool->control_mutex);
+
+  if (!pool->pass_active) {
+    logerr("[index-shard] pass release requested with no active pass\n");
+  } else {
+    pool->pass_active = FALSE;
+  }
+
+  /*
+   * pool_stop() may be waiting for pass_active to become false. Worker waiters
+   * also use work_cv, but they re-check their generation predicate in a loop.
+   */
+  pthread_cond_broadcast(&pool->work_cv);
+
+  pthread_mutex_unlock(&pool->control_mutex);
+}
+
 // ANCHOR INDEX-SHARD: pool-start
 /*
  * Create persistent worker pool.
@@ -1428,14 +1577,40 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   int i;
   int worker_count;
 
-  // pool already active for this engine job
-  if (!index_shard_pthread_enabled())
+   // pool already active for this engine job
+  if (!index_shard_pthread_enabled()) {
     return 0;
+  }
+
+  if (!bp || !sp) {
+    ERROR("Cannot start index-shard pool without owner state");
+    return -1;
+  }
 
   pthread_mutex_lock(&index_shard_global_pool_mutex);
 
   if (index_shard_global_pool) {
+    int reusable;
+
+    pool = index_shard_global_pool;
+
+    if (pool->owner_bp != bp || pool->owner_sp != sp) {
+      logerr("[index-shard] global pool already belongs to another engine job\n");
+      pthread_mutex_unlock(&index_shard_global_pool_mutex);
+      return -1;
+    }
+
+    pthread_mutex_lock(&pool->control_mutex);
+    reusable = !pool->shutdown && !pool->stopping;
+    pthread_mutex_unlock(&pool->control_mutex);
+
     pthread_mutex_unlock(&index_shard_global_pool_mutex);
+
+    if (!reusable) {
+      logerr("[index-shard] owner pool is stopping or shut down\n");
+      return -1;
+    }
+
     return 0;
   }
 
@@ -1448,8 +1623,8 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     return -1;
   }
 
-  pool->bp = bp;
-  pool->base_sp = sp;
+  pool->owner_bp = bp;
+  pool->owner_sp = sp;
   pool->worker_count = worker_count;
 
   // initialize shared state before workers can observe pool
@@ -1475,33 +1650,33 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   }
 
   size_t aux_max_pending;
-  aux_max_pending = pool->worker_count * pool->worker_count;
 
-  if (aux_max_pending < pool->worker_count)
-    aux_max_pending = pool->worker_count;
+  aux_max_pending =
+      (size_t)pool->worker_count * (size_t)pool->worker_count;
 
-   if (index_shard_aux_queue_init(&pool->auxq, aux_max_pending)) {
+  if (aux_max_pending < (size_t)pool->worker_count) {
+    aux_max_pending = (size_t)pool->worker_count;
+  }
+
+  if (index_shard_aux_queue_init(&pool->auxq, aux_max_pending)) {
     index_shard_shared_destroy(&pool->shared);
     pthread_cond_destroy(&pool->work_cv);
     pthread_mutex_destroy(&pool->control_mutex);
     free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
     return -1;
   }
 
   pool->threads = calloc((size_t)worker_count, sizeof(pthread_t));
   pool->contexts = calloc((size_t)worker_count, sizeof(index_shard_worker_context_t));
 
-  if (!pool->threads || !pool->contexts) {
+    if (!pool->threads || !pool->contexts) {
     free(pool->threads);
     free(pool->contexts);
-    index_shard_shared_destroy(&pool->shared);
     index_shard_aux_queue_destroy(&pool->auxq);
+    index_shard_shared_destroy(&pool->shared);
     pthread_cond_destroy(&pool->work_cv);
     pthread_mutex_destroy(&pool->control_mutex);
     free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    SYSERROR("Failed to allocate index-shard workers");
     return -1;
   }
 
@@ -1519,17 +1694,17 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
       pthread_cond_broadcast(&pool->work_cv);
       pthread_mutex_unlock(&pool->control_mutex);
 
-      for (j = 0; j < i; j++)
+            for (j = 0; j < i; j++) {
         pthread_join(pool->threads[j], NULL);
+      }
 
       free(pool->threads);
       free(pool->contexts);
+      index_shard_aux_queue_destroy(&pool->auxq);
       index_shard_shared_destroy(&pool->shared);
       pthread_cond_destroy(&pool->work_cv);
       pthread_mutex_destroy(&pool->control_mutex);
       free(pool);
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      SYSERROR("Failed to create index-shard worker");
       return -1;
     }
   }
@@ -1543,47 +1718,118 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
 }
 // ANCHOR INDEX-SHARD: pool-stop
 /*
- * Stop pool and join all workers.
+ * Stop the pool belonging to bp and join all workers.
  *
+ * New passes are rejected as soon as stopping is published. If one pass is
+ * already active, shutdown waits for that pass reservation to be released.
  */
 void index_shard_pool_stop(onefield_t *bp) {
   index_shard_pool_t *pool;
+  index_shard_aux_task_t *cancelled_tasks = NULL;
+  index_shard_aux_task_t *task;
+  index_shard_aux_metrics_snapshot_t aux_metrics;
+  size_t cancelled_count = 0;
   int i;
 
-  (void)bp;
-  // detach global pointer first so no new submit can find this pool
   pthread_mutex_lock(&index_shard_global_pool_mutex);
-  pool = index_shard_global_pool;
-  index_shard_global_pool = NULL;
-  pthread_mutex_unlock(&index_shard_global_pool_mutex);
 
-  if (!pool)
+  pool = index_shard_global_pool;
+
+  if (!pool) {
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
     return;
+  }
+
+  if (pool->owner_bp != bp) {
+    logerr("[index-shard] refusing to stop pool owned by another engine job\n");
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return;
+  }
 
   pthread_mutex_lock(&pool->control_mutex);
+
+  if (pool->stopping) {
+    pthread_mutex_unlock(&pool->control_mutex);
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return;
+  }
+
+  pool->stopping = TRUE;
+
+  /*
+   * An active pass may still call compatibility APIs that consult the
+   * process-global pool pointer. Release the global mutex before waiting.
+   */
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+
+  while (pool->pass_active) {
+    pthread_cond_wait(&pool->work_cv, &pool->control_mutex);
+  }
+
   pool->shutdown = TRUE;
+
+  /*
+   * Detach queued auxiliary work using the same control -> auxq lock order
+   * used by enqueue and worker wakeup.
+   *
+   * Every accepted task must end as either executed or cancelled. Cancelling
+   * a task also releases its group's pending credit.
+   */
+  pthread_mutex_lock(&pool->auxq.mutex);
+
+  pool->auxq.stopping = TRUE;
+  cancelled_tasks = pool->auxq.head;
+  pool->auxq.head = NULL;
+  pool->auxq.tail = NULL;
+
+  for (task = cancelled_tasks; task; task = task->next) {
+    cancelled_count++;
+  }
+
+  pool->auxq.pending = 0;
+  pool->auxq.cancelled_total += cancelled_count;
+
+  pthread_mutex_unlock(&pool->auxq.mutex);
+
   pthread_cond_broadcast(&pool->work_cv);
   pthread_mutex_unlock(&pool->control_mutex);
 
+  index_shard_aux_cancel_list(cancelled_tasks);
 
-  pthread_mutex_lock(&pool->auxq.mutex);
-  pool->auxq.stopping = 1;
-  pthread_cond_broadcast(&pool->auxq.cv);
-  pthread_mutex_unlock(&pool->auxq.mutex);
-  // wake sleeping workers so they can exit normally
-  for (i = 0; i < pool->worker_count; i++)
+  /*
+   * No active pass can retain the pool now. Detach it before freeing worker
+   * storage so later submissions cannot acquire this instance.
+   */
+  pthread_mutex_lock(&index_shard_global_pool_mutex);
+
+  if (index_shard_global_pool == pool) {
+    index_shard_global_pool = NULL;
+  }
+
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+
+  for (i = 0; i < pool->worker_count; i++) {
     pthread_join(pool->threads[i], NULL);
+  }
 
   free(pool->threads);
   free(pool->contexts);
+  index_shard_aux_metrics_snapshot(&pool->auxq, &aux_metrics);
 
   logmsg("[index-shard] auxq submitted=%llu executed=%llu rejected=%llu "
-       "pending=%zu max_pending=%zu\n",
-       pool->auxq.submitted_total,
-       pool->auxq.executed_total,
-       pool->auxq.rejected_total,
-       pool->auxq.pending,
-       pool->auxq.max_pending);
+         "cancelled=%llu pending=%zu max_pending=%zu\n",
+         aux_metrics.submitted,
+         aux_metrics.executed,
+         aux_metrics.rejected,
+         aux_metrics.cancelled,
+         aux_metrics.pending,
+         aux_metrics.max_pending);
+
+  if (aux_metrics.pending != 0 ||
+      aux_metrics.submitted !=
+          aux_metrics.executed + aux_metrics.cancelled) {
+    logerr("[index-shard] auxq accounting mismatch at shutdown\n");
+  }
 
   index_shard_shared_destroy(&pool->shared);
   index_shard_aux_queue_destroy(&pool->auxq);
@@ -1598,15 +1844,23 @@ void index_shard_pool_stop(onefield_t *bp) {
 
 // ANCHOR INDEX-SHARD: pool-active
 /*
- * Lightweight guard used by onefield_run() before entering pthread path.
+ * Return true only when the compatibility pool belongs to bp and remains
+ * available for a new pass reservation.
  */
 int index_shard_pool_active(onefield_t *bp) {
-  int active;
-
-  (void)bp;
+  index_shard_pool_t *pool;
+  int active = FALSE;
 
   pthread_mutex_lock(&index_shard_global_pool_mutex);
-  active = (index_shard_global_pool != NULL);
+
+  pool = index_shard_global_pool;
+
+  if (pool && pool->owner_bp == bp) {
+    pthread_mutex_lock(&pool->control_mutex);
+    active = !pool->shutdown && !pool->stopping;
+    pthread_mutex_unlock(&pool->control_mutex);
+  }
+
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
 
   return active;
@@ -1630,7 +1884,13 @@ static int index_shard_pool_submit(index_shard_pool_t *pool, onefield_t *bp, sol
   if (worker_count > pool->worker_count)
     worker_count = pool->worker_count;
 
-  pthread_mutex_lock(&pool->control_mutex);
+   pthread_mutex_lock(&pool->control_mutex);
+
+  if (!pool->pass_active || pool->shutdown ||
+      pool->owner_bp != bp || pool->owner_sp != base_sp) {
+    pthread_mutex_unlock(&pool->control_mutex);
+    return -1;
+  }
 
   pthread_mutex_lock(&shared->queue_mutex);
   pthread_mutex_lock(&shared->result_mutex);
@@ -1678,8 +1938,6 @@ static int index_shard_pool_submit(index_shard_pool_t *pool, onefield_t *bp, sol
   pthread_mutex_unlock(&shared->queue_mutex);
 
   // generation publish wakes workers for this pass
-  pool->bp = bp;
-  pool->base_sp = base_sp;
   pool->generation++;
 
   pthread_cond_broadcast(&pool->work_cv);
@@ -1698,12 +1956,11 @@ static int index_shard_pool_submit(index_shard_pool_t *pool, onefield_t *bp, sol
 
 // ANCHOR INDEX-SHARD: entry
 /*
- * Execute pthread index-shard pass for one onefield_run() call.
+ * Execute one complete index-shard pass.
  *
- * Returns:
- *   0  -> shard path handled the pass
- *   1  -> pthread mode inactive / pool inactive, caller may use fallback
- *  -1  -> hard shard failure
+ * Terminal status is classified according to whether master-visible solver
+ * state has already been mutated. Only an unavailable path or a failure
+ * proven to occur before master commit may return control to the serial path.
  */
 index_shard_solve_status_t index_shard_solve(onefield_t *bp,
                   solver_t *base_sp,
@@ -1714,8 +1971,10 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
   index_shard_result_t *results = NULL;
   unsigned char *completed = NULL;
   size_t i;
+  int acquire_rc;
   int rc = 0;
   index_shard_pass_state_snapshot_t state;
+  index_shard_pass_metrics_snapshot_t pass_metrics;
   index_shard_solve_status_t status = INDEX_SHARD_SOLVE_HANDLED;
 
   if (!index_shard_pthread_enabled()) {
@@ -1732,13 +1991,17 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
 
-  pthread_mutex_lock(&index_shard_global_pool_mutex);
-  pool = index_shard_global_pool;
-  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+  acquire_rc = index_shard_pool_acquire_pass(bp, base_sp, &pool);
 
-  if (!pool) {
+  if (acquire_rc == INDEX_SHARD_POOL_ACQUIRE_UNAVAILABLE) {
     logmsg("[index-shard] pthread mode requested but pool inactive\n");
     return INDEX_SHARD_SOLVE_UNAVAILABLE;
+  }
+
+  if (acquire_rc != INDEX_SHARD_POOL_ACQUIRE_OK) {
+    logerr("[index-shard] pool ownership or pass lifecycle conflict; "
+           "serial fallback suppressed\n");
+    return INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT;
   }
 
   kdtree_phase_a_reset();
@@ -1754,15 +2017,23 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
     free(results);
     free(completed);
 
+    index_shard_pool_release_pass(pool);
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
-  // submit wakes workers, reducer runs on caller thread
-  rc = index_shard_pool_submit(pool, bp, base_sp, nindexes, hooks, tasks, results, completed);
+   // submit wakes workers, reducer runs on caller thread
+  rc = index_shard_pool_submit(pool, bp, base_sp, nindexes, hooks,
+                               tasks, results, completed);
 
-  if (!rc) {
-    rc = index_shard_pool_reduce_online(pool);
+  if (rc) {
+    free(tasks);
+    free(results);
+    free(completed);
+
+    index_shard_pool_release_pass(pool);
+    return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
 
+  rc = index_shard_pool_reduce_online(pool);
   index_shard_pass_state_snapshot(&pool->shared, &state);
 
   if (rc) {
@@ -1771,6 +2042,17 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
     } else {
       status = INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
     }
+  }
+
+   /*
+   * Defensive ownership invariant: once the reducer has crossed the master
+   * mutation boundary, a precommit failure classification is impossible.
+   */
+  if (state.master_committed &&
+      status == INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE) {
+    logerr("[index-shard] invalid precommit status after master commit; "
+           "promoting to terminal failure\n");
+    status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
   }
 
   // dispose unmerged worker results after all workers have left pass
@@ -1782,27 +2064,22 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
   free(completed);
 
   // pool metrics measure only shard execution, not FITS/plot output
-  double pool_wall = timenow() - pool->shared.pass_wall_start;
-  float pool_cpu = get_cpu_usage() - pool->shared.pass_cpu_start;
-  double pool_cpu_pct = 0.0;
-
-  if (pool_wall > 0.0)
-    pool_cpu_pct = (100.0 * (double)pool_cpu) / pool_wall;
+  index_shard_pass_metrics_snapshot(&pool->shared, &pass_metrics);
 
   logmsg("[index-shard] pthread-pool done candidates=%zu reduced=%zu solved=%i "
          "total_cpu=%i cancelled=%i rc=%i status=%i master_committed=%i "
          "pool_wall=%.3f pool_cpu=%.3f pool_cpu_pct=%.1f%%\n",
          nindexes,
-         pool->shared.next_reduce,
+          pass_metrics.reduced,
          bp->single_field_solved,
          bp->hit_total_cpulimit,
          bp->cancelled,
          rc,
          (int)status,
          state.master_committed,
-         pool_wall,
-         (double)pool_cpu,
-         pool_cpu_pct);
+         pass_metrics.wall_seconds,
+         (double)pass_metrics.cpu_seconds,
+         pass_metrics.cpu_percent);
 
   kdtree_phase_a_stats_t kd_stats;
     double wall_total_ms;
@@ -1887,20 +2164,22 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
            (unsigned long long)kd_stats.histogram[8],
            (unsigned long long)kd_stats.histogram[9]);
 
+  index_shard_pool_release_pass(pool);
   return status;
 }
 
 
-//Aux Helpers
+/*
+ * SECTION INDEX-SHARD: auxiliary task executor
+ *
+ * Bounded inner work that reuses idle index-shard workers. Outer index work
+ * keeps priority; a waiting owner also executes queued work cooperatively.
+ */
 static int index_shard_aux_queue_init(index_shard_aux_queue_t *q,
                                       size_t max_pending) {
   memset(q, 0, sizeof(*q));
 
-  if (pthread_mutex_init(&q->mutex, NULL))
-    return -1;
-
-  if (pthread_cond_init(&q->cv, NULL)) {
-    pthread_mutex_destroy(&q->mutex);
+  if (pthread_mutex_init(&q->mutex, NULL)) {
     return -1;
   }
 
@@ -1910,122 +2189,173 @@ static int index_shard_aux_queue_init(index_shard_aux_queue_t *q,
 
 static void index_shard_aux_queue_destroy(index_shard_aux_queue_t *q) {
   index_shard_aux_task_t *task;
-  index_shard_aux_task_t *next;
+  index_shard_aux_task_t *cursor;
+  size_t cancelled_count = 0;
 
-  if (!q)
+  if (!q) {
     return;
+  }
 
   pthread_mutex_lock(&q->mutex);
+
   task = q->head;
   q->head = NULL;
   q->tail = NULL;
-  pthread_mutex_unlock(&q->mutex);
+  q->stopping = TRUE;
 
-  while (task) {
-    next = task->next;
-    free(task);
-    task = next;
+  for (cursor = task; cursor; cursor = cursor->next) {
+    cancelled_count++;
   }
 
-  pthread_cond_destroy(&q->cv);
+  q->pending = 0;
+  q->cancelled_total += cancelled_count;
+
+  pthread_mutex_unlock(&q->mutex);
+
+  index_shard_aux_cancel_list(task);
   pthread_mutex_destroy(&q->mutex);
 }
 
-static int index_shard_aux_queue_push(index_shard_aux_queue_t *q,
+static int index_shard_aux_queue_push(index_shard_pool_t *pool,
                                       index_shard_aux_task_t *task) {
-  if (!q || !task)
-    return -1;
+  index_shard_aux_queue_t *q;
+  int accepted = FALSE;
 
-  task->next = NULL;
-
-  pthread_mutex_lock(&q->mutex);
-
-  if (q->stopping || q->pending >= q->max_pending) {
-    q->rejected_total++;
-    pthread_mutex_unlock(&q->mutex);
+  if (!pool || !task) {
     return -1;
   }
 
-  if (q->tail)
-    q->tail->next = task;
-  else
-    q->head = task;
+  q = &pool->auxq;
+  task->next = NULL;
 
-  q->tail = task;
-  q->pending++;
-  q->submitted_total++;
+  /*
+   * control_mutex is the common worker sleep/wakeup boundary. Holding it
+   * across enqueue and notification prevents a worker from missing an arrival
+   * between its queue check and pthread_cond_wait().
+   */
+  pthread_mutex_lock(&pool->control_mutex);
+  pthread_mutex_lock(&q->mutex);
 
-  pthread_cond_signal(&q->cv);
+  if (pool->shutdown ||
+      pool->stopping ||
+      !pool->pass_active ||
+      q->stopping ||
+      q->pending >= q->max_pending) {
+    q->rejected_total++;
+  } else {
+    if (q->tail) {
+      q->tail->next = task;
+    } else {
+      q->head = task;
+    }
+
+    q->tail = task;
+    q->pending++;
+    q->submitted_total++;
+    accepted = TRUE;
+  }
+
   pthread_mutex_unlock(&q->mutex);
 
-  return 0;
+  if (accepted) {
+    pthread_cond_broadcast(&pool->work_cv);
+  }
+
+  pthread_mutex_unlock(&pool->control_mutex);
+
+  return accepted ? 0 : -1;
 }
 
-static index_shard_aux_task_t *index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q) {
+static index_shard_aux_task_t *
+index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q) {
   index_shard_aux_task_t *task;
 
-  if (!q)
+  if (!q) {
     return NULL;
+  }
 
   pthread_mutex_lock(&q->mutex);
 
   task = q->head;
+
   if (task) {
     q->head = task->next;
-    if (!q->head)
+
+    if (!q->head) {
       q->tail = NULL;
+    }
+
     task->next = NULL;
 
-    if (q->pending > 0)
+    if (q->pending > 0) {
       q->pending--;
+    }
   }
 
   pthread_mutex_unlock(&q->mutex);
   return task;
 }
 
-//ANCHOR - Aux Group Life Cycle
+// ANCHOR INDEX-SHARD: auxiliary-group-lifecycle
+
 index_shard_aux_group_t *index_shard_aux_group_new(void) {
-    index_shard_aux_group_t *group;
+  index_shard_aux_group_t *group;
+  index_shard_pool_t *pool;
+  int usable;
 
-    group = calloc(1, sizeof(index_shard_aux_group_t));
-    if (!group)
-        return NULL;
+  pool = index_shard_current_worker_pool;
 
-    if (pthread_mutex_init(&group->mutex, NULL)) {
-        free(group);
-        return NULL;
-    }
+  if (!pool) {
+    return NULL;
+  }
 
-    if (pthread_cond_init(&group->cv, NULL)) {
-        pthread_mutex_destroy(&group->mutex);
-        free(group);
-        return NULL;
-    }
+  pthread_mutex_lock(&pool->control_mutex);
+  usable = pool->pass_active && !pool->shutdown && !pool->stopping;
+  pthread_mutex_unlock(&pool->control_mutex);
 
-    group->pending = 0;
-    group->failed = 0;
-    group->closed = 0;
-    group->pool = index_shard_current_worker_pool;
+  if (!usable) {
+    return NULL;
+  }
 
-    return group;
+  group = calloc(1, sizeof(index_shard_aux_group_t));
+
+  if (!group) {
+    return NULL;
+  }
+
+  if (pthread_mutex_init(&group->mutex, NULL)) {
+    free(group);
+    return NULL;
+  }
+
+  if (pthread_cond_init(&group->cv, NULL)) {
+    pthread_mutex_destroy(&group->mutex);
+    free(group);
+    return NULL;
+  }
+
+  group->pool = pool;
+  return group;
 }
 
 void index_shard_aux_group_free(index_shard_aux_group_t *group) {
-    if (!group)
-        return;
+  if (!group) {
+    return;
+  }
 
-    pthread_mutex_lock(&group->mutex);
-    group->closed = 1;
+  pthread_mutex_lock(&group->mutex);
+  group->closed = TRUE;
+  pthread_mutex_unlock(&group->mutex);
 
-    while (group->pending > 0)
-        pthread_cond_wait(&group->cv, &group->mutex);
+  /*
+   * Normal callers wait explicitly. This cooperative wait is the lifecycle
+   * backstop that prevents freeing a group with accepted tasks outstanding.
+   */
+  (void)index_shard_kdtree_wait(group);
 
-    pthread_mutex_unlock(&group->mutex);
-
-    pthread_cond_destroy(&group->cv);
-    pthread_mutex_destroy(&group->mutex);
-    free(group);
+  pthread_cond_destroy(&group->cv);
+  pthread_mutex_destroy(&group->mutex);
+  free(group);
 }
 
 static int index_shard_kdtree_submit(void *userdata,
@@ -2035,22 +2365,30 @@ static int index_shard_kdtree_submit(void *userdata,
   index_shard_aux_task_t *task;
   index_shard_pool_t *pool;
 
-  if (!group || !fn)
+  if (!group || !fn) {
     return -1;
+  }
 
   pool = group->pool;
-  if (!pool)
+
+  if (!pool) {
     return -1;
+  }
 
   task = calloc(1, sizeof(index_shard_aux_task_t));
-  if (!task)
+
+  if (!task) {
     return -1;
+  }
 
   task->fn = fn;
   task->userdata = task_userdata;
   task->group = group;
-  task->next = NULL;
 
+  /*
+   * Reserve pending credit before publishing the task. Completion can happen
+   * immediately after enqueue, so reservation must precede publication.
+   */
   pthread_mutex_lock(&group->mutex);
 
   if (group->closed) {
@@ -2063,13 +2401,21 @@ static int index_shard_kdtree_submit(void *userdata,
 
   pthread_mutex_unlock(&group->mutex);
 
-  if (index_shard_aux_queue_push(&pool->auxq, task)) {
+  if (index_shard_aux_queue_push(pool, task)) {
+    /*
+     * Submission rejection means the caller may execute this work inline.
+     * Roll back the reservation, but do not mark the group failed.
+     */
     pthread_mutex_lock(&group->mutex);
 
-    if (group->pending > 0)
+    if (group->pending > 0) {
       group->pending--;
+    } else {
+      group->failed = TRUE;
+      logerr("[index-shard] aux group pending underflow after rejection\n");
+    }
 
-    group->failed = 1;
+    group->progress++;
     pthread_cond_broadcast(&group->cv);
 
     pthread_mutex_unlock(&group->mutex);
@@ -2078,27 +2424,40 @@ static int index_shard_kdtree_submit(void *userdata,
     return -1;
   }
 
+  pthread_mutex_lock(&group->mutex);
+
+  group->progress++;
+  pthread_cond_broadcast(&group->cv);
+
+  pthread_mutex_unlock(&group->mutex);
+
   return 0;
 }
 
 static int index_shard_kdtree_wait(void *userdata) {
   index_shard_aux_group_t *group = userdata;
   index_shard_pool_t *pool;
-  int failed = 0;
+  int failed = FALSE;
 
-  if (!group)
+  if (!group) {
     return -1;
+  }
 
   pool = group->pool;
-  if (!pool)
+
+  if (!pool) {
     return -1;
+  }
 
   while (1) {
-    index_shard_aux_task_t *task = NULL;
+    index_shard_aux_task_t *task;
     int pending;
+    unsigned long observed_progress;
 
     pthread_mutex_lock(&group->mutex);
+
     pending = group->pending;
+    observed_progress = group->progress;
 
     if (pending == 0) {
       failed = group->failed;
@@ -2109,24 +2468,28 @@ static int index_shard_kdtree_wait(void *userdata) {
     pthread_mutex_unlock(&group->mutex);
 
     /*
-     * Cooperative wait:
-     *
-     * Do not block permanently on group->cv.  This worker is part of the
-     * unified pool, so while its own group is pending it must keep draining
-     * global aux work.
+     * A worker waiting for its child tasks helps the global auxiliary queue.
+     * This prevents nested fork/join deadlock without reserving helper threads.
      */
     task = index_shard_aux_queue_try_pop(&pool->auxq);
+
     if (task) {
       index_shard_aux_execute_one(task);
       continue;
     }
 
     /*
-     * No work was visible right now.  Yield instead of sleeping forever on
-     * this group's private condition.  This is intentionally conservative:
-     * correctness first, performance later.
+     * The queue is empty. Outstanding work is either executing or between
+     * pending reservation and enqueue. Wait for progress instead of spinning.
      */
-    sched_yield();
+    pthread_mutex_lock(&group->mutex);
+
+    while (group->pending > 0 &&
+           group->progress == observed_progress) {
+      pthread_cond_wait(&group->cv, &group->mutex);
+    }
+
+    pthread_mutex_unlock(&group->mutex);
   }
 
   return failed ? -1 : 0;
@@ -2135,16 +2498,25 @@ static int index_shard_kdtree_wait(void *userdata) {
 int index_shard_kdtree_executor_init(kdtree_task_executor_t *executor,
                                      index_shard_aux_group_t *group) {
   index_shard_pool_t *pool;
+  int usable;
 
-  if (!executor || !group)
+  if (!executor || !group) {
     return -1;
+  }
 
-  pthread_mutex_lock(&index_shard_global_pool_mutex);
-  pool = index_shard_global_pool;
-  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+  pool = group->pool;
 
-  if (!pool)
+  if (!pool) {
     return -1;
+  }
+
+  pthread_mutex_lock(&pool->control_mutex);
+  usable = pool->pass_active && !pool->shutdown && !pool->stopping;
+  pthread_mutex_unlock(&pool->control_mutex);
+
+  if (!usable) {
+    return -1;
+  }
 
   executor->userdata = group;
   executor->submit = index_shard_kdtree_submit;
@@ -2154,203 +2526,89 @@ int index_shard_kdtree_executor_init(kdtree_task_executor_t *executor,
   return 0;
 }
 
-
-//ANCHOR - Task execution from aux
+// ANCHOR INDEX-SHARD: auxiliary-task-execution
 
 static void index_shard_aux_group_done(index_shard_aux_group_t *group,
                                        int failed) {
-    if (!group)
-        return;
+  if (!group) {
+    return;
+  }
 
-    pthread_mutex_lock(&group->mutex);
+  pthread_mutex_lock(&group->mutex);
 
-    if (failed)
-        group->failed = 1;
+  if (failed) {
+    group->failed = TRUE;
+  }
 
-    if (group->pending > 0)
-        group->pending--;
+  if (group->pending > 0) {
+    group->pending--;
+  } else {
+    group->failed = TRUE;
+    logerr("[index-shard] aux group pending underflow on completion\n");
+  }
 
-    pthread_cond_broadcast(&group->cv);
-    pthread_mutex_unlock(&group->mutex);
+  group->progress++;
+  pthread_cond_broadcast(&group->cv);
+
+  pthread_mutex_unlock(&group->mutex);
+}
+
+static void index_shard_aux_cancel_list(index_shard_aux_task_t *task) {
+  while (task) {
+    index_shard_aux_task_t *next = task->next;
+
+    index_shard_aux_group_done(task->group, TRUE);
+    free(task);
+    task = next;
+  }
 }
 
 static void index_shard_aux_execute_one(index_shard_aux_task_t *task) {
-  int failed = 0;
+  index_shard_pool_t *pool = NULL;
+  int failed = FALSE;
 
-  if (!task)
+  if (!task) {
     return;
+  }
 
-  if (task->fn)
+  if (task->group) {
+    pool = task->group->pool;
+  }
+
+  if (task->fn) {
     task->fn(task->userdata);
-  else
-    failed = 1;
+  } else {
+    failed = TRUE;
+  }
+
+  if (pool) {
+    pthread_mutex_lock(&pool->auxq.mutex);
+    pool->auxq.executed_total++;
+    pthread_mutex_unlock(&pool->auxq.mutex);
+  }
 
   index_shard_aux_group_done(task->group, failed);
   free(task);
 }
-//ANCHOR - Public API
+
+// ANCHOR INDEX-SHARD: auxiliary-public-api
 
 int index_shard_aux_available(void) {
-  int available = FALSE;
+  index_shard_pool_t *pool;
+  int available;
 
-  pthread_mutex_lock(&index_shard_global_pool_mutex);
-  available = (index_shard_global_pool != NULL);
-  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+  pool = index_shard_current_worker_pool;
+
+  if (!pool) {
+    return FALSE;
+  }
+
+  pthread_mutex_lock(&pool->control_mutex);
+  available = pool->pass_active && !pool->shutdown && !pool->stopping;
+  pthread_mutex_unlock(&pool->control_mutex);
 
   return available;
 }
-
-static int index_shard_aux_submit(index_shard_aux_group_t *group,
-                                  kdtree_task_fn fn,
-                                  void *userdata) {
-  index_shard_pool_t *pool;
-  index_shard_aux_task_t *task;
-
-  if (!group || !fn)
-    return -1;
-
-  pthread_mutex_lock(&index_shard_global_pool_mutex);
-  pool = index_shard_global_pool;
-  pthread_mutex_unlock(&index_shard_global_pool_mutex);
-
-  if (!pool)
-    return -1;
-
-  task = calloc(1, sizeof(index_shard_aux_task_t));
-  if (!task)
-    return -1;
-
-  task->fn = fn;
-  task->userdata = userdata;
-  task->group = group;
-
-  pthread_mutex_lock(&group->mutex);
-  if (group->closed) {
-    pthread_mutex_unlock(&group->mutex);
-    free(task);
-    return -1;
-  }
-  group->pending++;
-  pthread_mutex_unlock(&group->mutex);
-
-  pthread_mutex_lock(&pool->aux_mutex);
-
-  if (pool->aux_stopping) {
-    pthread_mutex_unlock(&pool->aux_mutex);
-
-    pthread_mutex_lock(&group->mutex);
-    group->pending--;
-    group->failed = 1;
-    pthread_cond_broadcast(&group->cv);
-    pthread_mutex_unlock(&group->mutex);
-
-    free(task);
-    return -1;
-  }
-
-  if (pool->aux_tail)
-    pool->aux_tail->next = task;
-  else
-    pool->aux_head = task;
-
-  pool->aux_tail = task;
-
-  pthread_cond_broadcast(&pool->aux_cv);
-  pthread_cond_broadcast(&pool->work_cv);
-  pthread_mutex_unlock(&pool->aux_mutex);
-
-  return 0;
-}
-
-static index_shard_aux_task_t *index_shard_aux_try_pop(index_shard_pool_t *pool) {
-  index_shard_aux_task_t *task;
-
-  if (!pool)
-    return NULL;
-
-  pthread_mutex_lock(&pool->aux_mutex);
-
-  task = pool->aux_head;
-  if (task) {
-    pool->aux_head = task->next;
-    if (!pool->aux_head)
-      pool->aux_tail = NULL;
-    task->next = NULL;
-  }
-
-  pthread_mutex_unlock(&pool->aux_mutex);
-  return task;
-}
-
-static void index_shard_aux_task_done(index_shard_aux_group_t *group, int failed) {
-  if (!group)
-    return;
-
-  pthread_mutex_lock(&group->mutex);
-
-  if (failed)
-    group->failed = 1;
-
-  if (group->pending > 0)
-    group->pending--;
-
-  pthread_cond_broadcast(&group->cv);
-  pthread_mutex_unlock(&group->mutex);
-}
-
-static void index_shard_aux_execute(index_shard_aux_task_t *task) {
-    int failed = 0;
-
-    if (!task)
-        return;
-
-    if (task->fn)
-        task->fn(task->userdata);
-    else
-        failed = 1;
-
-    index_shard_aux_group_done(task->group, failed);
-    free(task);
-}
-
-static int index_shard_aux_wait(index_shard_aux_group_t *group) {
-  index_shard_pool_t *pool;
-  int failed;
-
-  if (!group)
-    return -1;
-
-  for (;;) {
-    index_shard_aux_task_t *task = NULL;
-
-    pthread_mutex_lock(&group->mutex);
-    if (group->pending == 0) {
-      failed = group->failed;
-      group->closed = 1;
-      pthread_mutex_unlock(&group->mutex);
-      return failed ? -1 : 0;
-    }
-    pthread_mutex_unlock(&group->mutex);
-
-    pthread_mutex_lock(&index_shard_global_pool_mutex);
-    pool = index_shard_global_pool;
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-
-    if (pool)
-      task = index_shard_aux_try_pop(pool);
-
-    if (task) {
-      index_shard_aux_execute(task);
-      continue;
-    }
-
-    pthread_mutex_lock(&group->mutex);
-    if (group->pending > 0)
-      pthread_cond_wait(&group->cv, &group->mutex);
-    pthread_mutex_unlock(&group->mutex);
-  }
-}
-
 
 static int index_shard_kdtree_capacity(void *userdata,
                                        kdtree_task_capacity_t *capacity) {
@@ -2364,7 +2622,6 @@ static int index_shard_kdtree_capacity(void *userdata,
 
   size_t workers_total;
   size_t workers_effective;
-  size_t workers_active;
   size_t outer_running;
   size_t spare_workers;
 
@@ -2387,30 +2644,16 @@ static int index_shard_kdtree_capacity(void *userdata,
   shared = &pool->shared;
 
   /*
-   * Snapshot the outer scheduler state.
+   * Snapshot the outer scheduler.
    *
-   * queue_mutex protects:
-   *   - next_task / ntasks
-   *   - running_tasks
-   *   - active_limit
-   *   - have_solved_order / earliest_solved_order
-   *
-   * state_mutex protects:
-   *   - stop_requested
-   *   - fatal_error
-   *   - solved_published
-   *
-   * result_mutex protects:
-   *   - active_workers
-   *
-   * Preserve the established queue -> result lock order.
+   * active_workers is deliberately not used as a capacity limit. It counts
+   * workers still participating in pass completion. A worker which has
+   * finished its outer claims remains alive and can help with inner work.
    */
   pthread_mutex_lock(&shared->queue_mutex);
-  pthread_mutex_lock(&shared->result_mutex);
 
   workers_total = 0;
   workers_effective = 0;
-  workers_active = 0;
   outer_running = 0;
   spare_workers = 0;
 
@@ -2423,14 +2666,6 @@ static int index_shard_kdtree_capacity(void *userdata,
   if (shared->active_limit > 0 &&
       (size_t)shared->active_limit < workers_effective) {
     workers_effective = (size_t)shared->active_limit;
-  }
-
-  if (shared->active_workers > 0) {
-    workers_active = (size_t)shared->active_workers;
-  }
-
-  if (workers_active < workers_effective) {
-    workers_effective = workers_active;
   }
 
   if (shared->running_tasks > 0) {
@@ -2451,12 +2686,8 @@ static int index_shard_kdtree_capacity(void *userdata,
   }
 
   /*
-   * Conservative spare-capacity policy:
-   *
-   * If any unclaimed outer index work remains, it has priority over inner
-   * CodeKD subtasks.  Inner work is allowed only after the outer queue has no
-   * further claimable work and some participating workers are not occupied by
-   * running outer tasks.
+   * Unclaimed outer-index work always has priority. Inner subtasks become
+   * eligible only when the outer queue is exhausted and workers are spare.
    */
   if (!state.stop_requested &&
       !state.fatal_error &&
@@ -2467,13 +2698,8 @@ static int index_shard_kdtree_capacity(void *userdata,
     spare_workers = workers_effective - outer_running;
   }
 
-  pthread_mutex_unlock(&shared->result_mutex);
   pthread_mutex_unlock(&shared->queue_mutex);
 
-  /*
-   * Snapshot bounded aux-queue capacity separately.  Do not hold scheduler
-   * locks while acquiring the aux-queue mutex.
-   */
   pthread_mutex_lock(&pool->auxq.mutex);
 
   pending = pool->auxq.pending;
@@ -2492,8 +2718,8 @@ static int index_shard_kdtree_capacity(void *userdata,
   capacity->aux_room = room;
 
   /*
-   * One product subtree executes inline in the parent.  suggested_subtasks
-   * therefore counts only subtasks that may be offered asynchronously.
+   * One product subtree executes inline in the parent. This count represents
+   * only additional subtrees that may be offered asynchronously.
    */
   capacity->suggested_subtasks = spare_workers;
 

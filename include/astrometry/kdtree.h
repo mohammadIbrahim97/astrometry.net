@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdint.h>
 
+
 #define KDTREE_MAX_LEVELS 1000
 
 // negatives of these values should be valid also
@@ -59,7 +60,7 @@ enum kd_build_options {
     KD_BUILD_LINEAR_LR     = 0x10,
     // DEBUG
     KD_BUILD_FORCE_SORT    = 0x20,
-    
+
 };
 
 typedef uint64_t u64;
@@ -185,7 +186,7 @@ struct kdtree {
     int32_t* lr;            /* Points owned by leaf nodes, stored and manipulated
                              in a way that's too complicated to explain in this comment.
                              (nbottom) */
-               
+
     u32* perm;           /* Permutation index / hairstyle from the 80s
                           (ndata) */
 
@@ -549,14 +550,14 @@ void kdtree_output_dot(FILE* fid, kdtree_t* kd);
 kdtree_t* KDFUNC(kdtree_build)
      (kdtree_t* kd, void *data, int N, int D, int Nleaf,
       int treetype, unsigned int options);
-     
+
 kdtree_t* KDFUNC(kdtree_build_2)
      (kdtree_t* kd, void *data, int N, int D, int Nleaf,
       int treetype, unsigned int options,
       double* minval, double* maxval);
 
 /* Range seach for a single point.
- 
+
  kdtree_rangesearch()
 
  kd: kd-tree object.
@@ -595,6 +596,7 @@ kdtree_qres_t* KDFUNC(kdtree_rangesearch_options)(const kdtree_t *kd, const void
  previous call, to avoid a lot of freeing and allocating memory.
  */
 kdtree_qres_t* KDFUNC(kdtree_rangesearch_options_reuse)(const kdtree_t *kd, kdtree_qres_t* res, const void *pt, double maxd2, int options);
+
 
 #if !defined(KD_DIM)
 #undef KD_DIM_GENERIC

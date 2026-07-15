@@ -2,7 +2,8 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-
+#include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -28,6 +29,9 @@
 #include "quad-utils.h"
 #include "errors.h"
 #include "tweak2.h"
+#include "index_shard_internal.h"
+#include "kdtree_product_internal.h"
+#include "index_shard_config.h"
 
 #if TESTING_TRYALLCODES
 #define DEBUGSOLVER 1
@@ -304,7 +308,7 @@ void solver_print_to(const solver_t* sp, FILE* stream) {
  verify_matchobj_deep_copy(mo, dest);
  return dest;
  }
- 
+
  static void matchobj_free_data(MatchObj* mo) {
  verify_free_matchobj(mo);
  onefield_free_matchobj(mo);
@@ -415,6 +419,152 @@ static void set_center_and_radius(solver_t* solver, MatchObj* mo,
     mo->radius = sqrt(distsq(mo->center, xyz, 3));
     mo->radius_deg = dist2deg(mo->radius);
 }
+/*
+ * Resolve-match hot-path cache.
+ *
+ * The measured solver profile shows that resolve_matches() is dominated by
+ * repeated retrieval of quad membership and decoded star coordinates:
+ *
+ *   quadfile_get_stars()
+ *   startree_get()
+ *     -> kdtree_copy_data_double()
+ *
+ * Index data is immutable while an index is being solved, so repeated reads
+ * of the same quad or star can be served from worker-private memory without
+ * changing solver ordering, numerical results or acceptance semantics.
+ *
+ * This cache is thread-local because the index-shard implementation gives
+ * each pthread worker an independent solver/index execution context.  No
+ * mutex or cross-worker sharing is required.
+ *
+ * Both cache sizes are powers of two so lookup requires only a mask.
+ */
+#define RESOLVE_QUAD_CACHE_SIZE 1024U
+#define RESOLVE_STAR_CACHE_SIZE 2048U
+
+typedef struct resolve_quad_cache_entry {
+    unsigned int generation;
+    unsigned int quadid;
+    unsigned int stars[DQMAX];
+} resolve_quad_cache_entry_t;
+
+typedef struct resolve_star_cache_entry {
+    unsigned int generation;
+    unsigned int starid;
+    double xyz[3];
+} resolve_star_cache_entry_t;
+
+typedef struct resolve_hot_cache {
+    unsigned int generation;
+    const index_t* index;
+
+    unsigned long long quad_lookups;
+    unsigned long long quad_hits;
+
+    unsigned long long star_lookups;
+    unsigned long long star_hits;
+
+    resolve_quad_cache_entry_t quads[RESOLVE_QUAD_CACHE_SIZE];
+    resolve_star_cache_entry_t stars[RESOLVE_STAR_CACHE_SIZE];
+} resolve_hot_cache_t;
+
+static __thread resolve_hot_cache_t resolve_hot_cache;
+
+static inline unsigned int resolve_cache_hash(unsigned int value) {
+    /*
+     * Integer finalizer with unsigned wraparound semantics.
+     *
+     * This is not used for security or persistence.  It only disperses
+     * sequential and spatially related IDs across direct-mapped cache slots.
+     */
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+
+    return value;
+}
+
+
+static inline int resolve_cached_quad_stars(const quadfile_t* qf,
+                                            unsigned int quadid,
+                                            int dimquads,
+                                            unsigned int* stars) {
+    unsigned int slot;
+    resolve_quad_cache_entry_t* entry;
+
+    if (!qf || !stars) {
+        return -1;
+    }
+
+    if (dimquads <= 0 || dimquads > DQMAX) {
+        return -1;
+    }
+
+    resolve_hot_cache.quad_lookups++;
+
+    slot = resolve_cache_hash(quadid) & (RESOLVE_QUAD_CACHE_SIZE - 1U);
+    entry = &resolve_hot_cache.quads[slot];
+
+    if (entry->generation == resolve_hot_cache.generation &&
+        entry->quadid == quadid) {
+        memcpy(stars,
+               entry->stars,
+               (size_t)dimquads * sizeof(unsigned int));
+
+        resolve_hot_cache.quad_hits++;
+        return 0;
+    }
+
+    if (quadfile_get_stars(qf, quadid, stars)) {
+        return -1;
+    }
+
+    entry->generation = resolve_hot_cache.generation;
+    entry->quadid = quadid;
+
+    memcpy(entry->stars,
+           stars,
+           (size_t)dimquads * sizeof(unsigned int));
+
+    return 0;
+}
+
+static inline int resolve_cached_star_xyz(startree_t* starkd,
+                                          unsigned int starid,
+                                          double* xyz) {
+    unsigned int slot;
+    resolve_star_cache_entry_t* entry;
+
+    if (!starkd || !xyz) {
+        return -1;
+    }
+
+    resolve_hot_cache.star_lookups++;
+
+    slot = resolve_cache_hash(starid) & (RESOLVE_STAR_CACHE_SIZE - 1U);
+    entry = &resolve_hot_cache.stars[slot];
+
+    if (entry->generation == resolve_hot_cache.generation &&
+        entry->starid == starid) {
+        memcpy(xyz, entry->xyz, sizeof(entry->xyz));
+
+        resolve_hot_cache.star_hits++;
+        return 0;
+    }
+
+    if (startree_get(starkd, starid, xyz)) {
+        return -1;
+    }
+
+    entry->generation = resolve_hot_cache.generation;
+    entry->starid = starid;
+
+    memcpy(entry->xyz, xyz, sizeof(entry->xyz));
+
+    return 0;
+}
 
 static void set_index(solver_t* s, index_t* index) {
     s->index = index;
@@ -517,9 +667,9 @@ void solver_compute_quad_range(const solver_t* sp, const index_t* index,
     // -that divided by the smallest arcsec-per-pixel scale
     //  gives the largest motion in pixels.
 
-    //logverb("Index scale %f, %f\n", 
+    //logverb("Index scale %f, %f\n",
     //index->index_scale_upper, index->index_scale_lower);
-            
+
     scalefudge = index->index_scale_upper * M_SQRT1_2 *
         sp->codetol / sp->funits_upper;
 
@@ -889,7 +1039,7 @@ void solver_run(solver_t* solver) {
          * ("newpoint").  First, we try building all quads that have the new
          * star on the diagonal (star B).  Then, we try building all quads that
          * have the star not on the diagonal (star D).
-         * 
+         *
          * For each AB pair, we have a "potential_quad" or "pquad" struct.
          * This caches the computation we need to do: deciding whether the
          * scale is acceptable, computing the transformation to code
@@ -919,7 +1069,7 @@ void solver_run(solver_t* solver) {
             // quads with the new star on the diagonal:
             field[B] = newpoint;
             debug("Trying quads with B=%i\n", newpoint);
-	
+
             // first do an index-independent scale check...
             for (field[A] = 0; field[A] < newpoint; field[A]++) {
                 // initialize the "pquad" struct for this AB combo.
@@ -1136,7 +1286,114 @@ static void try_all_codes_2(const int* fieldstars, int dimquad,
  bailout:
     kdtree_free_query(result);
 }
+/*
+ * ------------------------------------------------------------------------
+ * CodeKD Product-search selection
+ * ------------------------------------------------------------------------
+ *
+ * Product decomposition is disabled by default because measured CodeKD
+ * queries are usually too small to amortize nested scheduling. An explicit
+ * interval enables sparse validation without changing the normal solver.
+ */
 
+typedef struct solver_kd_product_sampler {
+    anbool initialized;
+    unsigned long interval;
+    unsigned long countdown;
+} solver_kd_product_sampler_t;
+
+static __thread solver_kd_product_sampler_t solver_kd_product_sampler;
+
+
+/*
+ * A thread-local countdown avoids an integer division or modulo operation
+ * on every CodeKD query.
+ */
+static anbool solver_kd_product_selected(void) {
+    solver_kd_product_sampler_t *sampler = &solver_kd_product_sampler;
+
+    if (!sampler->initialized) {
+        sampler->interval = index_shard_config_get()->kd_product_interval;
+        sampler->countdown = sampler->interval;
+        sampler->initialized = TRUE;
+    }
+
+    if (!sampler->interval) {
+        return FALSE;
+    }
+
+    if (sampler->countdown > 1) {
+        sampler->countdown--;
+        return FALSE;
+    }
+
+    sampler->countdown = sampler->interval;
+    return TRUE;
+}
+
+/*
+ * Execute a normal scalar search unless this call was explicitly sampled
+ * and the shared index-shard executor can accept nested work.
+ */
+static kdtree_qres_t *solver_codekd_rangesearch(
+    solver_t *solver,
+    kdtree_qres_t *reuse,
+    const void *code,
+    double tol2,
+    int options) {
+    const kdtree_t *tree = solver->index->codekd->tree;
+    index_shard_aux_group_t *group;
+    kdtree_task_executor_t executor;
+    kdtree_qres_t *result;
+
+    if (!solver_kd_product_selected() ||
+        !index_shard_aux_available()) {
+        return kdtree_rangesearch_options_reuse(
+            tree,
+            reuse,
+            code,
+            tol2,
+            options);
+    }
+
+    group = index_shard_aux_group_new();
+    if (!group) {
+        return kdtree_rangesearch_options_reuse(
+            tree,
+            reuse,
+            code,
+            tol2,
+            options);
+    }
+
+    memset(&executor, 0, sizeof(executor));
+
+    if (index_shard_kdtree_executor_init(&executor, group)) {
+        index_shard_aux_group_free(group);
+
+        return kdtree_rangesearch_options_reuse(
+            tree,
+            reuse,
+            code,
+            tol2,
+            options);
+    }
+
+    result = kdtree_rangesearch_options_reuse_product(
+        tree,
+        reuse,
+        code,
+        tol2,
+        options,
+        &executor);
+
+    /*
+     * Product search waits for every accepted callback before returning,
+     * so the group has no live users at this point.
+     */
+    index_shard_aux_group_free(group);
+    return result;
+}
 /**
  This functions tries different permutations of the non-backbone
  stars C [, D [,E ] ]
@@ -1146,7 +1403,7 @@ static void try_all_codes_2(const int* fieldstars, int dimquad,
  stars: only elements [0] and [1] are set; they will be equal to origstars [0],[1] or [1],[0].
  code: may be NULL, in which case use a local variable
  slot: 0 on initial call; incremented on recursive calls
- 
+
  */
 static void try_permutations(const int* origstars, int dimquad,
                              const double* origcode,
@@ -1230,7 +1487,7 @@ static void try_permutations(const int* origstars, int dimquad,
                 meanx += code[2*j];
             meanx /= (slot+1);
             if (meanx > 0.5 + solver->cxdx_margin) {
-                debug("meanx <= 0.5 check failed: %g > 0.5 + %g\n", 
+                debug("meanx <= 0.5 check failed: %g > 0.5 + %g\n",
                       meanx, solver->cxdx_margin);
                 solver->num_meanx_skipped++;
                 continue;
@@ -1241,7 +1498,7 @@ static void try_permutations(const int* origstars, int dimquad,
         if (slot < lastslot) {
             placed[i] = TRUE;
             try_permutations(origstars, dimquad, origcode, solver,
-                             current_parity, tol2, stars, code, 
+                             current_parity, tol2, stars, code,
                              slot+1, placed, presult);
             placed[i] = FALSE;
 
@@ -1250,25 +1507,47 @@ static void try_permutations(const int* origstars, int dimquad,
             TEST_TRY_PERMUTATIONS(stars, code, dimquad, solver);
             continue;
 #endif
-				
-            // Search with the code we've built.
-            *presult = kdtree_rangesearch_options_reuse
-                (solver->index->codekd->tree, *presult, code, tol2, options);
-            //debug("      trying ABCD = [%i %i %i %i]: %i results.\n",
-            //fstars[A], fstars[B], fstars[C], fstars[D], result->nres);
+
+            /*
+            * CodeKD search.
+            *
+            * Product decomposition is disabled by default. Explicitly sampled
+            * searches may use only capacity admitted by the shared executor; every
+            * other query follows the scalar implementation.
+            */
+            *presult = solver_codekd_rangesearch(
+                solver,
+                *presult,
+                code,
+                tol2,
+                options);
+
+            if (!*presult) {
+                ERROR("CodeKD range search failed");
+                solver->quit_now = TRUE;
+                return;
+            }
 
             if ((*presult)->nres) {
-                double pixvals[DQMAX*2];
+                double pixvals[DQMAX * 2];
                 int j;
-                for (j=0; j<dimquad; j++) {
+
+                for (j = 0; j < dimquad; j++) {
                     setx(pixvals, j, field_getx(solver, stars[j]));
                     sety(pixvals, j, field_gety(solver, stars[j]));
                 }
-                resolve_matches(*presult, pixvals, stars, dimquad, solver,
+
+                resolve_matches(*presult,
+                                pixvals,
+                                stars,
+                                dimquad,
+                                solver,
                                 current_parity);
             }
-            if (unlikely(solver->quit_now))
+
+            if (unlikely(solver->quit_now)) {
                 return;
+            }
         }
     }
 }
@@ -1278,11 +1557,18 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
                             solver_t* solver, anbool current_parity) {
     // "field_xy" contains the xy pixel coordinates of stars A,B,C,D forming the quad
     //    [x_A,y_A, x_B,y_B, x_C,y_C, ...]
+    enum { MAX_PREFETCHED_QUADS = 32 };
     int jj, thisquadno;
     MatchObj mo;
     unsigned int star[dimquads];
 
     assert(krez);
+    // Queue candidate rows before ordered verification begins. Candidate
+    // evaluation and result commitment remain in their original order.
+    quadfile_prefetch_stars(
+        solver->index->quads,
+        krez->inds,
+        MIN(krez->nres, MAX_PREFETCHED_QUADS));
 
     for (jj = 0; jj < krez->nres; jj++) {
         double starxyz[dimquads*3];
@@ -1295,14 +1581,27 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
 
         solver->nummatches++;
         thisquadno = krez->inds[jj];
-        quadfile_get_stars(solver->index->quads, thisquadno, star);
-        for (i=0; i<dimquads; i++) {
-            startree_get(solver->index->starkd, star[i], starxyz + 3*i);
-            if (solver->use_radec)
-                if (distsq(starxyz + 3*i, solver->centerxyz, 3) > solver->r2) {
+
+        quadfile_get_stars(solver->index->quads,
+                           thisquadno,
+                           star);
+
+        startree_prefetch_stars(
+            solver->index->starkd, star, dimquads);
+
+        for (i = 0; i < dimquads; i++) {
+            startree_get(solver->index->starkd,
+                         star[i],
+                         starxyz + 3 * i);
+
+            if (solver->use_radec) {
+                if (distsq(starxyz + 3 * i,
+                           solver->centerxyz,
+                           3) > solver->r2) {
                     outofbounds = TRUE;
                     break;
                 }
+            }
         }
         if (outofbounds) {
             debug("Quad match is out of bounds.\n");
@@ -1317,7 +1616,7 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
 
         // Quick-n-dirty scale estimate based on two stars.
         // in (rad per pix)**2
-        abscale = square(distsq2rad(distsq(starxyz, starxyz+3, 3))) / 
+        abscale = square(distsq2rad(distsq(starxyz, starxyz+3, 3))) /
             distsq(field_xy, field_xy+2, 2);
         if (abscale > solver->abscale_high ||
             abscale < solver->abscale_low) {
@@ -1449,7 +1748,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
         mo->quadpix_orig[2*i+0] = starxy_getx(sp->fieldxy_orig, mo->field[i]);
         mo->quadpix_orig[2*i+1] = starxy_gety(sp->fieldxy_orig, mo->field[i]);
     }
-    
+
     update_timeused(sp);
     mo->timeused = sp->timeused;
 
@@ -1551,7 +1850,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                 printf("Initial SIP on distorted positions:\n");
                 sip_print(sip);
             }
-            
+
             int doshift = 1;
             fit_sip_wcs(matchxyz, matchxy, weights, Ngood, &(sip->wcstan),
                         sp->tweak_aborder, sp->tweak_abporder, doshift,
@@ -1571,7 +1870,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                         xx, yy, matchxy[2*i+0], matchxy[2*i+1]);
             }
             mo->sip = sip;
-            
+
         } else {
             // Take the coordinates after applying the --predistort,
             // fit a TAN to those, and include the --predistort in the output
