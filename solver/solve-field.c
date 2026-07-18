@@ -661,7 +661,7 @@ static void after_solved(augment_xylist_t* axy,
 
         xyls = xylist_open(axy->axyfn);
         if (!xyls) {
-            ERROR("Failed to read xylist to write SCAMP catalog and detect distractors");
+            ERROR("Failed to read xylist, so SCAMP catalog can't be written and distractors can't be detected");
             exit(-1);
         }
         if (axy->xcol)
@@ -714,11 +714,13 @@ static void after_solved(augment_xylist_t* axy,
 
             anwcs_t *const anwcs = anwcs_open(axy->wcsfn, 0);
 
+            printf("The brightest distractors are ");
             // Using doubles is fine here despite them being variably sized,
-            // since starxy_t itself is using doubles
+            // since starxy_t itself uses doubles
             double xycoords[2];
-            printf("The %d brightest distractors are at (RA, DEC):\n", MAX_DISTRACTORS_TO_MENTION);
-            for (int xyrow=0, corrindex=0, distractorsFound=0;
+            double rdcoords[2*MAX_DISTRACTORS_TO_MENTION];
+            int distractorsFound = 0;
+            for (int xyrow=0, corrindex=0;
                 distractorsFound<MAX_DISTRACTORS_TO_MENTION && corrindex<corrnrows;
                 xyrow++
             ) {
@@ -727,11 +729,22 @@ static void after_solved(augment_xylist_t* axy,
                     continue;
                 }
                 starxy_get(xy, xyrow, xycoords);
-                anwcs_pixelxy2radec(anwcs, xycoords[0], xycoords[1], &xycoords[0], &xycoords[1]);
-                printf("  %f, %f\n", xycoords[0], xycoords[1]);
+                anwcs_pixelxy2radec(anwcs, xycoords[0], xycoords[1],
+                    &rdcoords[2*distractorsFound], &rdcoords[2*distractorsFound+1]);
                 distractorsFound++;
+                if (distractorsFound>=MAX_DISTRACTORS_TO_MENTION) {
+                    printf("(capped at %d) ", MAX_DISTRACTORS_TO_MENTION);
+                    break;
+                } if (corrindex>=corrnrows) {
+                    printf("(only found %d) ", distractorsFound);
+                    break;
+                }
             }
             anwcs_free(anwcs);
+            printf("(RA, DEC):\n");
+            for (int i=0; i<distractorsFound; i++) {
+                printf("  %f, %f\n", rdcoords[2*i], rdcoords[2*i+1]);
+            }
         }
 
         starxy_free(xy);
