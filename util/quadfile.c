@@ -78,6 +78,11 @@ static quadfile_t* new_quadfile(const char* fn, anqfits_t* fits, anbool writing)
         return NULL;
     }
 
+    // Quad data bypasses kdtree FITS I/O, so apply the same index policy here.
+    if (!writing) {
+        fitsbin_configure_index_mmap(qf->fb);
+    }
+
     fitsbin_chunk_init(&chunk);
     chunk.tablename = "quads";
     chunk.required = 1;
@@ -85,7 +90,7 @@ static quadfile_t* new_quadfile(const char* fn, anqfits_t* fits, anbool writing)
     chunk.userdata = qf;
     fitsbin_add_chunk(qf->fb, &chunk);
     fitsbin_chunk_clean(&chunk);
-    
+
     return qf;
 }
 
@@ -349,5 +354,30 @@ int quadfile_get_stars(const quadfile_t* qf, unsigned int quadid, unsigned int* 
     return 0;
 }
 
+int quadfile_prefetch_stars(const quadfile_t* qf,
+                            const unsigned int* quadids,
+                            int nquads) {
+    size_t row_size;
+    int i;
 
+    if (!qf || !quadids || nquads <= 0 || !qf->quadarray) {
+        return 0;
+    }
+
+    row_size = (size_t)qf->dimquads * sizeof(uint32_t);
+
+    for (i = 0; i < nquads; i++) {
+        const uint32_t* row;
+
+        if (quadids[i] >= qf->numquads) {
+            return -1;
+        }
+
+        row = qf->quadarray +
+            (size_t)quadids[i] * (size_t)qf->dimquads;
+        fitsbin_prefetch_data(qf->fb, row, row_size);
+    }
+
+    return 0;
+}
 

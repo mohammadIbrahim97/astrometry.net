@@ -135,7 +135,7 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
         opts |= KD_OPTIONS_RETURN_POINTS;
 
     res = kdtree_rangesearch_options(s->tree, xyzcenter, radius2, opts);
-	
+
     if (!res || !res->nres) {
         if (xyzresults)
             *xyzresults = NULL;
@@ -483,22 +483,71 @@ int startree_get_sweep(const startree_t* s, int ind) {
     return s->sweep[ind];
 }
 
-int startree_get(startree_t* s, int starid, double* posn) {
+static int startree_data_index(startree_t* s, int starid) {
     if (s->tree->perm && !s->inverse_perm) {
         startree_compute_inverse_perm(s);
-        if (!s->inverse_perm)
+        if (!s->inverse_perm) {
             return -1;
+        }
     }
-    if (starid >= Ndata(s)) {
-        fprintf(stderr, "Invalid star ID: %u >= %u.\n", starid, Ndata(s));
+
+    if (starid < 0 || starid >= Ndata(s)) {
+        fprintf(stderr, "Invalid star ID %i; expected [0, %i).\n",
+                starid, Ndata(s));
         assert(0);
         return -1;
     }
+
     if (s->inverse_perm) {
-        kdtree_copy_data_double(s->tree, s->inverse_perm[starid], 1, posn);
-    } else {
-        kdtree_copy_data_double(s->tree, starid, 1, posn);
+        return s->inverse_perm[starid];
     }
+
+    return starid;
+}
+
+int startree_prefetch_stars(startree_t* s,
+                            const unsigned int* starids,
+                            int nstars) {
+    fitsbin_t* fb;
+    size_t row_size;
+    int i;
+
+    if (!s || !s->tree || !starids || nstars <= 0 ||
+        !s->tree->io || Ndata(s) <= 0) {
+        return 0;
+    }
+
+    fb = s->tree->io;
+    row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
+
+    for (i = 0; i < nstars; i++) {
+        int data_index;
+        void* row;
+
+        if (starids[i] >= (unsigned int)Ndata(s)) {
+            return -1;
+        }
+
+        data_index = startree_data_index(s, (int)starids[i]);
+        if (data_index < 0) {
+            return -1;
+        }
+
+        row = kdtree_get_data(s->tree, data_index);
+        fitsbin_prefetch_data(fb, row, row_size);
+    }
+
+    return 0;
+}
+
+int startree_get(startree_t* s, int starid, double* posn) {
+    int data_index = startree_data_index(s, starid);
+
+    if (data_index < 0) {
+        return -1;
+    }
+
+    kdtree_copy_data_double(s->tree, data_index, 1, posn);
     return 0;
 }
 
@@ -584,7 +633,7 @@ static int write_to_file(startree_t* s, const char* fn, anbool flipped,
 
     if (flipped)
         il_free(wordsizes);
-    
+
     if (io)
         kdtree_fits_io_close(io);
     return 0;

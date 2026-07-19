@@ -20,6 +20,7 @@
 #include "astrometry/verify.h"
 #include "astrometry/sip.h"
 #include "astrometry/an-bool.h"
+#include "astrometry/fitsbin.h"
 
 enum {
     PARITY_NORMAL,
@@ -40,7 +41,7 @@ struct solver_t {
 
     // FIELDS REQUIRED FROM THE CALLER BEFORE CALLING SOLVER_RUN
     // =========================================================
-	
+
     // The set of indexes.  Caller must add with solver_add_index()
     pl* indexes;
 
@@ -113,7 +114,7 @@ struct solver_t {
     anbool use_radec;
     double centerxyz[3];
     double r2;
-	
+
     // During verification, if the log-odds ratio drops to this level, we bail out and
     // assume it's not a match.  Default log(1e-100).
     double logratio_bail_threshold;
@@ -162,7 +163,7 @@ struct solver_t {
     int num_meanx_skipped;
     // number of matches skipped due to RA,Dec bounds constraints.
     int num_radec_skipped;
-    // 
+    //
     int num_abscale_skipped;
     // The number of times we ran verification on a quad.
     int num_verified;
@@ -209,6 +210,12 @@ struct solver_t {
 
     // Cached data about this field, for verify_hit().
     verify_field_t* vf;
+
+        /*
+     * Persists across consecutive index-shard passes for one field.
+     * Reset whenever solver_set_field() installs a new field.
+     */
+    fitsbin_mmap_advice_state_t index_mmap_policy;
 };
 typedef struct solver_t solver_t;
 

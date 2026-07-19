@@ -11,6 +11,7 @@
 
 #include "kdtree.h"
 #include "kdtree_internal.h"
+#include "kdtree_prefetch_internal.h"
 #include "kdtree_product_internal.h"
 #include "kdtree_phase_a_internal.h"
 
@@ -31,12 +32,13 @@ kdtree_t* KDFUNC(kdtree_build_2)
 /* Range seach */
 kdtree_qres_t* KDFUNC(kdtree_rangesearch)
      (const kdtree_t *kd, const void *pt, double maxd2) {
-    return KDFUNC(kdtree_rangesearch_options_reuse)(kd, NULL, pt, maxd2, KD_OPTIONS_COMPUTE_DISTS | KD_OPTIONS_SORT_DISTS);
+    return KDFUNC(kdtree_rangesearch_options_reuse)(kd, NULL, pt, maxd2, KD_OPTIONS_COMPUTE_DISTS | KD_OPTIONS_RETURN_POINTS |
+                                                     KD_OPTIONS_SORT_DISTS);
 }
 
 kdtree_qres_t* KDFUNC(kdtree_rangesearch_nosort)
      (const kdtree_t *kd, const void *pt, double maxd2) {
-    return KDFUNC(kdtree_rangesearch_options_reuse)(kd, NULL, pt, maxd2, KD_OPTIONS_COMPUTE_DISTS);
+    return KDFUNC(kdtree_rangesearch_options_reuse)(kd, NULL, pt, maxd2, KD_OPTIONS_COMPUTE_DISTS | KD_OPTIONS_RETURN_POINTS);
 }
 
 kdtree_qres_t* KDFUNC(kdtree_rangesearch_options)
@@ -78,6 +80,35 @@ kdtree_qres_t* KDFUNC(kdtree_rangesearch_options_reuse_product)
 
     return res;
 }
+
+KD_DECLARE(kdtree_rangesearch_prefetch_prepare,
+           int,
+           (const kdtree_t *kd,
+            const void *query,
+            double maxd2,
+            int options,
+            const kdtree_prefetch_sink_t *sink));
+
+int KDFUNC(kdtree_rangesearch_prefetch_prepare)
+     (const kdtree_t *kd,
+      const void *query,
+      double maxd2,
+      int options,
+      const kdtree_prefetch_sink_t *sink) {
+    int rc = -1;
+
+    if (!kd) {
+        return -1;
+    }
+
+    KD_DISPATCH(kdtree_rangesearch_prefetch_prepare,
+                kd->treetype,
+                rc=,
+                (kd, query, maxd2, options, sink));
+
+    return rc;
+}
+
 typedef struct kdtree_phase_a_atomic_stats {
     uint64_t calls;
     uint64_t product_calls;

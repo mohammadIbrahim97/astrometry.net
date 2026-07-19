@@ -79,6 +79,12 @@
  */
 
 struct fitsbin_t;
+// mmap access policy for solver index tables.
+typedef enum fitsbin_mmap_advice {
+    FITSBIN_MMAP_ADVICE_NORMAL = 0,
+    FITSBIN_MMAP_ADVICE_RANDOM = 1
+} fitsbin_mmap_advice_t;
+
 
 struct fitsbin_chunk_t {
     char* tablename;
@@ -147,6 +153,18 @@ struct fitsbin_t {
 
     // for use by callback_read_header().
     void* userdata;
+     // mmap policy applied to chunks read after opening this FITS file.
+    fitsbin_mmap_advice_t mmap_advice;
+
+    // Prevent repeated attempts after the kernel rejects an advice request.
+    anbool mmap_advice_failed;
+
+    // Cached system page size for bounded mmap prefetch requests.
+    size_t mmap_page_size;
+
+    // Enables bounded, caller-directed prefetch within random mappings.
+    anbool mmap_prefetch_enabled;
+    anbool mmap_prefetch_failed;
 };
 typedef struct fitsbin_t fitsbin_t;
 
@@ -177,6 +195,44 @@ fitsbin_t* fitsbin_open_for_writing(const char* fn);
 fitsbin_t* fitsbin_open_in_memory(void);
 
 int fitsbin_close_fd(fitsbin_t* fb);
+
+/**
+ Configures the mmap policy for solver index data.
+
+ The production default uses random mmap advice when supported and disables
+ explicit prefetching. Developer overrides may temporarily select alternate
+ policies for diagnostics and controlled performance comparisons.
+ */
+int fitsbin_configure_index_mmap(fitsbin_t* fb);
+
+/**
+ Requests population of the mapped pages covering this data range.
+
+ The request is a no-op unless random advice and mmap prefetching are both
+ enabled for the fitsbin.
+ */
+int fitsbin_prefetch_data(fitsbin_t* fb, const void* data, size_t size);
+
+/**
+ Resolves a requested data range to the actual mmap region containing it.
+
+ On success:
+   - map_base/map_size identify the exact mmap mapping.
+   - range_start/range_size identify the requested interval clipped to that
+     mapping.
+
+ Return:
+    1  containing mmap region found
+    0  address is not backed by a mapped fitsbin chunk
+   -1  invalid arguments
+ */
+int fitsbin_resolve_mapped_range(fitsbin_t* fb,
+                                 const void* data,
+                                 size_t size,
+                                 const void** map_base,
+                                 size_t* map_size,
+                                 const void** range_start,
+                                 size_t* range_size);
 
 int fitsbin_switch_to_reading(fitsbin_t* fb);
 
@@ -243,5 +299,90 @@ int fitsbin_write_chunk_header_to(fitsbin_t* fb, fitsbin_chunk_t* chunk, FILE* f
 int fitsbin_write_items_to(fitsbin_chunk_t* chunk, void* data, int N, FILE* fid);
 
 int fitsbin_write_chunk_to(fitsbin_t* fb, fitsbin_chunk_t* chunk, FILE* fid);
+
+/*
+ * Index mmap policy.
+ *
+ * Fixed policies preserve one advice for the complete field. Adaptive begins
+ * each field with RANDOM and changes to NORMAL only after one clean,
+ * exhaustive, unsolved index-shard pass.
+ */
+typedef enum fitsbin_mmap_policy {
+    FITSBIN_MMAP_POLICY_FIXED_NORMAL = 0,
+    FITSBIN_MMAP_POLICY_FIXED_RANDOM,
+    FITSBIN_MMAP_POLICY_ADAPTIVE
+} fitsbin_mmap_policy_t;
+
+typedef struct fitsbin_mmap_advice_state {
+    fitsbin_mmap_policy_t policy;
+    fitsbin_mmap_advice_t effective_advice;
+
+    /*
+     * Number of fully quiesced passes recorded for the current field.
+     */
+    unsigned int pass_number;
+
+    /*
+     * Adaptive-policy evidence and transitions for the current field.
+     */
+    unsigned int completed_clean_unsolved_passes;
+    unsigned int transition_count;
+} fitsbin_mmap_advice_state_t;
+
+fitsbin_mmap_policy_t fitsbin_mmap_policy_parse(const char* value);
+
+/*
+ * Return the automatic production policy. Runtime environment overrides are
+ * intentionally not part of the public UX.
+ */
+fitsbin_mmap_policy_t fitsbin_get_configured_mmap_policy(void);
+
+const char* fitsbin_mmap_policy_name(
+    fitsbin_mmap_policy_t policy);
+
+const char* fitsbin_mmap_advice_name(
+    fitsbin_mmap_advice_t advice);
+
+void fitsbin_mmap_advice_state_init(
+    fitsbin_mmap_advice_state_t* state,
+    fitsbin_mmap_policy_t policy);
+
+void fitsbin_mmap_advice_state_reset(
+    fitsbin_mmap_advice_state_t* state);
+
+fitsbin_mmap_advice_t fitsbin_mmap_advice_state_begin_pass(
+    const fitsbin_mmap_advice_state_t* state);
+
+/*
+ * Records one fully quiesced pass.
+ *
+ * Returns TRUE only when adaptive policy changes from RANDOM to NORMAL.
+ */
+anbool fitsbin_mmap_policy_complete_pass(
+    fitsbin_mmap_advice_state_t* state,
+    anbool pass_completed,
+    anbool pass_exhaustive,
+    anbool pass_solved,
+    anbool pass_cancelled,
+    int pass_rc,
+    int pass_status);
+
+/*
+ * Worker-local pass advice used while index components are opened and mmaped.
+ */
+void fitsbin_mmap_set_thread_advice(
+    fitsbin_mmap_advice_t advice);
+
+void fitsbin_mmap_clear_thread_advice(void);
+
+fitsbin_mmap_advice_t fitsbin_mmap_current_advice(void);
+
+/*
+ * Changes the logical advice and optionally reapplies it to existing chunks.
+ */
+int fitsbin_set_mmap_advice(
+    fitsbin_t* fb,
+    fitsbin_mmap_advice_t advice,
+    anbool reapply_existing);
 
 #endif

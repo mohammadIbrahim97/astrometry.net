@@ -15,6 +15,8 @@
 #include "kdtree.h"
 #include "kdtree_internal.h"
 #include "kdtree_executor_internal.h"
+#include "kdtree_prefetch_internal.h"
+#include "kdtree_continuation_internal.h"
 #include "kdtree_mem.h"
 #include "kdtree_phase_a_internal.h"
 #include "keywords.h"
@@ -28,9 +30,11 @@
 #define KDTREE_PRODUCT_MIN_POINTS 512
 #define KDTREE_PRODUCT_MIN_TREE_POINTS 4096
 #define KDTREE_PRODUCT_FRONTIER_STORAGE 64
+
 #ifndef KDTREE_PRODUCT_STACK_MAX
 #define KDTREE_PRODUCT_STACK_MAX 4096
 #endif
+
 
 #define WARNING(x, ...) fprintf(stderr, x, ## __VA_ARGS__)
 
@@ -633,7 +637,8 @@ static void compute_splitbits(kdtree_t* kd) {
 /* Sorts results by kq->sdists */
 static int kdtree_qsort_results(kdtree_qres_t *kq, int D) {
     int beg[KDTREE_MAX_RESULTS], end[KDTREE_MAX_RESULTS], i = 0, j, L, R;
-    static etype piv_vec[KDTREE_MAX_DIM];
+    etype piv_vec[KDTREE_MAX_DIM];
+    anbool do_points = (kq->results.any != NULL);
     unsigned int piv_perm;
     double piv;
 
@@ -644,8 +649,10 @@ static int kdtree_qsort_results(kdtree_qres_t *kq, int D) {
         R = end[i];
         if (L < R) {
             piv = kq->sdists[L];
-            for (j=0; j<D; j++)
-                piv_vec[j] = kq->results.ETYPE[L*D + j];
+            if (do_points) {
+                for (j=0; j<D; j++)
+                    piv_vec[j] = kq->results.ETYPE[L*D + j];
+            }
             piv_perm = kq->inds[L];
             if (i == KDTREE_MAX_RESULTS - 1) /* Sanity */
                 assert(0);
@@ -653,8 +660,10 @@ static int kdtree_qsort_results(kdtree_qres_t *kq, int D) {
                 while (kq->sdists[R] >= piv && L < R)
                     R--;
                 if (L < R) {
-                    for (j=0; j<D; j++)
-                        kq->results.ETYPE[L*D + j] = kq->results.ETYPE[R*D + j];
+                    if (do_points) {
+                        for (j=0; j<D; j++)
+                            kq->results.ETYPE[L*D + j] = kq->results.ETYPE[R*D + j];
+                    }
                     kq->inds  [L] = kq->inds  [R];
                     kq->sdists[L] = kq->sdists[R];
                     L++;
@@ -662,15 +671,19 @@ static int kdtree_qsort_results(kdtree_qres_t *kq, int D) {
                 while (kq->sdists[L] <= piv && L < R)
                     L++;
                 if (L < R) {
-                    for (j=0; j<D; j++)
-                        kq->results.ETYPE[R*D + j] = kq->results.ETYPE[L*D + j];
+                    if (do_points) {
+                        for (j=0; j<D; j++)
+                            kq->results.ETYPE[R*D + j] = kq->results.ETYPE[L*D + j];
+                    }
                     kq->inds  [R] = kq->inds  [L];
                     kq->sdists[R] = kq->sdists[L];
                     R--;
                 }
             }
-            for (j=0; j<D; j++)
-                kq->results.ETYPE[D*L + j] = piv_vec[j];
+            if (do_points) {
+                for (j=0; j<D; j++)
+                    kq->results.ETYPE[D*L + j] = piv_vec[j];
+            }
             kq->inds  [L] = piv_perm;
             kq->sdists[L] = piv;
             beg[i + 1] = L + 1;
@@ -713,10 +726,15 @@ anbool resize_results(kdtree_qres_t* res, int newsize, int D,
 
     if (do_dists)
         res->sdists  = REALLOC(res->sdists , newsize * sizeof(double));
-    if (do_points)
+    if (do_points) {
         res->results.any = REALLOC(res->results.any, (size_t)newsize * (size_t)D * sizeof(etype));
+    } else {
+        FREE(res->results.any);
+        res->results.any = NULL;
+    }
     res->inds = REALLOC(res->inds, newsize * sizeof(u32));
-    if (newsize && (!res->results.any || (do_dists && !res->sdists) || !res->inds))
+    if (newsize && ((do_points && !res->results.any) ||
+                    (do_dists && !res->sdists) || !res->inds))
         SYSERROR("Failed to resize kdtree results arrays");
     res->capacity = newsize;
 
@@ -1250,6 +1268,473 @@ void MANGLE(kdtree_nn)(const kdtree_t* kd, const void* vquery,
 }
 
 
+static inline int MANGLE(kdtree_rangesearch_continuation_push)(
+    kdtree_rangesearch_continuation_t* continuation,
+    int nodeid) {
+    if (!continuation) {
+        return -1;
+    }
+
+    if ((continuation->stackpos + 1) >=
+        KDTREE_RANGESEARCH_CONTINUATION_STACK_MAX) {
+        ERROR("KD range-search continuation stack overflow at node %i",
+              nodeid);
+        return -1;
+    }
+
+    continuation->stackpos++;
+    continuation->nodestack[continuation->stackpos] = nodeid;
+
+    return 0;
+}
+
+/*
+ * Process exactly one real split-tree traversal node.
+ *
+ * This implementation mirrors the established scalar split path while the
+ * scalar function remains an independent correctness fallback during the
+ * continuation gate.  Child push order matches the historical stack exactly,
+ * preserving result order.
+ */
+static inline int MANGLE(kdtree_rangesearch_continuation_visit_node)(
+    kdtree_rangesearch_continuation_t* continuation,
+    int nodeid) {
+    const kdtree_t* kd;
+    const etype* query;
+    ttype* tquery;
+    int D;
+    int dim = -1;
+    ttype split = 0;
+
+    if (!continuation || !continuation->tree || !continuation->query ||
+        !continuation->result) {
+        return -1;
+    }
+
+    kd = continuation->tree;
+    query = continuation->query;
+    tquery = continuation->tquery.TTYPE;
+    D = continuation->dimension;
+
+    if (nodeid < 0 ||
+        (nodeid >= kd->ninterior &&
+         nodeid >= kd->ninterior + kd->nbottom)) {
+        ERROR("KD range-search continuation encountered invalid node %i",
+              nodeid);
+        return -1;
+    }
+
+    if (KD_IS_LEAF(kd, nodeid)) {
+        int L;
+        int R;
+        int i;
+
+        L = kdtree_left(kd, nodeid);
+        R = kdtree_right(kd, nodeid);
+
+        if (L < 0 || R < L || R >= kd->ndata) {
+            ERROR("KD range-search continuation encountered invalid leaf "
+                  "range node=%i L=%i R=%i ndata=%i",
+                  nodeid,
+                  L,
+                  R,
+                  kd->ndata);
+            return -1;
+        }
+
+        if (continuation->do_dists) {
+            for (i = L; i <= R; i++) {
+                anbool bailedout = FALSE;
+                double dsqd;
+                dtype* data;
+
+                data = KD_DATA(kd, D, i);
+
+                dist2_bailout(kd,
+                              query,
+                              data,
+                              D,
+                              continuation->maxd2,
+                              &bailedout,
+                              &dsqd);
+
+                if (bailedout) {
+                    continue;
+                }
+
+                if (!add_result(kd,
+                                continuation->result,
+                                dsqd,
+                                KD_PERM(kd, i),
+                                data,
+                                D,
+                                continuation->do_dists,
+                                continuation->do_points)) {
+                    return -1;
+                }
+            }
+        } else {
+            for (i = L; i <= R; i++) {
+                dtype* data;
+
+                data = KD_DATA(kd, D, i);
+
+                if (dist2_exceeds(kd,
+                                  query,
+                                  data,
+                                  D,
+                                  continuation->maxd2)) {
+                    continue;
+                }
+
+                if (!add_result(kd,
+                                continuation->result,
+                                LARGE_VAL,
+                                KD_PERM(kd, i),
+                                data,
+                                D,
+                                continuation->do_dists,
+                                continuation->do_points)) {
+                    return -1;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    if (kd->splitdim) {
+        dim = kd->splitdim[nodeid];
+    }
+
+    split = *KD_SPLIT(kd, nodeid);
+
+    if (!kd->splitdim && TTYPE_INTEGER) {
+        bigint tmpsplit;
+
+        tmpsplit = split;
+        dim = tmpsplit & kd->dimmask;
+        split = tmpsplit & kd->splitmask;
+    }
+
+    if (dim < 0 || dim >= D) {
+        ERROR("KD range-search continuation encountered invalid split "
+              "dimension node=%i dim=%i ndim=%i",
+              nodeid,
+              dim,
+              D);
+        return -1;
+    }
+
+    if (TTYPE_INTEGER && continuation->use_tsplit) {
+        if (tquery[dim] < split) {
+            if (MANGLE(kdtree_rangesearch_continuation_push)(
+                    continuation,
+                    KD_CHILD_LEFT(nodeid))) {
+                return -1;
+            }
+
+            if (split - tquery[dim] <=
+                continuation->tlinf.TTYPE) {
+                if (MANGLE(kdtree_rangesearch_continuation_push)(
+                        continuation,
+                        KD_CHILD_RIGHT(nodeid))) {
+                    return -1;
+                }
+            }
+        } else {
+            if (MANGLE(kdtree_rangesearch_continuation_push)(
+                    continuation,
+                    KD_CHILD_RIGHT(nodeid))) {
+                return -1;
+            }
+
+            if (tquery[dim] - split <=
+                continuation->tlinf.TTYPE) {
+                if (MANGLE(kdtree_rangesearch_continuation_push)(
+                        continuation,
+                        KD_CHILD_LEFT(nodeid))) {
+                    return -1;
+                }
+            }
+        }
+    } else {
+        dtype rsplit;
+
+        rsplit = POINT_TE(kd, dim, split);
+
+        if (query[dim] < rsplit) {
+            if (MANGLE(kdtree_rangesearch_continuation_push)(
+                    continuation,
+                    KD_CHILD_LEFT(nodeid))) {
+                return -1;
+            }
+
+            if (rsplit - query[dim] <= continuation->maxdist) {
+                if (MANGLE(kdtree_rangesearch_continuation_push)(
+                        continuation,
+                        KD_CHILD_RIGHT(nodeid))) {
+                    return -1;
+                }
+            }
+        } else {
+            if (MANGLE(kdtree_rangesearch_continuation_push)(
+                    continuation,
+                    KD_CHILD_RIGHT(nodeid))) {
+                return -1;
+            }
+
+            if (query[dim] - rsplit <= continuation->maxdist) {
+                if (MANGLE(kdtree_rangesearch_continuation_push)(
+                        continuation,
+                        KD_CHILD_LEFT(nodeid))) {
+                    return -1;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+int MANGLE(kdtree_rangesearch_continuation_init)(
+    kdtree_rangesearch_continuation_t* continuation,
+    const kdtree_t* kd,
+    kdtree_qres_t* res,
+    const void* vquery,
+    double maxd2,
+    int options) {
+    const etype* query = vquery;
+    int D;
+    double dtlinf = 0.0;
+
+    if (!continuation) {
+        return KDTREE_RANGESEARCH_CONTINUATION_INIT_ERROR;
+    }
+
+    /*
+     * Initialize only lifecycle fields before validating caller input.  The
+     * previous implementation cleared the complete continuation object in
+     * execute(), init(), and cleanup().  That wrote more than one kilobyte
+     * per CodeKD query even when only four query dimensions were active.
+     */
+    continuation->tree = NULL;
+    continuation->query = NULL;
+    continuation->result = NULL;
+    continuation->stackpos = -1;
+    continuation->owns_result = FALSE;
+    continuation->result_released = FALSE;
+    continuation->nodes_visited = 0;
+    continuation->status =
+        KDTREE_RANGESEARCH_CONTINUATION_UNINITIALIZED;
+
+    if (!kd || !query) {
+        return KDTREE_RANGESEARCH_CONTINUATION_INIT_ERROR;
+    }
+
+#if defined(KD_DIM)
+    assert(kd->ndim == KD_DIM);
+    D = KD_DIM;
+#else
+    D = kd->ndim;
+#endif
+
+    if (D <= 0 || D > KDTREE_RANGESEARCH_CONTINUATION_DIM_MAX) {
+        return KDTREE_RANGESEARCH_CONTINUATION_INIT_UNSUPPORTED;
+    }
+
+    /*
+     * The first continuation gate deliberately supports the real split-tree
+     * scalar path used by CodeKD.  Bounding-box traversal remains on the
+     * established scalar implementation until it receives its own parity
+     * gate.
+     */
+    if (!kd->split.any ||
+        (kd->bb.any && !(options & KD_OPTIONS_USE_SPLIT))) {
+        return KDTREE_RANGESEARCH_CONTINUATION_INIT_UNSUPPORTED;
+    }
+
+    if (options & KD_OPTIONS_SORT_DISTS) {
+        options |= KD_OPTIONS_COMPUTE_DISTS;
+    }
+
+    continuation->tree = kd;
+    continuation->query = query;
+    continuation->maxd2 = maxd2;
+    continuation->maxdist = sqrt(maxd2);
+    continuation->options = options;
+    continuation->dimension = D;
+    continuation->do_dists =
+        (options & KD_OPTIONS_COMPUTE_DISTS) != 0;
+    continuation->do_points =
+        (options & KD_OPTIONS_RETURN_POINTS) != 0;
+    continuation->use_tquery = FALSE;
+    continuation->use_tsplit = FALSE;
+    continuation->tlinf.TTYPE = 0;
+
+    if (TTYPE_INTEGER) {
+        continuation->use_tquery =
+            ttype_query(kd,
+                        query,
+                        continuation->tquery.TTYPE);
+    }
+
+    if (TTYPE_INTEGER && continuation->use_tquery) {
+        dtlinf = DIST_ET(kd, continuation->maxdist, );
+        continuation->tlinf.TTYPE = ceil(dtlinf);
+    }
+
+    continuation->use_tsplit =
+        continuation->use_tquery &&
+        (dtlinf < TTYPE_MAX);
+
+    continuation->owns_result = (res == NULL);
+
+    if (res) {
+        if (!res->capacity) {
+            if (!resize_results(res,
+                                KDTREE_MAX_RESULTS,
+                                D,
+                                continuation->do_dists,
+                                continuation->do_points)) {
+                return KDTREE_RANGESEARCH_CONTINUATION_INIT_ERROR;
+            }
+        } else {
+            if (!resize_results(res,
+                                res->capacity,
+                                D,
+                                continuation->do_dists,
+                                continuation->do_points)) {
+                return KDTREE_RANGESEARCH_CONTINUATION_INIT_ERROR;
+            }
+        }
+
+        res->nres = 0;
+    } else {
+        res = CALLOC(1, sizeof(kdtree_qres_t));
+        if (!res) {
+            SYSERROR("Failed to allocate kdtree_qres_t struct");
+            return KDTREE_RANGESEARCH_CONTINUATION_INIT_ERROR;
+        }
+
+        if (!resize_results(res,
+                            KDTREE_MAX_RESULTS,
+                            D,
+                            continuation->do_dists,
+                            continuation->do_points)) {
+            kdtree_free_query(res);
+            return KDTREE_RANGESEARCH_CONTINUATION_INIT_ERROR;
+        }
+    }
+
+    continuation->result = res;
+    continuation->stackpos = 0;
+    continuation->nodestack[0] = 0;
+    continuation->status = KDTREE_RANGESEARCH_CONTINUATION_MORE;
+
+    return KDTREE_RANGESEARCH_CONTINUATION_INIT_OK;
+}
+
+int MANGLE(kdtree_rangesearch_continuation_step)(
+    kdtree_rangesearch_continuation_t* continuation,
+    size_t node_budget) {
+    size_t processed = 0;
+
+    if (!continuation || !continuation->tree ||
+        !continuation->result || !node_budget) {
+        if (continuation) {
+            continuation->status = KDTREE_RANGESEARCH_CONTINUATION_ERROR;
+        }
+        return KDTREE_RANGESEARCH_CONTINUATION_ERROR;
+    }
+
+    if (continuation->status !=
+        KDTREE_RANGESEARCH_CONTINUATION_MORE) {
+        return continuation->status;
+    }
+
+    while (continuation->stackpos >= 0 && processed < node_budget) {
+        int nodeid;
+
+        nodeid = continuation->nodestack[continuation->stackpos];
+        continuation->stackpos--;
+
+        if (MANGLE(kdtree_rangesearch_continuation_visit_node)(
+                continuation,
+                nodeid)) {
+            continuation->status = KDTREE_RANGESEARCH_CONTINUATION_ERROR;
+            return continuation->status;
+        }
+
+        continuation->nodes_visited++;
+        processed++;
+    }
+
+    if (continuation->stackpos < 0) {
+        continuation->status = KDTREE_RANGESEARCH_CONTINUATION_DONE;
+    }
+
+    return continuation->status;
+}
+
+kdtree_qres_t* MANGLE(kdtree_rangesearch_continuation_finish)(
+    kdtree_rangesearch_continuation_t* continuation) {
+    kdtree_qres_t* result;
+
+    if (!continuation || !continuation->tree ||
+        !continuation->result ||
+        continuation->status != KDTREE_RANGESEARCH_CONTINUATION_DONE) {
+        return NULL;
+    }
+
+    if (!(continuation->options & KD_OPTIONS_NO_RESIZE_RESULTS)) {
+        if (!resize_results(continuation->result,
+                            continuation->result->nres,
+                            continuation->dimension,
+                            continuation->do_dists,
+                            continuation->do_points)) {
+            continuation->status = KDTREE_RANGESEARCH_CONTINUATION_ERROR;
+            return NULL;
+        }
+    }
+
+    if (continuation->options & KD_OPTIONS_SORT_DISTS) {
+        kdtree_qsort_results(continuation->result,
+                             continuation->tree->ndim);
+    }
+
+    result = continuation->result;
+    continuation->result_released = TRUE;
+    continuation->status = KDTREE_RANGESEARCH_CONTINUATION_FINISHED;
+
+    return result;
+}
+
+void MANGLE(kdtree_rangesearch_continuation_cleanup)(
+    kdtree_rangesearch_continuation_t* continuation) {
+    if (!continuation) {
+        return;
+    }
+
+    if (continuation->result && !continuation->result_released) {
+        if (continuation->owns_result) {
+            kdtree_free_query(continuation->result);
+        } else {
+            continuation->result->nres = 0;
+        }
+    }
+
+    continuation->tree = NULL;
+    continuation->query = NULL;
+    continuation->result = NULL;
+    continuation->stackpos = -1;
+    continuation->owns_result = FALSE;
+    continuation->result_released = FALSE;
+    continuation->nodes_visited = 0;
+    continuation->status =
+        KDTREE_RANGESEARCH_CONTINUATION_UNINITIALIZED;
+}
+
 kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
      (const kdtree_t* kd, kdtree_qres_t* res, const void* vquery,
       double maxd2, int options)
@@ -1257,8 +1742,9 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
     int nodestack[100];
     int stackpos = 0;
     int D = (kd ? kd->ndim : 0);
+
     anbool do_dists;
-    anbool do_points = TRUE;
+    anbool do_points;
     anbool do_wholenode_check;
     double maxdist = 0.0;
     ttype tlinf = 0;
@@ -1297,6 +1783,7 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
         // gotta compute 'em if ya wanna sort 'em!
         options |= KD_OPTIONS_COMPUTE_DISTS;
     do_dists = options & KD_OPTIONS_COMPUTE_DISTS;
+    do_points = options & KD_OPTIONS_RETURN_POINTS;
     do_wholenode_check = !(options & KD_OPTIONS_SMALL_RADIUS);
 
     if ((options & KD_OPTIONS_SPLIT_PRECHECK) &&
@@ -1327,7 +1814,7 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
         }
     }
 
-    assert(use_splits || use_bboxes);
+     assert(use_splits || use_bboxes);
 
     maxdist = sqrt(maxd2);
 
@@ -1413,6 +1900,7 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
 
         nodeid = nodestack[stackpos];
         stackpos--;
+
 
         if (KD_IS_LEAF(kd, nodeid)) {
             dtype* data;
@@ -3167,6 +3655,14 @@ void MANGLE(kdtree_update_funcs)(kdtree_t* kd) {
     kd->fun.fix_bounding_boxes = MANGLE(kdtree_fix_bounding_boxes);
     kd->fun.nearest_neighbour_internal = MANGLE(kdtree_nn);
     kd->fun.rangesearch = MANGLE(kdtree_rangesearch_options);
+    kd->fun.rangesearch_continuation_init =
+        MANGLE(kdtree_rangesearch_continuation_init);
+    kd->fun.rangesearch_continuation_step =
+        MANGLE(kdtree_rangesearch_continuation_step);
+    kd->fun.rangesearch_continuation_finish =
+        MANGLE(kdtree_rangesearch_continuation_finish);
+    kd->fun.rangesearch_continuation_cleanup =
+        MANGLE(kdtree_rangesearch_continuation_cleanup);
     kd->fun.nodes_contained = MANGLE(kdtree_nodes_contained);
 }
 
@@ -3304,7 +3800,7 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
   int stackpos;
   int D;
   anbool do_dists;
-  anbool do_points = TRUE;
+  anbool do_points;
   double maxdist;
   anbool use_tquery = FALSE;
   anbool use_tsplit = FALSE;
@@ -3330,6 +3826,7 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
     return NULL;
 
   do_dists = TRUE;
+  do_points = (options & KD_OPTIONS_RETURN_POINTS) != 0;
   maxdist = sqrt(maxd2);
 
   if (res) {
@@ -3777,7 +4274,201 @@ static int MANGLE(kdtree_product_build_frontier)
 
   return nfrontier;
 }
+static anbool MANGLE(kdtree_prefetch_size_mul)
+     (size_t left,
+      size_t right,
+      size_t *result) {
+    if (!result) {
+        return FALSE;
+    }
 
+    if (left && right > SIZE_MAX / left) {
+        return FALSE;
+    }
+
+    *result = left * right;
+    return TRUE;
+}
+
+static void MANGLE(kdtree_prefetch_emit_hint)
+     (const kdtree_t *kd,
+      const void *address,
+      size_t length,
+      kdtree_prefetch_array_kind_t kind,
+      unsigned int priority,
+      const kdtree_prefetch_sink_t *sink) {
+    kdtree_prefetch_hint_t hint;
+
+    if (!kd ||
+        !kd->io ||
+        !address ||
+        !length ||
+        !sink ||
+        !sink->emit) {
+        return;
+    }
+
+    memset(&hint, 0, sizeof(hint));
+
+    hint.mapping = kd->io;
+    hint.address = address;
+    hint.length = length;
+    hint.kind = kind;
+    hint.priority = priority;
+
+    /*
+     * Prefetch is strictly advisory. Rejection or failure must never change
+     * solver correctness or range-search semantics.
+     */
+    (void)sink->emit(sink->userdata, &hint);
+}
+
+/*
+ * Predict a shallow CodeKD frontier and emit only the exact backing arrays
+ * that the normal split traversal is expected to access.
+ *
+ * This function deliberately does not:
+ *
+ *   - call madvise()
+ *   - perform page alignment
+ *   - deduplicate requests
+ *   - merge ranges
+ *   - manage a byte/page budget
+ *
+ * Those are responsibilities of the pool-shared coordinator.
+ */
+int MANGLE(kdtree_rangesearch_prefetch_prepare)
+     (const kdtree_t *kd,
+      const void *vquery,
+      double maxd2,
+      int options,
+      const kdtree_prefetch_sink_t *sink) {
+    kdtree_product_frontier_node_t
+        frontier[KDTREE_PRODUCT_FRONTIER_STORAGE];
+
+    int nfrontier;
+    int i;
+
+    if (!kd || !vquery || !sink) {
+        return -1;
+    }
+
+    if (!kd->io ||
+        !sink->emit ||
+        !sink->enabled) {
+        return 0;
+    }
+
+    /*
+     * Reject before predictive traversal so the prefetch-OFF path does not
+     * pay frontier construction cost.
+     */
+    if (!sink->enabled(sink->userdata, kd->io)) {
+        return 0;
+    }
+
+    /*
+     * CodeKD currently uses the split traversal path. Do not predict arrays
+     * that the actual search mode does not consume.
+     */
+    if (!(options & KD_OPTIONS_USE_SPLIT) ||
+        !kd->split.any) {
+        return 0;
+    }
+
+    memset(frontier, 0, sizeof(frontier));
+
+    /*
+     * Reuse the validated Product-KD shallow-frontier builder. This preserves
+     * the actual query geometry and child-selection rules instead of creating
+     * a second traversal predictor.
+     */
+    nfrontier = MANGLE(kdtree_product_build_frontier)
+        (kd,
+         vquery,
+         maxd2,
+         options,
+         frontier,
+         KDTREE_PRODUCT_FRONTIER_STORAGE);
+
+    if (nfrontier <= 0) {
+        return 0;
+    }
+
+    for (i = 0; i < nfrontier; i++) {
+        int nodeid = frontier[i].nodeid;
+
+        if (!MANGLE(kdtree_product_valid_node)(kd, nodeid)) {
+            continue;
+        }
+
+        if (nodeid < kd->ninterior) {
+            MANGLE(kdtree_prefetch_emit_hint)
+                (kd,
+                 KD_SPLIT(kd, nodeid),
+                 sizeof(ttype),
+                 KDTREE_PREFETCH_ARRAY_SPLIT,
+                 KDTREE_PREFETCH_PRIORITY_METADATA,
+                 sink);
+
+            if (kd->splitdim) {
+                MANGLE(kdtree_prefetch_emit_hint)
+                    (kd,
+                     kd->splitdim + nodeid,
+                     sizeof(*kd->splitdim),
+                     KDTREE_PREFETCH_ARRAY_SPLITDIM,
+                     KDTREE_PREFETCH_PRIORITY_METADATA,
+                     sink);
+            }
+
+            continue;
+        }
+
+        if (MANGLE(kdtree_product_valid_leaf_node)(kd, nodeid)) {
+            int leafid = nodeid - kd->ninterior;
+
+            /*
+             * kdtree_leaf_left/right() read:
+             *
+             *   left:  lr[leafid - 1], except leaf zero
+             *   right: lr[leafid]
+             *
+             * Emit only this small traversal-metadata range. Leaf payload
+             * data and permutation pages are intentionally excluded from
+             * Gate 13.1.
+             */
+            if (kd->lr && !kd->has_linear_lr) {
+                int first_lr =
+                    leafid > 0 ? leafid - 1 : leafid;
+
+                int lr_count =
+                    leafid > 0 ? 2 : 1;
+
+                if (first_lr >= 0 &&
+                    first_lr < kd->nbottom &&
+                    lr_count > 0 &&
+                    lr_count <= kd->nbottom - first_lr) {
+                    size_t lr_bytes;
+
+                    if (MANGLE(kdtree_prefetch_size_mul)
+                        ((size_t)lr_count,
+                         sizeof(*kd->lr),
+                         &lr_bytes)) {
+                        MANGLE(kdtree_prefetch_emit_hint)
+                            (kd,
+                             kd->lr + first_lr,
+                             lr_bytes,
+                             KDTREE_PREFETCH_ARRAY_LR,
+                             KDTREE_PREFETCH_PRIORITY_METADATA,
+                             sink);
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
 static void MANGLE(kdtree_product_task_run)(void *userdata) {
   kdtree_product_task_t *task = userdata;
 
@@ -3926,7 +4617,7 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
   int D;
 
   anbool do_dists = TRUE;
-  anbool do_points = TRUE;
+  anbool do_points;
 
   const etype *query = vquery;
 
@@ -3937,6 +4628,8 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
   if (!kd || !query) {
     return NULL;
   }
+
+  do_points = (options & KD_OPTIONS_RETURN_POINTS) != 0;
 
   memset(&phase_a_sample, 0, sizeof(phase_a_sample));
   memset(&phase_a_wall_start, 0, sizeof(phase_a_wall_start));

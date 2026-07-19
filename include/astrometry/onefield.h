@@ -102,8 +102,8 @@ struct onefield_params {
     float cpu_start;
     anbool hit_cpulimit;
 
-    int timelimit;
-    time_t time_start;
+    double timelimit;
+    double time_start;
     anbool hit_timelimit;
 
     float total_cpulimit;

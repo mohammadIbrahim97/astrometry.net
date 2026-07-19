@@ -497,7 +497,7 @@ int engine_run_job(engine_t* engine, job_t* job) {
         goto finish;
     }
     // SECTION INDEX-SHARD: engine-lifecycle
-    bp->time_total_start = timenow();
+    bp->time_total_start = monotonic_seconds();
     bp->cpu_total_start = get_cpu_usage();
 
     if (index_shard_pthread_enabled()) {
@@ -750,7 +750,7 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
     onefield_set_ycol(bp, fn=fits_get_dupstring(hdr, "ANYCOL"));
     free(fn);
 
-    bp->timelimit = qfits_header_getint(hdr, "ANTLIM", 0);
+    bp->timelimit = qfits_header_getdouble(hdr, "ANTLIM", 0.0);
     bp->cpulimit = qfits_header_getdouble(hdr, "ANCLIM", 0.0);
     bp->logratio_tosolve = log(qfits_header_getdouble(hdr, "ANODDSSL", default_odds_tosolve));
     logverb("Set odds ratio to solve to %g (log = %g)\n", exp(bp->logratio_tosolve), bp->logratio_tosolve);
@@ -1152,9 +1152,9 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
     }
 
     logmsg("[index-shard] engine limits after setup: "
-           "cpulimit=%f total_cpulimit=%f timelimit=%li total_timelimit=%li\n",
-           bp->cpulimit, bp->total_cpulimit, (long)bp->timelimit,
-           (long)bp->total_timelimit);
+           "cpulimit=%f total_cpulimit=%f timelimit=%g total_timelimit=%g\n",
+           bp->cpulimit, bp->total_cpulimit, bp->timelimit,
+           bp->total_timelimit);
 
     // If the job didn't specify depths, set defaults.
     if (il_size(job->depths) == 0) {

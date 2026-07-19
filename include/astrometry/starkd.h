@@ -62,7 +62,7 @@ startree_t* startree_open_fits(anqfits_t* fits);
  starinds: if non-NULL, returns the indices of stars within range.
  This can be used to retrieve extra information about the stars, using
  the 'startree_get_data_column()' function.
- 
+
  */
 void startree_search_for(const startree_t* s, const double* xyzcenter, double radius2,
                          double** xyzresults, double** radecresults,
@@ -103,7 +103,7 @@ int64_t* startree_get_data_column_int64(startree_t* s, const char* colname, cons
  The column may be an array (that is, each row contains multiple
  entries); the array size is placed in "arraysize".
 
- The array entries 
+ The array entries
  */
 Malloc
 double* startree_get_data_column_array(startree_t* s, const char* colname, const int* indices, int N, int* arraysize);
@@ -184,6 +184,11 @@ int startree_D(const startree_t* s);
 qfits_header* startree_header(const startree_t* s);
 
 int startree_get(startree_t* s, int starid, double *p_xyz);
+
+// Schedules the mapped coordinate rows for the next group of star lookups.
+int startree_prefetch_stars(startree_t* s,
+                            const unsigned int* starids,
+                            int nstars);
 
 int startree_get_radec(startree_t* s, int starid, double *p_ra, double *p_dec);
 

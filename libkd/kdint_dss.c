@@ -38,6 +38,15 @@
 #define EQUAL_DT 1
 #define EQUAL_ET 0
 
+/*
+ * Enable the specialized 4D CodeKD leaf kernel only for the dominant
+ * double/U16/U16 specialization.
+ */
+#define KDTREE_CODEKD_DSS_U16_FAST_PATH 1
+
 #include "kdtree_internal.c"
+
+#undef KDTREE_CODEKD_DSS_U16_FAST_PATH
+
 #include "kdtree_internal_fits.c"
 

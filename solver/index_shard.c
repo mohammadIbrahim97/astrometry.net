@@ -30,9 +30,12 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/resource.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "index_shard_internal.h"
@@ -42,6 +45,20 @@
 #include "astrometry/log.h"
 #include "astrometry/tic.h"
 #include "kdtree_phase_a_internal.h"
+#include "astrometry/fitsbin.h"
+#include "kdtree_prefetch_internal.h"
+
+enum {
+  INDEX_SHARD_DISCOVERY_FRONTIER_LIMIT = 1,
+  INDEX_SHARD_SINGLE_WORKER_ORDERED_QUANTUM = 2
+};
+
+/*
+ * Bound the time an owner will wait for an unclaimed lending reservation.
+ * This is a scheduler safety bound, not an image- or index-specific rule.
+ */
+static const double INDEX_SHARD_LEND_OWNER_WAIT_SECONDS = 0.005;
+
 /*
  * SECTION INDEX-SHARD: types
  */
@@ -69,10 +86,39 @@ typedef struct index_shard_result {
   double best_logodds; // diagnostic + future usefulness hint
   int best_fieldnum;
 
-  double wall_seconds; // task wall time, excludes reducer wait
-  float cpu_seconds;   // process CPU delta around this task
+  /*
+   * solve wall covers solve_one_index() only.
+   *
+   * cpu_seconds is a process-wide CPU delta and is diagnostic only when
+   * pthread workers overlap; it is not exclusive CPU time for this task.
+   */
+  double wall_seconds;
+  float cpu_seconds;
+
+   /*
+   * Full outer-task timing covers local reset, index acquisition, solving,
+   * result analysis, and index release. It excludes queue wait and reducer
+   * wait.
+   */
+  anbool task_started;
+  int worker_id;
+  double task_wall_seconds;
+  double task_start_since_pass;
+  double task_finish_since_pass;
+
+  /*
+   * Non-overlapping wall-time attribution inside the outer task.
+   *
+   * solve_seconds is represented by wall_seconds above to preserve the
+   * existing result layout and diagnostics.
+   */
+  double reset_seconds;
+  double acquire_seconds;
+  double analyze_seconds;
+  double release_seconds;
 
   anbool hit_total_cpulimit;
+
   anbool cancelled;
 
   size_t index_order; // original candidate index order in onefield pass
@@ -88,6 +134,7 @@ typedef struct index_shard_result {
  */
 typedef struct index_shard_task {
   size_t index_order;
+  anbool discovery_frontier;
 } index_shard_task_t;
 
 // ANCHOR INDEX-SHARD: shared-pass-state
@@ -117,7 +164,13 @@ typedef struct index_shard_thread_state {
 
   index_shard_task_t *tasks;
   size_t ntasks;
-  size_t next_task; // next task in simple ordered queue
+  size_t next_task; // total tasks claimed from both immutable lanes
+  size_t next_frontier_task;
+  size_t next_ordered_task;
+  size_t task_family_count;
+  size_t task_frontier_count;
+  size_t ordered_since_frontier;
+  int frontier_running;
 
   index_shard_result_t *results;
   unsigned char *completed; // result slot is visible to reducer
@@ -145,12 +198,18 @@ typedef struct index_shard_thread_state {
   int master_committed;
 
   int have_solved_order;        // solved frontier exists
-  size_t earliest_solved_order; // prevents claiming later work after solve
+  size_t earliest_solved_order; // earliest original order known to solve
 
   int limit_reported; // avoid repeated CPU-limit log spam
 
   double pass_wall_start;
   float pass_cpu_start;
+
+  fitsbin_mmap_advice_t mmap_advice;
+  unsigned int mmap_pass_number;
+
+  struct rusage pass_rusage_start;
+  int pass_rusage_valid;
 } index_shard_thread_state_t;
 
 typedef struct index_shard_pool index_shard_pool_t;
@@ -193,6 +252,8 @@ struct index_shard_aux_group {
   int pending;
   int failed;
   int closed;
+  int lend_slot;
+  int lend_claimed;
   unsigned long progress;
 };
 
@@ -222,6 +283,139 @@ typedef struct index_shard_aux_metrics_snapshot {
   size_t pending;
   size_t max_pending;
 } index_shard_aux_metrics_snapshot_t;
+/*
+ * Shared prefetch coordinator safety ceilings.
+ *
+ * These are memory/I/O bounds, not workload-specific activation thresholds.
+ * For four workers and 4-KiB pages:
+ *
+ *   issue budget:   4 * 64 pages = 1 MiB per flush
+ *   collection cap: 4 MiB worth of raw page candidates
+ *
+ * Metadata pages always outrank leaf payload pages.
+ */
+#define INDEX_SHARD_PREFETCH_ISSUE_PAGES_PER_WORKER 64
+#define INDEX_SHARD_PREFETCH_COLLECT_MULTIPLIER 4
+#define INDEX_SHARD_PREFETCH_RECENT_MULTIPLIER 2
+/*
+ * Absolute safety ceiling on kernel-advice issue windows per pass.
+ *
+ * This is not a workload-selection threshold. It prevents prefetch traffic
+ * from becoming an unbounded second workload.
+ */
+#define INDEX_SHARD_PREFETCH_MAX_ISSUE_WINDOWS_PER_PASS 64
+
+typedef struct index_shard_prefetch_page {
+  fitsbin_t *fb;
+  const void *map_base;
+
+  uintptr_t page;
+  size_t page_size;
+
+  unsigned int priority;
+  kdtree_prefetch_array_kind_t kind;
+} index_shard_prefetch_page_t;
+
+typedef struct index_shard_prefetch_metrics {
+  unsigned long long hints_emitted;
+  unsigned long long hints_stale;
+  unsigned long long hints_unmapped;
+
+  unsigned long long pages_raw;
+  unsigned long long pages_unique;
+  unsigned long long pages_duplicate;
+  unsigned long long pages_selected;
+
+  unsigned long long pages_collection_dropped;
+  unsigned long long pages_budget_dropped;
+
+  unsigned long long metadata_pages_selected;
+  unsigned long long leaf_pages_selected;
+
+  /*
+   * publish_calls counts worker-local batches transferred into the shared
+   * accumulator. flushes counts actual kernel-advice issue windows.
+   */
+  unsigned long long publish_calls;
+  unsigned long long publish_empty;
+  unsigned long long issue_below_threshold;
+
+  unsigned long long flushes;
+  unsigned long long ranges_issued;
+  unsigned long long bytes_issued;
+  unsigned long long prefetch_failures;
+
+  unsigned long long pass_budget_exhausted;
+   /*
+   * Mapping-lifetime barriers prevent deferred page descriptors from
+   * surviving the index/mmap object that owns them.
+   */
+  unsigned long long mapping_barriers;
+  unsigned long long pending_pages_purged;
+  unsigned long long recent_pages_purged;
+} index_shard_prefetch_metrics_t;
+
+typedef struct index_shard_prefetch_metrics_snapshot {
+  index_shard_prefetch_metrics_t totals;
+
+  size_t pending;
+
+  size_t issue_page_budget;
+  size_t issue_threshold_pages;
+
+  size_t pass_page_budget;
+  size_t pass_pages_issued;
+
+  size_t collection_capacity;
+  size_t recent_capacity;
+} index_shard_prefetch_metrics_snapshot_t;
+
+typedef struct index_shard_prefetch_coordinator {
+  pthread_mutex_t mutex;
+  pthread_mutex_t flush_mutex;
+
+  int initialized;
+  unsigned long generation;
+
+  index_shard_prefetch_page_t *pending;
+  index_shard_prefetch_page_t *snapshot;
+  index_shard_prefetch_page_t *selected;
+  index_shard_prefetch_page_t *recent;
+
+  size_t pending_count;
+  size_t pending_capacity;
+
+  size_t issue_page_budget;
+  size_t issue_threshold_pages;
+
+  /*
+   * Hard per-pass ceiling. Reset at every pool generation.
+   */
+  size_t pass_page_budget;
+  size_t pass_pages_issued;
+
+  size_t recent_count;
+  size_t recent_capacity;
+  size_t recent_next;
+
+  index_shard_prefetch_metrics_t metrics;
+} index_shard_prefetch_coordinator_t;
+
+static int index_shard_prefetch_coordinator_init(
+    index_shard_prefetch_coordinator_t *coordinator,
+    int worker_count);
+
+static void index_shard_prefetch_coordinator_destroy(
+    index_shard_prefetch_coordinator_t *coordinator);
+
+static void index_shard_prefetch_coordinator_reset(
+    index_shard_prefetch_coordinator_t *coordinator,
+    unsigned long generation);
+
+static void index_shard_prefetch_metrics_snapshot(
+    index_shard_prefetch_coordinator_t *coordinator,
+    index_shard_prefetch_metrics_snapshot_t *snapshot);
+
 // ANCHOR INDEX-SHARD: pool-state
 /*
  * Persistent worker pool for one engine job.
@@ -249,6 +443,22 @@ struct index_shard_pool {
   index_shard_thread_state_t shared;
   index_shard_aux_queue_t auxq;
 
+  /*
+   * One configured worker may be lent at an outer-task boundary to the group
+   * holding lend_group. The token never creates a thread and never changes
+   * the ordered outer task plan. Protected by auxq.mutex.
+   */
+  struct index_shard_aux_group *lend_group;
+  unsigned long long lend_acquired_total;
+  unsigned long long lend_busy_total;
+  unsigned long long lend_tasks_total;
+  unsigned long long lend_fallback_total;
+
+  /*
+   * One mapping-aware prefetch coordinator shared by all solver workers.
+   */
+  index_shard_prefetch_coordinator_t prefetch;
+
 } ;
 
 static index_shard_pool_t *index_shard_global_pool = NULL;
@@ -263,12 +473,19 @@ static void index_shard_aux_queue_destroy(index_shard_aux_queue_t *q);
 static int index_shard_aux_queue_push(index_shard_pool_t *pool,
                                       index_shard_aux_task_t *task);
 static index_shard_aux_task_t *
-index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q);
+index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q,
+                              const index_shard_aux_group_t *exclude_group,
+                              int lend_only,
+                              int skip_lent);
+static int index_shard_help_lent_once(index_shard_pool_t *pool);
 static void index_shard_aux_group_done(index_shard_aux_group_t *group,
                                        int failed);
 static void index_shard_aux_cancel_list(index_shard_aux_task_t *task);
 static void index_shard_aux_execute_one(index_shard_aux_task_t *task);
 static int index_shard_kdtree_wait(void *userdata);
+static int index_shard_pool_capacity(index_shard_pool_t *pool,
+                                     index_shard_aux_group_t *group,
+                                     kdtree_task_capacity_t *capacity);
 static int index_shard_kdtree_capacity(void *userdata,
                                        kdtree_task_capacity_t *capacity);
 
@@ -308,7 +525,11 @@ anbool index_shard_pthread_enabled(void) {
 }
 
 anbool index_shard_trace_enabled(void) {
-  return index_shard_config_get()->trace_enabled;
+  /*
+   * Detailed scheduler traces follow the ordinary command-line verbosity
+   * model. Two -v flags select LOG_ALL without another environment control.
+   */
+  return log_get_level() >= LOG_ALL;
 }
 
 static int index_shard_get_worker_count(size_t nindexes) {
@@ -328,7 +549,69 @@ typedef struct index_shard_pass_metrics_snapshot {
   double wall_seconds;
   float cpu_seconds;
   double cpu_percent;
+
+  int resource_available;
+  double user_seconds;
+  double system_seconds;
+
+  long minor_faults;
+  long major_faults;
+  long voluntary_context_switches;
+  long involuntary_context_switches;
 } index_shard_pass_metrics_snapshot_t;
+
+typedef struct index_shard_task_profile_snapshot {
+  size_t executed;
+  int quantiles_available;
+
+  double task_p50_seconds;
+  double task_p90_seconds;
+  double task_p99_seconds;
+  double task_max_seconds;
+
+  double max_solve_seconds;
+  size_t max_index_order;
+  int max_worker_id;
+
+  double max_to_p50;
+  double max_pool_percent;
+
+  double serial_tail_seconds;
+  double serial_tail_percent;
+  size_t tail_index_order;
+  int tail_worker_id;
+} index_shard_task_profile_snapshot_t;
+
+typedef struct index_shard_phase_profile_snapshot {
+  size_t executed;
+  int quantiles_available;
+
+  double task_wall_total;
+
+  double reset_total;
+  double acquire_total;
+  double solve_total;
+  double analyze_total;
+  double release_total;
+  double other_total;
+
+  double reset_percent;
+  double acquire_percent;
+  double solve_percent;
+  double analyze_percent;
+  double release_percent;
+  double other_percent;
+
+  double acquire_p50;
+  double acquire_p90;
+  double acquire_p99;
+  double acquire_max;
+
+  double solve_p50;
+  double solve_p90;
+  double solve_p99;
+  double solve_max;
+} index_shard_phase_profile_snapshot_t;
 
 // ANCHOR INDEX-SHARD: pass-state-snapshot
 /*
@@ -359,26 +642,479 @@ static void index_shard_pass_state_snapshot(index_shard_thread_state_t *shared,
  * This function is called only after index_shard_pool_reduce_online() has
  * returned and all participating workers have left the pass.
  */
+static double index_shard_timeval_delta_seconds(
+    const struct timeval *finish,
+    const struct timeval *start) {
+  double seconds;
+
+  assert(finish);
+  assert(start);
+
+  seconds =
+      (double)(finish->tv_sec - start->tv_sec) +
+      ((double)(finish->tv_usec - start->tv_usec) / 1000000.0);
+
+  if (seconds < 0.0) {
+    return 0.0;
+  }
+
+  return seconds;
+}
+
+static long index_shard_nonnegative_long_delta(long finish,
+                                                long start) {
+  if (finish < start) {
+    return 0;
+  }
+
+  return finish - start;
+}
+
+/*
+ * Snapshot completed-pass timing and process resource usage.
+ *
+ * The rusage counters cover the complete process while the pthread pass is
+ * active. They are suitable for pass-level attribution but deliberately not
+ * treated as exclusive per-task measurements.
+ */
 static void index_shard_pass_metrics_snapshot(
     index_shard_thread_state_t *shared,
     index_shard_pass_metrics_snapshot_t *snapshot) {
+  struct rusage finish;
+
   assert(shared);
   assert(snapshot);
+
+  memset(snapshot, 0, sizeof(*snapshot));
 
   snapshot->reduced = shared->next_reduce;
   snapshot->wall_seconds =
       timenow() - shared->pass_wall_start;
   snapshot->cpu_seconds =
       get_cpu_usage() - shared->pass_cpu_start;
-  snapshot->cpu_percent = 0.0;
 
   if (snapshot->wall_seconds > 0.0) {
     snapshot->cpu_percent =
         (100.0 * (double)snapshot->cpu_seconds) /
         snapshot->wall_seconds;
   }
+
+  if (!shared->pass_rusage_valid ||
+      getrusage(RUSAGE_SELF, &finish)) {
+    return;
+  }
+
+  snapshot->resource_available = TRUE;
+
+  snapshot->user_seconds =
+      index_shard_timeval_delta_seconds(
+          &finish.ru_utime,
+          &shared->pass_rusage_start.ru_utime);
+
+  snapshot->system_seconds =
+      index_shard_timeval_delta_seconds(
+          &finish.ru_stime,
+          &shared->pass_rusage_start.ru_stime);
+
+  snapshot->minor_faults =
+      index_shard_nonnegative_long_delta(
+          finish.ru_minflt,
+          shared->pass_rusage_start.ru_minflt);
+
+  snapshot->major_faults =
+      index_shard_nonnegative_long_delta(
+          finish.ru_majflt,
+          shared->pass_rusage_start.ru_majflt);
+
+  snapshot->voluntary_context_switches =
+      index_shard_nonnegative_long_delta(
+          finish.ru_nvcsw,
+          shared->pass_rusage_start.ru_nvcsw);
+
+  snapshot->involuntary_context_switches =
+      index_shard_nonnegative_long_delta(
+          finish.ru_nivcsw,
+          shared->pass_rusage_start.ru_nivcsw);
+}
+/*
+ * Compare task durations for percentile calculation.
+ */
+static int index_shard_compare_double(const void *left,
+                                      const void *right) {
+  const double lhs = *(const double *)left;
+  const double rhs = *(const double *)right;
+
+  if (lhs < rhs) {
+    return -1;
+  }
+
+  if (lhs > rhs) {
+    return 1;
+  }
+
+  return 0;
 }
 
+/*
+ * Return the zero-based nearest-rank percentile index.
+ *
+ * The calculation avoids multiplying the full sample count by the percentile,
+ * so it remains safe for large size_t values.
+ */
+static size_t index_shard_percentile_index(size_t count,
+                                           unsigned int percentile) {
+  size_t rank;
+  size_t whole;
+  size_t remainder;
+
+  assert(count > 0);
+  assert(percentile >= 1);
+  assert(percentile <= 100);
+
+  whole = (count / 100) * percentile;
+  remainder = (count % 100) * percentile;
+  rank = whole + ((remainder + 99) / 100);
+
+  if (rank == 0) {
+    rank = 1;
+  }
+
+  if (rank > count) {
+    rank = count;
+  }
+
+  return rank - 1;
+}
+
+/*
+ * Build a completed-pass profile from immutable worker result slots.
+ *
+ * This runs only after index_shard_pool_reduce_online() has waited for every
+ * participating worker to leave the pass. No task modifies result storage at
+ * this point.
+ *
+ * The terminal serial tail is the interval after every other measured task
+ * has finished while the latest-finishing task is still running. If that task
+ * started after the second-latest completion, its own start time is used as
+ * the lower bound.
+ */
+static void index_shard_task_profile_snapshot(
+    const index_shard_result_t *results,
+    size_t nresults,
+    double pool_wall_seconds,
+    index_shard_task_profile_snapshot_t *snapshot) {
+  double *durations = NULL;
+  size_t sample_count = 0;
+  size_t i;
+
+  anbool have_max = FALSE;
+  anbool have_latest = FALSE;
+  anbool have_second_latest = FALSE;
+
+  double latest_finish = 0.0;
+  double latest_start = 0.0;
+  double second_latest_finish = 0.0;
+
+  memset(snapshot, 0, sizeof(*snapshot));
+
+  snapshot->max_worker_id = -1;
+  snapshot->tail_worker_id = -1;
+
+  if (!results || !nresults) {
+    return;
+  }
+
+  if (nresults <= ((size_t)-1) / sizeof(*durations)) {
+    durations = malloc(nresults * sizeof(*durations));
+  }
+
+  for (i = 0; i < nresults; i++) {
+    const index_shard_result_t *result = &results[i];
+
+    if (!result->task_started) {
+      continue;
+    }
+
+    if (!isfinite(result->task_wall_seconds) ||
+        !isfinite(result->task_start_since_pass) ||
+        !isfinite(result->task_finish_since_pass) ||
+        result->task_wall_seconds < 0.0 ||
+        result->task_finish_since_pass < result->task_start_since_pass) {
+      continue;
+    }
+
+    snapshot->executed++;
+
+    if (durations) {
+      durations[sample_count++] = result->task_wall_seconds;
+    }
+
+    if (!have_max ||
+        result->task_wall_seconds > snapshot->task_max_seconds) {
+      have_max = TRUE;
+
+      snapshot->task_max_seconds = result->task_wall_seconds;
+      snapshot->max_solve_seconds = result->wall_seconds;
+      snapshot->max_index_order = result->index_order;
+      snapshot->max_worker_id = result->worker_id;
+    }
+
+    if (!have_latest ||
+        result->task_finish_since_pass > latest_finish) {
+      if (have_latest) {
+        second_latest_finish = latest_finish;
+        have_second_latest = TRUE;
+      }
+
+      have_latest = TRUE;
+      latest_finish = result->task_finish_since_pass;
+      latest_start = result->task_start_since_pass;
+
+      snapshot->tail_index_order = result->index_order;
+      snapshot->tail_worker_id = result->worker_id;
+    } else if (!have_second_latest ||
+               result->task_finish_since_pass > second_latest_finish) {
+      second_latest_finish = result->task_finish_since_pass;
+      have_second_latest = TRUE;
+    }
+  }
+
+  if (durations &&
+      sample_count > 0 &&
+      sample_count == snapshot->executed) {
+    qsort(durations,
+          sample_count,
+          sizeof(*durations),
+          index_shard_compare_double);
+
+    snapshot->quantiles_available = TRUE;
+
+    snapshot->task_p50_seconds =
+        durations[index_shard_percentile_index(sample_count, 50)];
+
+    snapshot->task_p90_seconds =
+        durations[index_shard_percentile_index(sample_count, 90)];
+
+    snapshot->task_p99_seconds =
+        durations[index_shard_percentile_index(sample_count, 99)];
+
+    if (snapshot->task_p50_seconds > 0.0) {
+      snapshot->max_to_p50 =
+          snapshot->task_max_seconds /
+          snapshot->task_p50_seconds;
+    }
+  }
+
+  if (pool_wall_seconds > 0.0) {
+    snapshot->max_pool_percent =
+        (100.0 * snapshot->task_max_seconds) /
+        pool_wall_seconds;
+  }
+
+  if (have_latest) {
+    double tail_start = latest_start;
+
+    if (have_second_latest &&
+        second_latest_finish > tail_start) {
+      tail_start = second_latest_finish;
+    }
+
+    if (latest_finish > tail_start) {
+      snapshot->serial_tail_seconds =
+          latest_finish - tail_start;
+    }
+
+    if (pool_wall_seconds > 0.0) {
+      snapshot->serial_tail_percent =
+          (100.0 * snapshot->serial_tail_seconds) /
+          pool_wall_seconds;
+    }
+  }
+
+  free(durations);
+}
+
+/*
+ * Attribute completed outer-task wall time to reset, index acquisition,
+ * solving, result analysis, and index release.
+ *
+ * Phase totals are sums of per-task wall durations and may exceed pool wall
+ * time because pthread workers execute concurrently. Percentages are therefore
+ * relative to summed task wall, not elapsed pass wall.
+ */
+static void index_shard_phase_profile_snapshot(
+    const index_shard_result_t *results,
+    size_t nresults,
+    index_shard_phase_profile_snapshot_t *snapshot) {
+  double *acquire_durations = NULL;
+  double *solve_durations = NULL;
+  size_t sample_count = 0;
+  size_t i;
+  double measured_total;
+
+  memset(snapshot, 0, sizeof(*snapshot));
+
+  if (!results || !nresults) {
+    return;
+  }
+
+  if (nresults <= ((size_t)-1) / sizeof(*acquire_durations)) {
+    acquire_durations =
+        malloc(nresults * sizeof(*acquire_durations));
+
+    solve_durations =
+        malloc(nresults * sizeof(*solve_durations));
+  }
+
+  if (!acquire_durations || !solve_durations) {
+    free(acquire_durations);
+    free(solve_durations);
+
+    acquire_durations = NULL;
+    solve_durations = NULL;
+  }
+
+  for (i = 0; i < nresults; i++) {
+    const index_shard_result_t *result = &results[i];
+
+    if (!result->task_started ||
+        !isfinite(result->task_wall_seconds) ||
+        result->task_wall_seconds < 0.0) {
+      continue;
+    }
+
+    snapshot->executed++;
+    snapshot->task_wall_total += result->task_wall_seconds;
+
+    if (isfinite(result->reset_seconds) &&
+        result->reset_seconds >= 0.0) {
+      snapshot->reset_total += result->reset_seconds;
+    }
+
+    if (isfinite(result->acquire_seconds) &&
+        result->acquire_seconds >= 0.0) {
+      snapshot->acquire_total += result->acquire_seconds;
+    }
+
+    if (isfinite(result->wall_seconds) &&
+        result->wall_seconds >= 0.0) {
+      snapshot->solve_total += result->wall_seconds;
+    }
+
+    if (isfinite(result->analyze_seconds) &&
+        result->analyze_seconds >= 0.0) {
+      snapshot->analyze_total += result->analyze_seconds;
+    }
+
+    if (isfinite(result->release_seconds) &&
+        result->release_seconds >= 0.0) {
+      snapshot->release_total += result->release_seconds;
+    }
+
+    if (acquire_durations &&
+        solve_durations &&
+        isfinite(result->acquire_seconds) &&
+        result->acquire_seconds >= 0.0 &&
+        isfinite(result->wall_seconds) &&
+        result->wall_seconds >= 0.0) {
+      acquire_durations[sample_count] =
+          result->acquire_seconds;
+
+      solve_durations[sample_count] =
+          result->wall_seconds;
+
+      sample_count++;
+    }
+  }
+
+  measured_total =
+      snapshot->reset_total +
+      snapshot->acquire_total +
+      snapshot->solve_total +
+      snapshot->analyze_total +
+      snapshot->release_total;
+
+  if (snapshot->task_wall_total > measured_total) {
+    snapshot->other_total =
+        snapshot->task_wall_total - measured_total;
+  }
+
+  if (snapshot->task_wall_total > 0.0) {
+    snapshot->reset_percent =
+        (100.0 * snapshot->reset_total) /
+        snapshot->task_wall_total;
+
+    snapshot->acquire_percent =
+        (100.0 * snapshot->acquire_total) /
+        snapshot->task_wall_total;
+
+    snapshot->solve_percent =
+        (100.0 * snapshot->solve_total) /
+        snapshot->task_wall_total;
+
+    snapshot->analyze_percent =
+        (100.0 * snapshot->analyze_total) /
+        snapshot->task_wall_total;
+
+    snapshot->release_percent =
+        (100.0 * snapshot->release_total) /
+        snapshot->task_wall_total;
+
+    snapshot->other_percent =
+        (100.0 * snapshot->other_total) /
+        snapshot->task_wall_total;
+  }
+
+  if (acquire_durations &&
+      solve_durations &&
+      sample_count > 0 &&
+      sample_count == snapshot->executed) {
+    qsort(acquire_durations,
+          sample_count,
+          sizeof(*acquire_durations),
+          index_shard_compare_double);
+
+    qsort(solve_durations,
+          sample_count,
+          sizeof(*solve_durations),
+          index_shard_compare_double);
+
+    snapshot->quantiles_available = TRUE;
+
+    snapshot->acquire_p50 =
+        acquire_durations[
+            index_shard_percentile_index(sample_count, 50)];
+
+    snapshot->acquire_p90 =
+        acquire_durations[
+            index_shard_percentile_index(sample_count, 90)];
+
+    snapshot->acquire_p99 =
+        acquire_durations[
+            index_shard_percentile_index(sample_count, 99)];
+
+    snapshot->acquire_max =
+        acquire_durations[sample_count - 1];
+
+    snapshot->solve_p50 =
+        solve_durations[
+            index_shard_percentile_index(sample_count, 50)];
+
+    snapshot->solve_p90 =
+        solve_durations[
+            index_shard_percentile_index(sample_count, 90)];
+
+    snapshot->solve_p99 =
+        solve_durations[
+            index_shard_percentile_index(sample_count, 99)];
+
+    snapshot->solve_max =
+        solve_durations[sample_count - 1];
+  }
+
+  free(acquire_durations);
+  free(solve_durations);
+}
 /*
  * Take one synchronized snapshot of auxiliary queue accounting.
  *
@@ -527,14 +1263,15 @@ static int index_shard_master_stop_requested(index_shard_thread_state_t *shared)
   return index_shard_master_limit_or_cancel_requested(shared, NULL, NULL);
 }
 
-// ANCHOR INDEX-SHARD: global-cpu-limit
+// ANCHOR INDEX-SHARD: global-limits
 /*
- * Process-wide CPU budget check.
+ * Process-wide elapsed-time and CPU-budget checks.
  *
- * bp->total_cpulimit is not divided by worker count.  With N active threads,
- * CPU time accumulates roughly N times faster than wall time.
+ * total_timelimit is one shared monotonic wall-clock deadline and is not
+ * divided by worker count. total_cpulimit is aggregate process CPU time; with
+ * N active threads it can be consumed roughly N times faster than wall time.
  */
-static int index_shard_check_global_cpu_limit(index_shard_thread_state_t *shared) {
+static int index_shard_check_global_limits(index_shard_thread_state_t *shared) {
   onefield_t *bp = shared->bp;
   index_shard_pass_state_snapshot_t state;
   int hit = FALSE;
@@ -549,19 +1286,42 @@ static int index_shard_check_global_cpu_limit(index_shard_thread_state_t *shared
 
   if (bp->cancelled || bp->hit_total_cpulimit || bp->hit_total_timelimit) {
     hit = TRUE;
-  } else if (bp->total_cpulimit > 0.0) {
-    float now = get_cpu_usage();
-    double elapsed = (double)(now - bp->cpu_total_start);
+  } else {
+    if (bp->total_timelimit > 0.0) {
+      double now = monotonic_seconds();
 
-    if (elapsed >= bp->total_cpulimit) {
-      bp->hit_total_cpulimit = TRUE;
-      hit = TRUE;
+      if (now >= 0.0 &&
+          now - bp->time_total_start >= bp->total_timelimit) {
+        bp->hit_total_timelimit = TRUE;
+        hit = TRUE;
 
-      if (!shared->limit_reported) {
-        shared->limit_reported = TRUE;
-        logmsg("Total CPU time limit reached!\n");
-        logmsg("[index-shard] cpu-budget reached total_cpulimit=%g elapsed=%.3f\n",
-               bp->total_cpulimit, elapsed);
+        if (!shared->limit_reported) {
+          shared->limit_reported = TRUE;
+          logmsg("Total wall-clock time limit reached!\n");
+          logmsg("[index-shard] wall-limit reached total_timelimit=%g "
+                 "elapsed=%.3f\n",
+                 bp->total_timelimit,
+                 now - bp->time_total_start);
+        }
+      }
+    }
+
+    if (!hit && bp->total_cpulimit > 0.0) {
+      float now = get_cpu_usage();
+      double elapsed = (double)(now - bp->cpu_total_start);
+
+      if (elapsed >= bp->total_cpulimit) {
+        bp->hit_total_cpulimit = TRUE;
+        hit = TRUE;
+
+        if (!shared->limit_reported) {
+          shared->limit_reported = TRUE;
+          logmsg("Total CPU time limit reached!\n");
+          logmsg("[index-shard] cpu-budget reached total_cpulimit=%g "
+                 "elapsed=%.3f\n",
+                 bp->total_cpulimit,
+                 elapsed);
+        }
       }
     }
   }
@@ -590,7 +1350,7 @@ void index_shard_poll_from_callback(onefield_t *bp) {
   if (!ctx || !ctx->pool)
     return;
 
-  if (index_shard_check_global_cpu_limit(&ctx->pool->shared)) {
+  if (index_shard_check_global_limits(&ctx->pool->shared)) {
     bp->solver.quit_now = TRUE;
     return;
   }
@@ -662,6 +1422,31 @@ static void index_shard_result_dispose(index_shard_result_t *result,
   bl_free(result->solutions);
   result->solutions = NULL;
 }
+
+/*
+ * Close the full outer-task timing interval.
+ *
+ * One timenow() call is used for both task duration and position within the
+ * pass, keeping the hot-path instrumentation minimal.
+ */
+static void index_shard_result_finish_task(
+    index_shard_result_t *result,
+    const index_shard_thread_state_t *shared,
+    double task_wall_start) {
+  double task_wall_finish;
+
+  assert(result);
+  assert(shared);
+
+  task_wall_finish = timenow();
+
+  result->task_wall_seconds =
+      task_wall_finish - task_wall_start;
+
+  result->task_finish_since_pass =
+      task_wall_finish - shared->pass_wall_start;
+}
+
 // ANCHOR INDEX-SHARD: analyze-result
 /*
  * Inspect worker-local solutions without merging them.
@@ -785,22 +1570,143 @@ static index_t *index_shard_worker_get_index(index_shard_worker_context_t *ctx,
   return index;
 }
 
+static void index_shard_apply_index_mmap_advice(
+    index_t* index,
+    fitsbin_mmap_advice_t advice) {
+    fitsbin_t* fb;
+
+    if (!index) {
+        return;
+    }
+
+    /*
+     * Code KD tree.
+     *
+     * kdtree_fits_t is a typedef of fitsbin_t, and kdtree_t::io owns the
+     * corresponding FITS mapping.
+     */
+    if (index->codekd &&
+        index->codekd->tree &&
+        index->codekd->tree->io) {
+        fb = (fitsbin_t*)index->codekd->tree->io;
+
+        (void)fitsbin_set_mmap_advice(
+            fb,
+            advice,
+            TRUE);
+    }
+
+    /*
+     * Star KD tree.
+     */
+    if (index->starkd &&
+        index->starkd->tree &&
+        index->starkd->tree->io) {
+        fb = (fitsbin_t*)index->starkd->tree->io;
+
+        (void)fitsbin_set_mmap_advice(
+            fb,
+            advice,
+            TRUE);
+    }
+
+    /*
+     * Quad table.
+     */
+    if (index->quads &&
+        index->quads->fb) {
+        (void)fitsbin_set_mmap_advice(
+            index->quads->fb,
+            advice,
+            TRUE);
+    }
+}
+
 /*
  * SECTION INDEX-SHARD: queue
  */
 // ANCHOR INDEX-SHARD: build-task-plan
 /*
- * Build ordered one-index tasks for the current pass.
+ * Return true only for a standard unsplit Astrometry.net index name.
  *
- * No cost sorting, grouping, or chunking here.  The task order mirrors the
- * candidate index order received from onefield/engine.
+ * A split index has a second dash followed by its HEALPix number.  Such a file
+ * covers one sky region, so trying one arbitrary member cannot discover the
+ * usefulness of the whole scale family.  Keep split and unknown names in
+ * their original order.  Only an index-<digits> basename is genuinely
+ * suitable for the all-sky discovery lane.
  */
-static index_shard_task_t *index_shard_build_task_plan(size_t nindexes) {
-  size_t i;
-  index_shard_task_t *tasks;
+static anbool index_shard_task_is_all_sky(const char *index_name) {
+  const char *base;
+  const char *number;
 
-  if (!nindexes)
+  if (!index_name || !index_name[0]) {
+    return FALSE;
+  }
+
+  base = strrchr(index_name, '/');
+  base = base ? base + 1 : index_name;
+
+  if (strncmp(base, "index-", 6)) {
+    return FALSE;
+  }
+
+  number = base + 6;
+
+  if (*number < '0' || *number > '9') {
+    return FALSE;
+  }
+
+  do {
+    number++;
+  } while (*number >= '0' && *number <= '9');
+
+  return (*number == '\0' || *number == '.');
+}
+
+static void index_shard_build_ordered_task_plan(
+    index_shard_task_t *tasks,
+    size_t nindexes) {
+  size_t i;
+
+  assert(tasks || !nindexes);
+
+  for (i = 0; i < nindexes; i++) {
+    tasks[i].index_order = i;
+    tasks[i].discovery_frontier = FALSE;
+  }
+}
+
+/*
+ * Build the one-index task plan for the current pass.
+ *
+ * The production plan has two immutable lanes.  Genuinely all-sky indexes
+ * form a compact discovery lane; split and unknown indexes form an ordered
+ * lane.  Claiming interleaves the lanes without dropping, duplicating, or
+ * modifying solver work.  Result storage and reduction remain indexed by the
+ * original candidate order.
+ */
+static index_shard_task_t *index_shard_build_task_plan(
+    onefield_t *bp,
+    size_t nindexes,
+    const index_shard_hooks_t *hooks,
+    size_t *family_count_out,
+    size_t *frontier_count_out) {
+  index_shard_task_t *tasks;
+  unsigned char *in_frontier = NULL;
+  size_t frontier_count = 0;
+  size_t i;
+
+  if (family_count_out) {
+    *family_count_out = 0;
+  }
+
+  if (frontier_count_out) {
+    *frontier_count_out = 0;
+  }
+
+  if (!nindexes) {
     return NULL;
+  }
 
   tasks = calloc(nindexes, sizeof(index_shard_task_t));
   if (!tasks) {
@@ -808,8 +1714,56 @@ static index_shard_task_t *index_shard_build_task_plan(size_t nindexes) {
     return NULL;
   }
 
-  for (i = 0; i < nindexes; i++)
-    tasks[i].index_order = i;
+  index_shard_build_ordered_task_plan(tasks, nindexes);
+
+  if (!index_shard_config_get()->discovery_frontier_enabled ||
+      !hooks ||
+      !hooks->get_index_name) {
+    return tasks;
+  }
+
+  in_frontier = calloc(nindexes, sizeof(unsigned char));
+
+  if (!in_frontier) {
+    logmsg("[index-shard] discovery-frontier allocation failed; "
+           "using ordered task plan\n");
+    return tasks;
+  }
+
+  for (i = 0; i < nindexes; i++) {
+    const char *index_name = hooks->get_index_name(bp, i);
+
+    if (index_shard_task_is_all_sky(index_name)) {
+      tasks[frontier_count].index_order = i;
+      tasks[frontier_count].discovery_frontier = TRUE;
+      frontier_count++;
+      in_frontier[i] = TRUE;
+    }
+  }
+
+  {
+    size_t task_index = frontier_count;
+
+    for (i = 0; i < nindexes; i++) {
+      if (!in_frontier[i]) {
+        tasks[task_index].index_order = i;
+        tasks[task_index].discovery_frontier = FALSE;
+        task_index++;
+      }
+    }
+
+    assert(task_index == nindexes);
+  }
+
+  if (family_count_out) {
+    *family_count_out = frontier_count;
+  }
+
+  if (frontier_count_out) {
+    *frontier_count_out = frontier_count;
+  }
+
+  free(in_frontier);
 
   return tasks;
 }
@@ -825,8 +1779,16 @@ static index_shard_task_t *index_shard_build_task_plan(size_t nindexes) {
  * active_limit is a concurrency cap, not a ramp scheduler.
  */
 static int index_shard_claim_one(index_shard_thread_state_t *shared,
-                                 size_t *index_order) {
+                                 size_t *index_order,
+                                 anbool *frontier_task) {
   index_shard_pass_state_snapshot_t state;
+  anbool frontier_available;
+  anbool ordered_available;
+  anbool claim_frontier = FALSE;
+  index_shard_task_t *task;
+
+  assert(index_order);
+  assert(frontier_task);
 
   pthread_mutex_lock(&shared->queue_mutex);
 
@@ -853,22 +1815,59 @@ static int index_shard_claim_one(index_shard_thread_state_t *shared,
     return FALSE;
   }
 
-  if (shared->have_solved_order &&
-      shared->tasks[shared->next_task].index_order >
-          shared->earliest_solved_order) {
+  if (shared->have_solved_order) {
     pthread_mutex_unlock(&shared->queue_mutex);
     return FALSE;
   }
 
-  *index_order = shared->tasks[shared->next_task].index_order;
+  frontier_available =
+      (shared->next_frontier_task < shared->task_frontier_count);
+  ordered_available = (shared->next_ordered_task < shared->ntasks);
+
+  if (frontier_available) {
+    if (!ordered_available) {
+      claim_frontier = TRUE;
+    } else if (shared->worker_count == 1) {
+      if (shared->next_frontier_task == 0 ||
+          shared->ordered_since_frontier >=
+              INDEX_SHARD_SINGLE_WORKER_ORDERED_QUANTUM) {
+        claim_frontier = TRUE;
+      }
+    } else if (shared->frontier_running <
+               INDEX_SHARD_DISCOVERY_FRONTIER_LIMIT) {
+      claim_frontier = TRUE;
+    }
+  }
+
+  if (claim_frontier) {
+    task = &shared->tasks[shared->next_frontier_task];
+    shared->next_frontier_task++;
+    shared->frontier_running++;
+    shared->ordered_since_frontier = 0;
+  } else if (ordered_available) {
+    task = &shared->tasks[shared->next_ordered_task];
+    shared->next_ordered_task++;
+
+    if (shared->worker_count == 1 && frontier_available) {
+      shared->ordered_since_frontier++;
+    }
+  } else {
+    pthread_mutex_unlock(&shared->queue_mutex);
+    return FALSE;
+  }
+
+  *index_order = task->index_order;
+  *frontier_task = task->discovery_frontier;
   shared->next_task++;
   shared->running_tasks++;
 
   if (index_shard_trace_enabled()) {
-    logmsg("[index-shard] claim index_order=%zu running=%i active_limit=%i "
-           "wall_since_pass=%.3f\n",
+    logmsg("[index-shard] claim index_order=%zu lane=%s running=%i "
+           "frontier_running=%i active_limit=%i wall_since_pass=%.3f\n",
            *index_order,
+           *frontier_task ? "all-sky" : "ordered",
            shared->running_tasks,
+           shared->frontier_running,
            shared->active_limit,
            timenow() - shared->pass_wall_start);
   }
@@ -882,27 +1881,35 @@ static int index_shard_claim_one(index_shard_thread_state_t *shared,
  *
  * Must be called exactly once for each successful claim_one().
  */
-static void index_shard_release_active_credit(index_shard_thread_state_t *shared) {
+static void index_shard_release_active_credit(index_shard_thread_state_t *shared,
+                                              anbool frontier_task) {
   // release queue credit before publishing completion
   // completed flag is the reducer visibility boundary
   pthread_mutex_lock(&shared->queue_mutex);
 
-  if (shared->running_tasks > 0)
+  if (shared->running_tasks > 0) {
     shared->running_tasks--;
+  }
+
+  if (frontier_task) {
+    assert(shared->frontier_running > 0);
+    shared->frontier_running--;
+  }
 
   pthread_cond_broadcast(&shared->queue_cv);
   pthread_mutex_unlock(&shared->queue_mutex);
 }
 
 static void index_shard_mark_result_completed(index_shard_thread_state_t *shared,
-                                              size_t index_order) {
+                                              size_t index_order,
+                                              anbool frontier_task) {
   /*
    * NOTE INDEX-SHARD: claimed-task-invariant
    *
    * Every claimed task must release its active credit exactly once and mark
    * completion exactly once.  Otherwise the reducer can wait forever.
    */
-  index_shard_release_active_credit(shared);
+  index_shard_release_active_credit(shared, frontier_task);
 
   pthread_mutex_lock(&shared->result_mutex);
   shared->completed[index_order] = TRUE;
@@ -999,6 +2006,8 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
                                                    index_shard_result_t *result) {
   // one result slot belongs to this task
   index_t *index = NULL;
+  double task_wall_start;
+  double phase_wall_start;
   double wall_start;
   float cpu_start;
   int rc = 0;
@@ -1024,16 +2033,64 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
     result->rc = -1;
     return -1;
   }
-  // local_bp reused across tasks, but solutions change per task
+
+  /*
+   * Full outer-task timing starts before local reset and index acquisition.
+   * Queue wait and reducer wait are deliberately excluded.
+   */
+  task_wall_start = timenow();
+
+  result->task_started = TRUE;
+  result->worker_id = ctx->worker_id;
+  result->task_start_since_pass =
+      task_wall_start - shared->pass_wall_start;
+
+   // local_bp reused across tasks, but solutions change per task
+  phase_wall_start = timenow();
+
   shared->hooks->reset_local_context_for_task(&ctx->local_bp, result->solutions);
 
-  index = index_shard_worker_get_index(ctx, shared, index_order);
+  result->reset_seconds = timenow() - phase_wall_start;
+
+  phase_wall_start = timenow();
+
+  /*
+   * get_index() opens and mmaps the index components. Install the immutable
+   * pass advice before acquisition so every new mapping receives the correct
+   * policy immediately.
+   */
+  fitsbin_mmap_set_thread_advice(
+      shared->mmap_advice);
+
+  index = index_shard_worker_get_index(
+      ctx,
+      shared,
+      index_order);
+
+  fitsbin_mmap_clear_thread_advice();
+
   if (!index) {
+    result->acquire_seconds = timenow() - phase_wall_start;
+
     ERROR("Failed to load index order %zu", index_order);
     result->failed = TRUE;
     result->rc = -1;
+
+    index_shard_result_finish_task(result,
+                                   shared,
+                                   task_wall_start);
     return -1;
   }
+
+  /*
+   * Reapply to any component that the onefield hook reused rather than opened
+   * during this acquisition.
+   */
+  index_shard_apply_index_mmap_advice(
+      index,
+      shared->mmap_advice);
+
+  result->acquire_seconds = timenow() - phase_wall_start;
 
   if (index_shard_trace_enabled()) {
     logmsg("[index-shard] worker=%i start index_order=%zu cached=%i index=%s\n", ctx->worker_id,
@@ -1056,11 +2113,16 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   result->rc = rc;
 
   // analyze before reducer so worker can trigger fast stop
+  phase_wall_start = timenow();
+
   index_shard_capture_solution_analysis(shared, result);
 
-    if (ctx->local_bp.single_field_solved) {
+  if (ctx->local_bp.single_field_solved) {
     result->solved = TRUE;
   }
+
+  result->analyze_seconds =
+      timenow() - phase_wall_start;
 
   /*
    * Log the index name before done_with_index() releases index ownership.
@@ -1073,11 +2135,18 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   }
 
   // Release through the original onefield ownership hook.
+  phase_wall_start = timenow();
   if (shared->hooks->done_with_index) {
     shared->hooks->done_with_index(shared->bp, index_order, index);
     index = NULL;
   }
 
+  result->release_seconds =
+      timenow() - phase_wall_start;
+
+  index_shard_result_finish_task(result,
+                                 shared,
+                                 task_wall_start);
   if (rc) {
     result->failed = TRUE;
     result->rc = rc;
@@ -1126,6 +2195,7 @@ static void *index_shard_worker_main(void *userdata) {
   while (1) {
     index_shard_thread_state_t *shared = NULL;
     size_t index_order;
+    anbool frontier_task;
     index_shard_aux_task_t *aux_task = NULL;
     int run_pass = FALSE;
 
@@ -1148,7 +2218,11 @@ static void *index_shard_worker_main(void *userdata) {
         break;
       }
 
-      aux_task = index_shard_aux_queue_try_pop(&pool->auxq);
+      aux_task = index_shard_aux_queue_try_pop(
+          &pool->auxq,
+          NULL,
+          FALSE,
+          FALSE);
       if (aux_task) {
         break;
       }
@@ -1178,16 +2252,34 @@ static void *index_shard_worker_main(void *userdata) {
       continue;
     }
 
-    while (index_shard_claim_one(shared, &index_order)) {
-      index_shard_result_t *result = &shared->results[index_order];
+    while (1) {
+      index_shard_result_t *result;
 
-      if (index_shard_check_global_cpu_limit(shared) ||
+      /*
+       * A completed outer task has released its queue credit. Before this
+       * worker claims the next ordered index, it may execute the one helper
+       * range reserved by an active large inner wave. After exactly one range
+       * it returns here and resumes the unchanged outer claim sequence.
+       */
+      (void)index_shard_help_lent_once(pool);
+
+      if (!index_shard_claim_one(shared,
+                                 &index_order,
+                                 &frontier_task)) {
+        break;
+      }
+
+      result = &shared->results[index_order];
+
+      if (index_shard_check_global_limits(shared) ||
           index_shard_master_stop_requested(shared)) {
         index_shard_master_limit_or_cancel_requested(
             shared,
             &result->hit_total_cpulimit,
             &result->cancelled);
-        index_shard_mark_result_completed(shared, index_order);
+        index_shard_mark_result_completed(shared,
+                                          index_order,
+                                          frontier_task);
         break;
       }
 
@@ -1195,7 +2287,9 @@ static void *index_shard_worker_main(void *userdata) {
                                                   shared,
                                                   index_order,
                                                   result)) {
-        index_shard_mark_result_completed(shared, index_order);
+        index_shard_mark_result_completed(shared,
+                                          index_order,
+                                          frontier_task);
         index_shard_request_fatal_stop(shared);
         break;
       }
@@ -1226,8 +2320,10 @@ static void *index_shard_worker_main(void *userdata) {
                timenow() - shared->pass_wall_start);
       }
 
-      index_shard_check_global_cpu_limit(shared);
-      index_shard_mark_result_completed(shared, index_order);
+      index_shard_check_global_limits(shared);
+      index_shard_mark_result_completed(shared,
+                                        index_order,
+                                        frontier_task);
     }
 
     index_shard_worker_cleanup_pass(ctx, shared);
@@ -1663,22 +2759,42 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     pthread_cond_destroy(&pool->work_cv);
     pthread_mutex_destroy(&pool->control_mutex);
     free(pool);
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
     return -1;
   }
 
-  pool->threads = calloc((size_t)worker_count, sizeof(pthread_t));
-  pool->contexts = calloc((size_t)worker_count, sizeof(index_shard_worker_context_t));
-
-    if (!pool->threads || !pool->contexts) {
-    free(pool->threads);
-    free(pool->contexts);
+  if (index_shard_prefetch_coordinator_init(
+          &pool->prefetch,
+          worker_count)) {
     index_shard_aux_queue_destroy(&pool->auxq);
     index_shard_shared_destroy(&pool->shared);
     pthread_cond_destroy(&pool->work_cv);
     pthread_mutex_destroy(&pool->control_mutex);
     free(pool);
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
     return -1;
   }
+
+  pool->threads = calloc((size_t)worker_count, sizeof(pthread_t));
+  pool->contexts = calloc((size_t)worker_count,
+                          sizeof(index_shard_worker_context_t));
+
+    if (!pool->threads || !pool->contexts) {
+      free(pool->threads);
+      free(pool->contexts);
+
+      index_shard_prefetch_coordinator_destroy(&pool->prefetch);
+      index_shard_aux_queue_destroy(&pool->auxq);
+      index_shard_shared_destroy(&pool->shared);
+
+      pthread_cond_destroy(&pool->work_cv);
+      pthread_mutex_destroy(&pool->control_mutex);
+
+      free(pool);
+
+      pthread_mutex_unlock(&index_shard_global_pool_mutex);
+      return -1;
+    }
 
   // worker contexts are stable for lifetime of the pool
   for (i = 0; i < worker_count; i++) {
@@ -1698,20 +2814,27 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
         pthread_join(pool->threads[j], NULL);
       }
 
-      free(pool->threads);
+       free(pool->threads);
       free(pool->contexts);
+
+      index_shard_prefetch_coordinator_destroy(&pool->prefetch);
       index_shard_aux_queue_destroy(&pool->auxq);
       index_shard_shared_destroy(&pool->shared);
+
       pthread_cond_destroy(&pool->work_cv);
       pthread_mutex_destroy(&pool->control_mutex);
+
       free(pool);
+
+      pthread_mutex_unlock(&index_shard_global_pool_mutex);
       return -1;
     }
   }
 
   index_shard_global_pool = pool;
 
-  logmsg("[index-shard] pthread-pool start workers=%i scheduler=ordered chunk=1\n", worker_count);
+  logmsg("[index-shard] workers=%i mode=pthread\n",
+         worker_count);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
   return 0;
@@ -1728,6 +2851,11 @@ void index_shard_pool_stop(onefield_t *bp) {
   index_shard_aux_task_t *cancelled_tasks = NULL;
   index_shard_aux_task_t *task;
   index_shard_aux_metrics_snapshot_t aux_metrics;
+  unsigned long long lend_acquired_total;
+  unsigned long long lend_busy_total;
+  unsigned long long lend_fallback_total;
+  unsigned long long lend_tasks_total;
+  int lend_group_live;
   size_t cancelled_count = 0;
   int i;
 
@@ -1816,7 +2944,17 @@ void index_shard_pool_stop(onefield_t *bp) {
   free(pool->contexts);
   index_shard_aux_metrics_snapshot(&pool->auxq, &aux_metrics);
 
-  logmsg("[index-shard] auxq submitted=%llu executed=%llu rejected=%llu "
+  pthread_mutex_lock(&pool->auxq.mutex);
+
+  lend_acquired_total = pool->lend_acquired_total;
+  lend_busy_total = pool->lend_busy_total;
+  lend_tasks_total = pool->lend_tasks_total;
+  lend_fallback_total = pool->lend_fallback_total;
+  lend_group_live = pool->lend_group != NULL;
+
+  pthread_mutex_unlock(&pool->auxq.mutex);
+
+  logverb("[index-shard] auxq submitted=%llu executed=%llu rejected=%llu "
          "cancelled=%llu pending=%zu max_pending=%zu\n",
          aux_metrics.submitted,
          aux_metrics.executed,
@@ -1831,13 +2969,26 @@ void index_shard_pool_stop(onefield_t *bp) {
     logerr("[index-shard] auxq accounting mismatch at shutdown\n");
   }
 
+  logverb("[index-shard] inner-lending acquired=%llu busy=%llu "
+         "lent_tasks=%llu owner_fallback=%llu live_group=%i\n",
+         lend_acquired_total,
+         lend_busy_total,
+         lend_tasks_total,
+         lend_fallback_total,
+         lend_group_live);
+
+  if (lend_group_live) {
+    logerr("[index-shard] inner lending group live at shutdown\n");
+  }
+
   index_shard_shared_destroy(&pool->shared);
+  index_shard_prefetch_coordinator_destroy(&pool->prefetch);
   index_shard_aux_queue_destroy(&pool->auxq);
 
   pthread_cond_destroy(&pool->work_cv);
   pthread_mutex_destroy(&pool->control_mutex);
 
-  logmsg("[index-shard] pthread-pool stop\n");
+  logverb("[index-shard] pthread-pool stop\n");
 
   free(pool);
 }
@@ -1876,7 +3027,9 @@ int index_shard_pool_active(onefield_t *bp) {
 static int index_shard_pool_submit(index_shard_pool_t *pool, onefield_t *bp, solver_t *base_sp,
                                    size_t nindexes, const index_shard_hooks_t *hooks,
                                    index_shard_task_t *tasks, index_shard_result_t *results,
-                                   unsigned char *completed) {
+                                   unsigned char *completed,
+                                   size_t task_family_count,
+                                   size_t task_frontier_count) {
   index_shard_thread_state_t *shared = &pool->shared;
   int worker_count = index_shard_get_worker_count(nindexes);
 
@@ -1905,6 +3058,12 @@ static int index_shard_pool_submit(index_shard_pool_t *pool, onefield_t *bp, sol
   shared->tasks = tasks;
   shared->ntasks = nindexes;
   shared->next_task = 0;
+  shared->next_frontier_task = 0;
+  shared->next_ordered_task = task_frontier_count;
+  shared->task_family_count = task_family_count;
+  shared->task_frontier_count = task_frontier_count;
+  shared->ordered_since_frontier = 0;
+  shared->frontier_running = 0;
 
   shared->results = results;
   shared->completed = completed;
@@ -1928,9 +3087,24 @@ static int index_shard_pool_submit(index_shard_pool_t *pool, onefield_t *bp, sol
 
   shared->limit_reported = FALSE;
 
+   /*
+   * Policy state belongs to the master solver and changes only after a fully
+   * quiesced pass. Workers consume this immutable pass snapshot.
+   */
+  shared->mmap_advice =
+      fitsbin_mmap_advice_state_begin_pass(
+          &base_sp->index_mmap_policy);
+
+  shared->mmap_pass_number =
+      base_sp->index_mmap_policy.pass_number;
+
   // pass timing excludes final solve-field output generation
   shared->pass_wall_start = timenow();
   shared->pass_cpu_start = get_cpu_usage();
+
+  shared->pass_rusage_valid =
+      (getrusage(RUSAGE_SELF,
+                 &shared->pass_rusage_start) == 0);
 
   pthread_mutex_unlock(&shared->limit_mutex);
   pthread_mutex_unlock(&shared->state_mutex);
@@ -1940,12 +3114,59 @@ static int index_shard_pool_submit(index_shard_pool_t *pool, onefield_t *bp, sol
   // generation publish wakes workers for this pass
   pool->generation++;
 
+  /*
+   * Every pass starts with an empty hint set, empty recent-page window and
+   * fresh accounting. This occurs before workers observe the new generation.
+   */
+  index_shard_prefetch_coordinator_reset(
+      &pool->prefetch,
+      pool->generation);
+
   pthread_cond_broadcast(&pool->work_cv);
   pthread_mutex_unlock(&pool->control_mutex);
 
-  logmsg("[index-shard] pthread-pool submit workers=%i candidates=%zu "
-         "startobj=%i endobj=%i scheduler=ordered chunk=1 active_limit=%i\n",
-         worker_count, nindexes, base_sp->startobj, base_sp->endobj, shared->active_limit);
+  logverb("[index-shard] pthread-pool submit workers=%i pool_workers=%i "
+         "candidates=%zu "
+         "startobj=%i endobj=%i scheduler=%s chunk=1 "
+         "families=%zu frontier=%zu frontier_limit=%i "
+         "single_worker_ordered_quantum=%i "
+         "active_limit=%i mmap_pass=%u mmap_advice=%s "
+         "kd_continuation=%i kd_node_budget=%zu\n",
+         worker_count,
+         pool->worker_count,
+         nindexes,
+         base_sp->startobj,
+         base_sp->endobj,
+         shared->task_frontier_count
+             ? "discovery-frontier"
+             : "ordered",
+         shared->task_family_count,
+         shared->task_frontier_count,
+         INDEX_SHARD_DISCOVERY_FRONTIER_LIMIT,
+         INDEX_SHARD_SINGLE_WORKER_ORDERED_QUANTUM,
+         shared->active_limit,
+         shared->mmap_pass_number,
+         fitsbin_mmap_advice_name(shared->mmap_advice),
+         index_shard_config_get()->kd_continuation_enabled ? 1 : 0,
+         index_shard_config_get()->kd_continuation_node_budget);
+
+  if (index_shard_trace_enabled() &&
+      shared->task_frontier_count) {
+    size_t frontier_position;
+
+    for (frontier_position = 0;
+         frontier_position < shared->task_frontier_count;
+         frontier_position++) {
+      size_t index_order = tasks[frontier_position].index_order;
+      const char *index_name = hooks->get_index_name(bp, index_order);
+
+      logmsg("[index-shard] discovery-frontier position=%zu "
+             "index_order=%zu index=%s\n",
+             frontier_position,
+             index_order,
+             index_name ? index_name : "(null)");
+    }
+  }
 
   return 0;
 }
@@ -1970,12 +3191,22 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
   index_shard_task_t *tasks = NULL;
   index_shard_result_t *results = NULL;
   unsigned char *completed = NULL;
+  size_t task_family_count = 0;
+  size_t task_frontier_count = 0;
   size_t i;
   int acquire_rc;
   int rc = 0;
   index_shard_pass_state_snapshot_t state;
   index_shard_pass_metrics_snapshot_t pass_metrics;
+  index_shard_task_profile_snapshot_t task_profile;
+  index_shard_prefetch_metrics_snapshot_t prefetch_metrics;
+  index_shard_phase_profile_snapshot_t phase_profile;
   index_shard_solve_status_t status = INDEX_SHARD_SOLVE_HANDLED;
+  anbool pass_completed;
+  anbool pass_exhaustive;
+  anbool pass_solved;
+  anbool pass_cancelled;
+  anbool mmap_transitioned;
 
   if (!index_shard_pthread_enabled()) {
     return INDEX_SHARD_SOLVE_UNAVAILABLE;
@@ -2006,7 +3237,12 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
 
   kdtree_phase_a_reset();
 
-  tasks = index_shard_build_task_plan(nindexes);
+  tasks = index_shard_build_task_plan(
+      bp,
+      nindexes,
+      hooks,
+      &task_family_count,
+      &task_frontier_count);
   results = calloc(nindexes, sizeof(index_shard_result_t));
   completed = calloc(nindexes, sizeof(unsigned char));
 
@@ -2022,7 +3258,9 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
   }
    // submit wakes workers, reducer runs on caller thread
   rc = index_shard_pool_submit(pool, bp, base_sp, nindexes, hooks,
-                               tasks, results, completed);
+                               tasks, results, completed,
+                               task_family_count,
+                               task_frontier_count);
 
   if (rc) {
     free(tasks);
@@ -2055,31 +3293,254 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
     status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
   }
 
+   /*
+   * Workers have left the pass and result slots are now immutable. Snapshot
+   * pass timing and task-duration distribution before destroying results.
+   */
+  index_shard_pass_metrics_snapshot(&pool->shared,
+                                    &pass_metrics);
+
+  index_shard_task_profile_snapshot(results,
+                                    nindexes,
+                                    pass_metrics.wall_seconds,
+                                    &task_profile);
+
+  index_shard_phase_profile_snapshot(results,
+                                     nindexes,
+                                     &phase_profile);
+
+  index_shard_prefetch_metrics_snapshot( &pool->prefetch, &prefetch_metrics);
+
+  /*
+   * index_shard_pool_reduce_online() has returned and every participating
+   * worker has left this generation. The pass outcome is now immutable.
+   */
+  pass_completed =
+      task_profile.executed == nindexes;
+
+  pass_exhaustive =
+      pass_completed &&
+      pass_metrics.reduced == nindexes;
+
+  pass_solved =
+      state.master_committed ||
+      bp->single_field_solved;
+
+  pass_cancelled =
+      !pass_solved &&
+      (bp->cancelled ||
+       bp->hit_total_cpulimit ||
+       bp->hit_total_timelimit ||
+       state.stop_requested);
+
+  mmap_transitioned =
+      fitsbin_mmap_policy_complete_pass(
+          &base_sp->index_mmap_policy,
+          pass_completed,
+          pass_exhaustive,
+          pass_solved,
+          pass_cancelled,
+          rc,
+          (int)status);
   // dispose unmerged worker results after all workers have left pass
-  for (i = 0; i < nindexes; i++)
+  for (i = 0; i < nindexes; i++) {
     index_shard_result_dispose(&results[i], hooks);
+  }
 
   free(tasks);
   free(results);
   free(completed);
 
-  // pool metrics measure only shard execution, not FITS/plot output
-  index_shard_pass_metrics_snapshot(&pool->shared, &pass_metrics);
-
-  logmsg("[index-shard] pthread-pool done candidates=%zu reduced=%zu solved=%i "
-         "total_cpu=%i cancelled=%i rc=%i status=%i master_committed=%i "
-         "pool_wall=%.3f pool_cpu=%.3f pool_cpu_pct=%.1f%%\n",
-         nindexes,
-          pass_metrics.reduced,
+  logmsg("[index-shard] done workers=%i solved=%i "
+         "wall=%.3f cpu=%.3f utilization=%.1f%%\n",
+         pool->worker_count,
          bp->single_field_solved,
-         bp->hit_total_cpulimit,
-         bp->cancelled,
-         rc,
-         (int)status,
-         state.master_committed,
          pass_metrics.wall_seconds,
          (double)pass_metrics.cpu_seconds,
          pass_metrics.cpu_percent);
+
+  logverb("[index-shard] pass-detail candidates=%zu reduced=%zu "
+          "total_cpu=%i total_wall=%i cancelled=%i rc=%i status=%i "
+          "master_committed=%i\n",
+          nindexes,
+          pass_metrics.reduced,
+          bp->hit_total_cpulimit,
+          bp->hit_total_timelimit,
+          bp->cancelled,
+          rc,
+          (int)status,
+          state.master_committed);
+
+  logverb("[index-shard] mmap-policy "
+         "policy=%s effective=%s pass=%u "
+         "clean_unsolved_passes=%u transitions=%u "
+         "transitioned=%i completed=%i exhaustive=%i "
+         "solved=%i cancelled=%i\n",
+         fitsbin_mmap_policy_name(
+             base_sp->index_mmap_policy.policy),
+         fitsbin_mmap_advice_name(
+             base_sp->index_mmap_policy.effective_advice),
+         base_sp->index_mmap_policy.pass_number,
+         base_sp->index_mmap_policy
+             .completed_clean_unsolved_passes,
+         base_sp->index_mmap_policy.transition_count,
+         mmap_transitioned ? 1 : 0,
+         pass_completed ? 1 : 0,
+         pass_exhaustive ? 1 : 0,
+         pass_solved ? 1 : 0,
+         pass_cancelled ? 1 : 0);
+
+   if (!task_profile.executed) {
+    logverb("[index-shard] task-profile executed=0\n");
+  } else if (task_profile.quantiles_available) {
+    logverb("[index-shard] task-profile executed=%zu "
+           "task_p50=%.3f task_p90=%.3f task_p99=%.3f "
+           "task_max=%.3f max_order=%zu max_worker=%i "
+           "max_solve=%.3f skew_max_p50=%.1f "
+           "max_pool_pct=%.1f%% serial_tail=%.3f "
+           "serial_tail_pct=%.1f%% tail_order=%zu tail_worker=%i\n",
+           task_profile.executed,
+           task_profile.task_p50_seconds,
+           task_profile.task_p90_seconds,
+           task_profile.task_p99_seconds,
+           task_profile.task_max_seconds,
+           task_profile.max_index_order,
+           task_profile.max_worker_id,
+           task_profile.max_solve_seconds,
+           task_profile.max_to_p50,
+           task_profile.max_pool_percent,
+           task_profile.serial_tail_seconds,
+           task_profile.serial_tail_percent,
+           task_profile.tail_index_order,
+           task_profile.tail_worker_id);
+  } else {
+    logverb("[index-shard] task-profile executed=%zu "
+           "quantiles=unavailable task_max=%.3f "
+           "max_order=%zu max_worker=%i max_solve=%.3f "
+           "max_pool_pct=%.1f%% serial_tail=%.3f "
+           "serial_tail_pct=%.1f%% tail_order=%zu tail_worker=%i\n",
+           task_profile.executed,
+           task_profile.task_max_seconds,
+           task_profile.max_index_order,
+           task_profile.max_worker_id,
+           task_profile.max_solve_seconds,
+           task_profile.max_pool_percent,
+           task_profile.serial_tail_seconds,
+           task_profile.serial_tail_percent,
+           task_profile.tail_index_order,
+           task_profile.tail_worker_id);
+  }
+
+  if (!phase_profile.executed) {
+    logverb("[index-shard] phase-profile executed=0\n");
+  } else if (phase_profile.quantiles_available) {
+    logverb("[index-shard] phase-profile executed=%zu task_sum=%.3f "
+           "reset=%.3f(%.1f%%) acquire=%.3f(%.1f%%) "
+           "solve=%.3f(%.1f%%) analyze=%.3f(%.1f%%) "
+           "release=%.3f(%.1f%%) other=%.3f(%.1f%%) "
+           "acquire_p50=%.3f acquire_p90=%.3f "
+           "acquire_p99=%.3f acquire_max=%.3f "
+           "solve_p50=%.3f solve_p90=%.3f "
+           "solve_p99=%.3f solve_max=%.3f\n",
+           phase_profile.executed,
+           phase_profile.task_wall_total,
+           phase_profile.reset_total,
+           phase_profile.reset_percent,
+           phase_profile.acquire_total,
+           phase_profile.acquire_percent,
+           phase_profile.solve_total,
+           phase_profile.solve_percent,
+           phase_profile.analyze_total,
+           phase_profile.analyze_percent,
+           phase_profile.release_total,
+           phase_profile.release_percent,
+           phase_profile.other_total,
+           phase_profile.other_percent,
+           phase_profile.acquire_p50,
+           phase_profile.acquire_p90,
+           phase_profile.acquire_p99,
+           phase_profile.acquire_max,
+           phase_profile.solve_p50,
+           phase_profile.solve_p90,
+           phase_profile.solve_p99,
+           phase_profile.solve_max);
+  } else {
+    logverb("[index-shard] phase-profile executed=%zu task_sum=%.3f "
+           "reset=%.3f(%.1f%%) acquire=%.3f(%.1f%%) "
+           "solve=%.3f(%.1f%%) analyze=%.3f(%.1f%%) "
+           "release=%.3f(%.1f%%) other=%.3f(%.1f%%) "
+           "quantiles=unavailable\n",
+           phase_profile.executed,
+           phase_profile.task_wall_total,
+           phase_profile.reset_total,
+           phase_profile.reset_percent,
+           phase_profile.acquire_total,
+           phase_profile.acquire_percent,
+           phase_profile.solve_total,
+           phase_profile.solve_percent,
+           phase_profile.analyze_total,
+           phase_profile.analyze_percent,
+           phase_profile.release_total,
+           phase_profile.release_percent,
+           phase_profile.other_total,
+           phase_profile.other_percent);
+  }
+
+  if (pass_metrics.resource_available) {
+    logverb("[index-shard] pass-resource user=%.3f sys=%.3f "
+           "minflt=%ld majflt=%ld nvcsw=%ld nivcsw=%ld\n",
+           pass_metrics.user_seconds,
+           pass_metrics.system_seconds,
+           pass_metrics.minor_faults,
+           pass_metrics.major_faults,
+           pass_metrics.voluntary_context_switches,
+           pass_metrics.involuntary_context_switches);
+  } else {
+    logverb("[index-shard] pass-resource unavailable\n");
+  }
+
+  logverb("[index-shard] prefetch-coordinator "
+         "hints=%llu stale=%llu unmapped=%llu "
+         "raw_pages=%llu unique_pages=%llu dup_pages=%llu "
+         "selected_pages=%llu collect_drop=%llu budget_drop=%llu "
+         "metadata_pages=%llu leaf_pages=%llu "
+         "publishes=%llu publish_empty=%llu below_threshold=%llu "
+         "flushes=%llu ranges=%llu bytes=%llu failures=%llu "
+         "pass_budget_exhausted=%llu "
+         "pending=%zu issue_budget_pages=%zu "
+         "issue_threshold_pages=%zu "
+         "pass_budget_pages=%zu pass_pages_issued=%zu "
+         "collection_capacity=%zu recent_capacity=%zu\n"
+         "mapping_barriers=%llu pending_purged=%llu recent_purged=%llu",
+         prefetch_metrics.totals.hints_emitted,
+         prefetch_metrics.totals.hints_stale,
+         prefetch_metrics.totals.hints_unmapped,
+         prefetch_metrics.totals.pages_raw,
+         prefetch_metrics.totals.pages_unique,
+         prefetch_metrics.totals.pages_duplicate,
+         prefetch_metrics.totals.pages_selected,
+         prefetch_metrics.totals.pages_collection_dropped,
+         prefetch_metrics.totals.pages_budget_dropped,
+         prefetch_metrics.totals.metadata_pages_selected,
+         prefetch_metrics.totals.leaf_pages_selected,
+         prefetch_metrics.totals.publish_calls,
+         prefetch_metrics.totals.publish_empty,
+         prefetch_metrics.totals.issue_below_threshold,
+         prefetch_metrics.totals.flushes,
+         prefetch_metrics.totals.ranges_issued,
+         prefetch_metrics.totals.bytes_issued,
+         prefetch_metrics.totals.prefetch_failures,
+         prefetch_metrics.totals.pass_budget_exhausted,
+         prefetch_metrics.pending,
+         prefetch_metrics.issue_page_budget,
+         prefetch_metrics.issue_threshold_pages,
+         prefetch_metrics.pass_page_budget,
+         prefetch_metrics.pass_pages_issued,
+         prefetch_metrics.collection_capacity,
+         prefetch_metrics.recent_capacity,
+         prefetch_metrics.totals.mapping_barriers,
+         prefetch_metrics.totals.pending_pages_purged,
+         prefetch_metrics.totals.recent_pages_purged);
 
   kdtree_phase_a_stats_t kd_stats;
     double wall_total_ms;
@@ -2122,12 +3583,12 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
             (double)kd_stats.calls;
     }
 
-    logmsg("[kd-phase-a] calls=%llu product=%llu fallback=%llu\n",
+    logverb("[kd-phase-a] calls=%llu product=%llu fallback=%llu\n",
            (unsigned long long)kd_stats.calls,
            (unsigned long long)kd_stats.product_calls,
            (unsigned long long)kd_stats.fallback_calls);
 
-    logmsg("[kd-phase-a] nodes=%llu leaves=%llu points=%llu matches=%llu "
+    logverb("[kd-phase-a] nodes=%llu leaves=%llu points=%llu matches=%llu "
            "avg_nodes=%.2f avg_leaves=%.2f avg_points=%.2f\n",
            (unsigned long long)kd_stats.nodes_visited,
            (unsigned long long)kd_stats.leaves_visited,
@@ -2137,19 +3598,19 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
            avg_leaves,
            avg_points);
 
-    logmsg("[kd-phase-a] frontier_total=%llu submitted=%llu inline=%llu\n",
+    logverb("[kd-phase-a] frontier_total=%llu submitted=%llu inline=%llu\n",
            (unsigned long long)kd_stats.frontier_total,
            (unsigned long long)kd_stats.tasks_submitted,
            (unsigned long long)kd_stats.tasks_inline);
 
-    logmsg("[kd-phase-a] wall_total_ms=%.3f cpu_total_ms=%.3f "
+    logverb("[kd-phase-a] wall_total_ms=%.3f cpu_total_ms=%.3f "
            "wall_min_us=%.3f wall_max_us=%.3f\n",
            wall_total_ms,
            cpu_total_ms,
            wall_min_us,
            wall_max_us);
 
-    logmsg("[kd-phase-a] wall_us histogram "
+    logverb("[kd-phase-a] wall_us histogram "
            "<1=%llu 1-5=%llu 5-10=%llu 10-50=%llu "
            "50-100=%llu 100-500=%llu 500-1000=%llu "
            "1-5ms=%llu 5-10ms=%llu >=10ms=%llu\n",
@@ -2172,8 +3633,10 @@ index_shard_solve_status_t index_shard_solve(onefield_t *bp,
 /*
  * SECTION INDEX-SHARD: auxiliary task executor
  *
- * Bounded inner work that reuses idle index-shard workers. Outer index work
- * keeps priority; a waiting owner also executes queued work cooperatively.
+ * Bounded inner work that reuses the configured index-shard worker pool.
+ * In-flight outer work is never preempted; at most one worker can help at an
+ * index boundary before returning to the ordered outer queue. A waiting owner
+ * also executes ordinary queued work cooperatively.
  */
 static int index_shard_aux_queue_init(index_shard_aux_queue_t *q,
                                       size_t max_pending) {
@@ -2267,8 +3730,12 @@ static int index_shard_aux_queue_push(index_shard_pool_t *pool,
 }
 
 static index_shard_aux_task_t *
-index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q) {
+index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q,
+                              const index_shard_aux_group_t *exclude_group,
+                              int lend_only,
+                              int skip_lent) {
   index_shard_aux_task_t *task;
+  index_shard_aux_task_t *previous = NULL;
 
   if (!q) {
     return NULL;
@@ -2278,11 +3745,41 @@ index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q) {
 
   task = q->head;
 
-  if (task) {
-    q->head = task->next;
+  /*
+   * A boundary lender scans only for work belonging to the group holding the
+   * one lend token. The owner waiting on that same group excludes its own
+   * reserved range so it cannot consume the range before a lender arrives.
+   */
+  while (task &&
+         ((exclude_group && task->group == exclude_group) ||
+          (lend_only &&
+           (!task->group ||
+            !task->group->lend_slot ||
+            task->group->lend_claimed)) ||
+          (skip_lent &&
+           task->group && task->group->lend_slot))) {
+    previous = task;
+    task = task->next;
+  }
 
-    if (!q->head) {
-      q->tail = NULL;
+  if (task) {
+    /*
+     * Claim publication and owner timeout arbitration share q->mutex. Once a
+     * configured worker marks the range claimed, the owner may no longer
+     * revoke the lending token and execute that same range inline.
+     */
+    if (task->group && task->group->lend_slot) {
+      task->group->lend_claimed = TRUE;
+    }
+
+    if (previous) {
+      previous->next = task->next;
+    } else {
+      q->head = task->next;
+    }
+
+    if (q->tail == task) {
+      q->tail = previous;
     }
 
     task->next = NULL;
@@ -2294,6 +3791,1224 @@ index_shard_aux_queue_try_pop(index_shard_aux_queue_t *q) {
 
   pthread_mutex_unlock(&q->mutex);
   return task;
+}
+
+/*
+ * Lend one configured outer worker at an index-task boundary.
+ *
+ * The caller has not claimed another index, so no outer task is displaced
+ * after acquisition. Exactly one coarse helper range is executed, then the
+ * caller immediately returns to the ordered outer claim loop.
+ */
+static int index_shard_help_lent_once(index_shard_pool_t *pool) {
+  index_shard_aux_task_t *task;
+
+  if (!pool ||
+      !index_shard_config_get()->inner_lending_enabled) {
+    return FALSE;
+  }
+
+  task = index_shard_aux_queue_try_pop(&pool->auxq,
+                                       NULL,
+                                       TRUE,
+                                       FALSE);
+
+  if (!task) {
+    return FALSE;
+  }
+
+  index_shard_aux_execute_one(task);
+  return TRUE;
+}
+
+/*
+ * SECTION INDEX-SHARD: shared prefetch coordinator
+ */
+
+static anbool index_shard_prefetch_is_metadata(
+    kdtree_prefetch_array_kind_t kind) {
+  return kind == KDTREE_PREFETCH_ARRAY_SPLIT ||
+      kind == KDTREE_PREFETCH_ARRAY_SPLITDIM ||
+      kind == KDTREE_PREFETCH_ARRAY_BBOX ||
+      kind == KDTREE_PREFETCH_ARRAY_LR;
+}
+
+static anbool index_shard_prefetch_same_page(
+    const index_shard_prefetch_page_t *left,
+    const index_shard_prefetch_page_t *right) {
+  if (!left || !right) {
+    return FALSE;
+  }
+
+  return left->fb == right->fb &&
+      left->map_base == right->map_base &&
+      left->page == right->page;
+}
+
+static int index_shard_prefetch_page_key_compare(
+    const void *left,
+    const void *right) {
+  const index_shard_prefetch_page_t *lhs = left;
+  const index_shard_prefetch_page_t *rhs = right;
+
+  uintptr_t lhs_fb;
+  uintptr_t rhs_fb;
+  uintptr_t lhs_map;
+  uintptr_t rhs_map;
+
+  lhs_fb = (uintptr_t)lhs->fb;
+  rhs_fb = (uintptr_t)rhs->fb;
+
+  if (lhs_fb < rhs_fb) {
+    return -1;
+  }
+
+  if (lhs_fb > rhs_fb) {
+    return 1;
+  }
+
+  lhs_map = (uintptr_t)lhs->map_base;
+  rhs_map = (uintptr_t)rhs->map_base;
+
+  if (lhs_map < rhs_map) {
+    return -1;
+  }
+
+  if (lhs_map > rhs_map) {
+    return 1;
+  }
+
+  if (lhs->page < rhs->page) {
+    return -1;
+  }
+
+  if (lhs->page > rhs->page) {
+    return 1;
+  }
+
+  if (lhs->priority < rhs->priority) {
+    return -1;
+  }
+
+  if (lhs->priority > rhs->priority) {
+    return 1;
+  }
+
+  if (lhs->kind < rhs->kind) {
+    return -1;
+  }
+
+  if (lhs->kind > rhs->kind) {
+    return 1;
+  }
+
+  return 0;
+}
+
+static int index_shard_prefetch_page_priority_compare(
+    const void *left,
+    const void *right) {
+  const index_shard_prefetch_page_t *lhs = left;
+  const index_shard_prefetch_page_t *rhs = right;
+
+  if (lhs->priority < rhs->priority) {
+    return -1;
+  }
+
+  if (lhs->priority > rhs->priority) {
+    return 1;
+  }
+
+  return index_shard_prefetch_page_key_compare(left, right);
+}
+
+static int index_shard_prefetch_coordinator_init(
+    index_shard_prefetch_coordinator_t *coordinator,
+    int worker_count) {
+  size_t workers;
+  size_t issue_page_budget;
+  size_t pending_capacity;
+  size_t recent_capacity;
+  size_t pass_page_budget;
+
+  if (!coordinator || worker_count <= 0) {
+    return -1;
+  }
+
+  memset(coordinator, 0, sizeof(*coordinator));
+
+  workers = (size_t)worker_count;
+
+  if (workers >
+      SIZE_MAX / INDEX_SHARD_PREFETCH_ISSUE_PAGES_PER_WORKER) {
+    return -1;
+  }
+
+  issue_page_budget =
+      workers * INDEX_SHARD_PREFETCH_ISSUE_PAGES_PER_WORKER;
+
+  if (issue_page_budget >
+      SIZE_MAX / INDEX_SHARD_PREFETCH_COLLECT_MULTIPLIER) {
+    return -1;
+  }
+
+  pending_capacity =
+      issue_page_budget * INDEX_SHARD_PREFETCH_COLLECT_MULTIPLIER;
+
+  if (issue_page_budget >
+      SIZE_MAX / INDEX_SHARD_PREFETCH_RECENT_MULTIPLIER) {
+    return -1;
+  }
+
+  recent_capacity =
+      issue_page_budget * INDEX_SHARD_PREFETCH_RECENT_MULTIPLIER;
+
+  if (issue_page_budget >
+      SIZE_MAX / INDEX_SHARD_PREFETCH_MAX_ISSUE_WINDOWS_PER_PASS) {
+    return -1;
+  }
+
+  pass_page_budget =
+      issue_page_budget *
+      INDEX_SHARD_PREFETCH_MAX_ISSUE_WINDOWS_PER_PASS;
+
+  if (pthread_mutex_init(&coordinator->mutex, NULL)) {
+    return -1;
+  }
+
+  if (pthread_mutex_init(&coordinator->flush_mutex, NULL)) {
+    pthread_mutex_destroy(&coordinator->mutex);
+    return -1;
+  }
+
+  coordinator->pending =
+      calloc(pending_capacity,
+             sizeof(*coordinator->pending));
+
+  coordinator->snapshot =
+      calloc(pending_capacity,
+             sizeof(*coordinator->snapshot));
+
+  coordinator->selected =
+      calloc(issue_page_budget,
+             sizeof(*coordinator->selected));
+
+  coordinator->recent =
+      calloc(recent_capacity,
+             sizeof(*coordinator->recent));
+
+  if (!coordinator->pending ||
+      !coordinator->snapshot ||
+      !coordinator->selected ||
+      !coordinator->recent) {
+    free(coordinator->pending);
+    free(coordinator->snapshot);
+    free(coordinator->selected);
+    free(coordinator->recent);
+
+    pthread_mutex_destroy(&coordinator->flush_mutex);
+    pthread_mutex_destroy(&coordinator->mutex);
+
+    memset(coordinator, 0, sizeof(*coordinator));
+    return -1;
+  }
+
+  coordinator->pending_capacity = pending_capacity;
+
+  coordinator->issue_page_budget = issue_page_budget;
+
+  /*
+   * Do not issue until one complete issue window has accumulated.
+   * With four workers this is 256 raw page entries.
+   */
+  coordinator->issue_threshold_pages = issue_page_budget;
+
+  coordinator->pass_page_budget = pass_page_budget;
+
+  coordinator->recent_capacity = recent_capacity;
+
+  coordinator->initialized = TRUE;
+
+  return 0;
+}
+
+static void index_shard_prefetch_coordinator_destroy(
+    index_shard_prefetch_coordinator_t *coordinator) {
+  if (!coordinator || !coordinator->initialized) {
+    return;
+  }
+
+  free(coordinator->pending);
+  free(coordinator->snapshot);
+  free(coordinator->selected);
+  free(coordinator->recent);
+
+  coordinator->pending = NULL;
+  coordinator->snapshot = NULL;
+  coordinator->selected = NULL;
+  coordinator->recent = NULL;
+
+  pthread_mutex_destroy(&coordinator->flush_mutex);
+  pthread_mutex_destroy(&coordinator->mutex);
+
+  memset(coordinator, 0, sizeof(*coordinator));
+}
+
+static void index_shard_prefetch_coordinator_reset(
+    index_shard_prefetch_coordinator_t *coordinator,
+    unsigned long generation) {
+  if (!coordinator || !coordinator->initialized) {
+    return;
+  }
+
+  pthread_mutex_lock(&coordinator->flush_mutex);
+  pthread_mutex_lock(&coordinator->mutex);
+
+  coordinator->generation = generation;
+
+  coordinator->pending_count = 0;
+
+  coordinator->pass_pages_issued = 0;
+
+  coordinator->recent_count = 0;
+  coordinator->recent_next = 0;
+
+  memset(&coordinator->metrics,
+         0,
+         sizeof(coordinator->metrics));
+
+  pthread_mutex_unlock(&coordinator->mutex);
+  pthread_mutex_unlock(&coordinator->flush_mutex);
+}
+
+static void index_shard_prefetch_metrics_snapshot(
+    index_shard_prefetch_coordinator_t *coordinator,
+    index_shard_prefetch_metrics_snapshot_t *snapshot) {
+  if (!snapshot) {
+    return;
+  }
+
+  memset(snapshot, 0, sizeof(*snapshot));
+
+  if (!coordinator || !coordinator->initialized) {
+    return;
+  }
+
+  pthread_mutex_lock(&coordinator->mutex);
+
+  snapshot->totals = coordinator->metrics;
+
+  snapshot->pending = coordinator->pending_count;
+
+  snapshot->issue_page_budget =
+      coordinator->issue_page_budget;
+
+  snapshot->issue_threshold_pages =
+      coordinator->issue_threshold_pages;
+
+  snapshot->pass_page_budget =
+      coordinator->pass_page_budget;
+
+  snapshot->pass_pages_issued =
+      coordinator->pass_pages_issued;
+
+  snapshot->collection_capacity =
+      coordinator->pending_capacity;
+
+  snapshot->recent_capacity =
+      coordinator->recent_capacity;
+
+  pthread_mutex_unlock(&coordinator->mutex);
+}
+
+static index_shard_pool_t *index_shard_prefetch_session_pool(
+    const index_shard_prefetch_session_t *session) {
+  if (!session) {
+    return NULL;
+  }
+
+  return (index_shard_pool_t *)session->pool;
+}
+
+static anbool index_shard_prefetch_session_usable(
+    const index_shard_prefetch_session_t *session) {
+  index_shard_pool_t *pool;
+  index_shard_thread_state_t *shared;
+  int usable;
+
+  pool = index_shard_prefetch_session_pool(session);
+
+  if (!pool) {
+    return FALSE;
+  }
+
+  pthread_mutex_lock(&pool->control_mutex);
+
+  usable =
+      pool->pass_active &&
+      !pool->shutdown &&
+      !pool->stopping &&
+      pool->generation == session->generation;
+
+  pthread_mutex_unlock(&pool->control_mutex);
+
+  if (!usable) {
+    return FALSE;
+  }
+
+  shared = &pool->shared;
+
+  pthread_mutex_lock(&shared->state_mutex);
+
+  usable =
+      !shared->stop_requested &&
+      !shared->fatal_error &&
+      !shared->solved_published;
+
+  pthread_mutex_unlock(&shared->state_mutex);
+
+  return usable;
+}
+
+static int index_shard_prefetch_sink_enabled(
+    void *userdata,
+    void *mapping) {
+  index_shard_prefetch_session_t *session = userdata;
+  fitsbin_t *fb = mapping;
+
+  /*
+   * Check immutable per-file policy first. The OFF path performs no pool
+   * locking and no predictive traversal.
+   */
+  if (!fb ||
+      fb->mmap_advice != FITSBIN_MMAP_ADVICE_RANDOM ||
+      !fb->mmap_prefetch_enabled ||
+      !fb->mmap_page_size) {
+    return FALSE;
+  }
+
+  return index_shard_prefetch_session_usable(session);
+}
+
+static size_t index_shard_prefetch_find_worst_priority(
+    const index_shard_prefetch_coordinator_t *coordinator) {
+  size_t worst = 0;
+  size_t i;
+
+  assert(coordinator);
+  assert(coordinator->pending_count > 0);
+
+  for (i = 1; i < coordinator->pending_count; i++) {
+    if (coordinator->pending[i].priority >
+        coordinator->pending[worst].priority) {
+      worst = i;
+    }
+  }
+
+  return worst;
+}
+static anbool index_shard_prefetch_session_has_page(
+    const index_shard_prefetch_session_t *session,
+    void *mapping,
+    const void *map_base,
+    uintptr_t page) {
+  size_t i;
+
+  if (!session) {
+    return FALSE;
+  }
+
+  for (i = 0; i < session->page_count; i++) {
+    const index_shard_prefetch_local_page_t *candidate =
+        &session->pages[i];
+
+    if (candidate->mapping == mapping &&
+        candidate->map_base == map_base &&
+        candidate->page == page) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+static void index_shard_prefetch_session_clear(
+    index_shard_prefetch_session_t *session) {
+  if (!session) {
+    return;
+  }
+
+  session->page_count = 0;
+
+  session->hints_emitted = 0;
+  session->hints_stale = 0;
+  session->hints_unmapped = 0;
+
+  session->pages_raw = 0;
+  session->pages_local_duplicate = 0;
+}
+/*
+ * Transfers one worker-local page batch into the pool-shared accumulator.
+ *
+ * No madvise() call occurs here. Kernel advice is issued separately only
+ * after the shared accumulation threshold is reached.
+ *
+ * Return:
+ *   1  shared issue threshold reached
+ *   0  published, but threshold not reached
+ *  -1  invalid or unavailable session
+ */
+static int index_shard_prefetch_session_publish(
+    index_shard_prefetch_session_t *session) {
+  index_shard_pool_t *pool;
+  index_shard_prefetch_coordinator_t *coordinator;
+
+  int threshold_reached = FALSE;
+  size_t i;
+
+  pool = index_shard_prefetch_session_pool(session);
+
+  if (!pool) {
+    return -1;
+  }
+
+  coordinator = &pool->prefetch;
+
+  if (!coordinator->initialized) {
+    index_shard_prefetch_session_clear(session);
+    return -1;
+  }
+
+  if (!session->page_count &&
+      !session->hints_emitted &&
+      !session->hints_stale &&
+      !session->hints_unmapped &&
+      !session->pages_raw &&
+      !session->pages_local_duplicate) {
+    return 0;
+  }
+
+  if (!index_shard_prefetch_session_usable(session)) {
+    pthread_mutex_lock(&coordinator->mutex);
+
+    coordinator->metrics.hints_stale +=
+        session->hints_emitted +
+        session->hints_stale;
+
+    coordinator->metrics.publish_calls++;
+
+    pthread_mutex_unlock(&coordinator->mutex);
+
+    index_shard_prefetch_session_clear(session);
+    return 0;
+  }
+
+  pthread_mutex_lock(&coordinator->mutex);
+
+  coordinator->metrics.publish_calls++;
+
+  coordinator->metrics.hints_emitted +=
+      session->hints_emitted;
+
+  coordinator->metrics.hints_stale +=
+      session->hints_stale;
+
+  coordinator->metrics.hints_unmapped +=
+      session->hints_unmapped;
+
+  coordinator->metrics.pages_raw +=
+      session->pages_raw;
+
+  coordinator->metrics.pages_duplicate +=
+      session->pages_local_duplicate;
+
+  if (!session->page_count) {
+    coordinator->metrics.publish_empty++;
+  }
+
+  for (i = 0; i < session->page_count; i++) {
+    index_shard_prefetch_local_page_t *local =
+        &session->pages[i];
+
+    index_shard_prefetch_page_t page;
+
+    /*
+     * Once the pass-wide issue ceiling is exhausted, additional speculation
+     * is discarded instead of becoming an unbounded pending backlog.
+     */
+    if (coordinator->pass_pages_issued >=
+        coordinator->pass_page_budget) {
+      coordinator->metrics.pages_budget_dropped++;
+      continue;
+    }
+
+    memset(&page, 0, sizeof(page));
+
+    page.fb = (fitsbin_t *)local->mapping;
+    page.map_base = local->map_base;
+
+    page.page = local->page;
+    page.page_size = local->page_size;
+
+    page.priority = local->priority;
+    page.kind = local->kind;
+
+    if (coordinator->pending_count <
+        coordinator->pending_capacity) {
+      coordinator->pending[
+          coordinator->pending_count++] = page;
+
+      continue;
+    }
+
+    /*
+     * Gate 13.1 is metadata-only, but keep the existing priority-preserving
+     * saturation behavior for future precision tiers.
+     */
+    {
+      size_t worst =
+          index_shard_prefetch_find_worst_priority(coordinator);
+
+      if (page.priority <
+          coordinator->pending[worst].priority) {
+        coordinator->pending[worst] = page;
+      } else {
+        coordinator->metrics.pages_collection_dropped++;
+      }
+    }
+  }
+
+  threshold_reached =
+      coordinator->pending_count >=
+      coordinator->issue_threshold_pages;
+
+  pthread_mutex_unlock(&coordinator->mutex);
+
+  index_shard_prefetch_session_clear(session);
+
+  return threshold_reached;
+}
+static int index_shard_prefetch_sink_emit(
+    void *userdata,
+    const kdtree_prefetch_hint_t *hint) {
+  index_shard_prefetch_session_t *session = userdata;
+
+  fitsbin_t *fb;
+
+  const void *map_base;
+  size_t map_size;
+
+  const void *range_data;
+  size_t range_size;
+
+  uintptr_t map_start;
+  uintptr_t map_end;
+
+  uintptr_t request_start;
+  uintptr_t request_end;
+
+  uintptr_t first_page;
+  uintptr_t end_page;
+
+  size_t page_size;
+  size_t page_count;
+  size_t i;
+
+  int mapped;
+
+  if (!session ||
+      !hint ||
+      !hint->mapping ||
+      !hint->address ||
+      !hint->length) {
+    return -1;
+  }
+
+  if (!index_shard_prefetch_session_usable(session)) {
+    session->hints_stale++;
+    return 1;
+  }
+
+  fb = hint->mapping;
+
+  if (fb->mmap_advice != FITSBIN_MMAP_ADVICE_RANDOM ||
+      !fb->mmap_prefetch_enabled ||
+      !fb->mmap_page_size) {
+    return 1;
+  }
+
+  session->hints_emitted++;
+
+  mapped = fitsbin_resolve_mapped_range(
+      fb,
+      hint->address,
+      hint->length,
+      &map_base,
+      &map_size,
+      &range_data,
+      &range_size);
+
+  if (mapped <= 0) {
+    session->hints_unmapped++;
+
+    return mapped < 0 ? -1 : 1;
+  }
+
+  page_size = fb->mmap_page_size;
+
+  map_start = (uintptr_t)map_base;
+
+  if (map_size > UINTPTR_MAX - map_start) {
+    return 1;
+  }
+
+  map_end = map_start + map_size;
+
+  request_start = (uintptr_t)range_data;
+
+  if (range_size > UINTPTR_MAX - request_start) {
+    return 1;
+  }
+
+  request_end = request_start + range_size;
+
+  first_page =
+      request_start -
+      request_start % (uintptr_t)page_size;
+
+  if (first_page < map_start) {
+    first_page = map_start;
+  }
+
+  end_page = request_end;
+
+  if (end_page % (uintptr_t)page_size) {
+    uintptr_t padding =
+        (uintptr_t)page_size -
+        end_page % (uintptr_t)page_size;
+
+    if (padding > map_end - end_page) {
+      end_page = map_end;
+    } else {
+      end_page += padding;
+    }
+  }
+
+  if (end_page > map_end) {
+    end_page = map_end;
+  }
+
+  if (end_page <= first_page) {
+    return 1;
+  }
+
+  page_count =
+      (size_t)((end_page - first_page) /
+               (uintptr_t)page_size);
+
+  if (!page_count) {
+    return 1;
+  }
+
+  session->pages_raw += page_count;
+
+  for (i = 0; i < page_count; i++) {
+    uintptr_t page_address;
+
+    page_address =
+        first_page +
+        (uintptr_t)i * (uintptr_t)page_size;
+
+    if (index_shard_prefetch_session_has_page(
+        session,
+        fb,
+        map_base,
+        page_address)) {
+      session->pages_local_duplicate++;
+      continue;
+    }
+
+    /*
+     * A full local buffer is published into the shared accumulator, but this
+     * still does not necessarily issue kernel advice.
+     */
+     if (session->page_count >=
+        INDEX_SHARD_PREFETCH_LOCAL_PAGE_CAPACITY) {
+      int publish_rc =
+          index_shard_prefetch_session_publish(session);
+
+      if (publish_rc < 0) {
+        return -1;
+      }
+
+      if (publish_rc > 0) {
+        session->issue_requested = TRUE;
+      }
+    }
+
+    if (session->page_count <
+        INDEX_SHARD_PREFETCH_LOCAL_PAGE_CAPACITY) {
+      index_shard_prefetch_local_page_t *page =
+          &session->pages[session->page_count++];
+
+      memset(page, 0, sizeof(*page));
+
+      page->mapping = fb;
+      page->map_base = map_base;
+
+      page->page = page_address;
+      page->page_size = page_size;
+
+      page->priority = hint->priority;
+      page->kind = hint->kind;
+    }
+  }
+
+  return 0;
+}
+
+static anbool index_shard_prefetch_recent_contains(
+    const index_shard_prefetch_coordinator_t *coordinator,
+    const index_shard_prefetch_page_t *page) {
+  size_t i;
+
+  if (!coordinator || !page) {
+    return FALSE;
+  }
+
+  for (i = 0; i < coordinator->recent_count; i++) {
+    if (index_shard_prefetch_same_page(
+        &coordinator->recent[i],
+        page)) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+static void index_shard_prefetch_recent_add(
+    index_shard_prefetch_coordinator_t *coordinator,
+    const index_shard_prefetch_page_t *page) {
+  if (!coordinator ||
+      !page ||
+      !coordinator->recent_capacity) {
+    return;
+  }
+
+  if (coordinator->recent_count <
+      coordinator->recent_capacity) {
+    coordinator->recent[
+        coordinator->recent_count++] = *page;
+
+    return;
+  }
+
+  coordinator->recent[
+      coordinator->recent_next] = *page;
+
+  coordinator->recent_next++;
+
+  if (coordinator->recent_next >=
+      coordinator->recent_capacity) {
+    coordinator->recent_next = 0;
+  }
+}
+
+static int index_shard_prefetch_coordinator_issue(
+    index_shard_prefetch_session_t *session) {
+  index_shard_pool_t *pool;
+  index_shard_prefetch_coordinator_t *coordinator;
+
+  size_t snapshot_count;
+  size_t unique_count;
+  size_t filtered_count;
+  size_t selected_count;
+
+  size_t duplicate_count = 0;
+  size_t budget_dropped = 0;
+
+  size_t remaining_pass_budget;
+
+  unsigned long long ranges_issued = 0;
+  unsigned long long bytes_issued = 0;
+  unsigned long long prefetch_failures = 0;
+
+  size_t i;
+
+  pool = index_shard_prefetch_session_pool(session);
+
+  if (!pool) {
+    return -1;
+  }
+
+  coordinator = &pool->prefetch;
+
+  if (!coordinator->initialized) {
+    return 0;
+  }
+
+  pthread_mutex_lock(&coordinator->flush_mutex);
+
+  if (!index_shard_prefetch_session_usable(session)) {
+    pthread_mutex_lock(&coordinator->mutex);
+
+    coordinator->metrics.hints_stale +=
+        coordinator->pending_count;
+
+    coordinator->pending_count = 0;
+
+    pthread_mutex_unlock(&coordinator->mutex);
+    pthread_mutex_unlock(&coordinator->flush_mutex);
+
+    return 0;
+  }
+
+  pthread_mutex_lock(&coordinator->mutex);
+
+  if (coordinator->generation != session->generation) {
+    coordinator->metrics.hints_stale +=
+        coordinator->pending_count;
+
+    coordinator->pending_count = 0;
+
+    pthread_mutex_unlock(&coordinator->mutex);
+    pthread_mutex_unlock(&coordinator->flush_mutex);
+
+    return 0;
+  }
+
+  /*
+   * The decisive Gate 13.1 behavior: no kernel advice for tiny batches.
+   */
+  if (coordinator->pending_count <
+      coordinator->issue_threshold_pages) {
+    coordinator->metrics.issue_below_threshold++;
+
+    pthread_mutex_unlock(&coordinator->mutex);
+    pthread_mutex_unlock(&coordinator->flush_mutex);
+
+    return 0;
+  }
+
+  if (coordinator->pass_pages_issued >=
+      coordinator->pass_page_budget) {
+    coordinator->metrics.pages_budget_dropped +=
+        coordinator->pending_count;
+
+    coordinator->metrics.pass_budget_exhausted++;
+
+    coordinator->pending_count = 0;
+
+    pthread_mutex_unlock(&coordinator->mutex);
+    pthread_mutex_unlock(&coordinator->flush_mutex);
+
+    return 0;
+  }
+
+  snapshot_count = coordinator->pending_count;
+
+  memcpy(coordinator->snapshot,
+         coordinator->pending,
+         snapshot_count * sizeof(*coordinator->snapshot));
+
+  coordinator->pending_count = 0;
+
+  pthread_mutex_unlock(&coordinator->mutex);
+
+  /*
+   * Cross-query and cross-worker page deduplication.
+   */
+  qsort(coordinator->snapshot,
+        snapshot_count,
+        sizeof(*coordinator->snapshot),
+        index_shard_prefetch_page_key_compare);
+
+  unique_count = 0;
+
+  for (i = 0; i < snapshot_count; i++) {
+    if (unique_count > 0 &&
+        index_shard_prefetch_same_page(
+            &coordinator->snapshot[unique_count - 1],
+            &coordinator->snapshot[i])) {
+      duplicate_count++;
+      continue;
+    }
+
+    coordinator->snapshot[unique_count++] =
+        coordinator->snapshot[i];
+  }
+
+  /*
+   * Suppress pages recently issued by this pass generation.
+   */
+  filtered_count = 0;
+
+  pthread_mutex_lock(&coordinator->mutex);
+
+  for (i = 0; i < unique_count; i++) {
+    if (index_shard_prefetch_recent_contains(
+        coordinator,
+        &coordinator->snapshot[i])) {
+      duplicate_count++;
+      continue;
+    }
+
+    coordinator->snapshot[filtered_count++] =
+        coordinator->snapshot[i];
+  }
+
+  coordinator->metrics.pages_duplicate += duplicate_count;
+  coordinator->metrics.pages_unique += filtered_count;
+
+  remaining_pass_budget =
+      coordinator->pass_page_budget -
+      coordinator->pass_pages_issued;
+
+  pthread_mutex_unlock(&coordinator->mutex);
+
+  if (!filtered_count) {
+    pthread_mutex_unlock(&coordinator->flush_mutex);
+    return 0;
+  }
+
+  qsort(coordinator->snapshot,
+        filtered_count,
+        sizeof(*coordinator->snapshot),
+        index_shard_prefetch_page_priority_compare);
+
+  selected_count = filtered_count;
+
+  if (selected_count > coordinator->issue_page_budget) {
+    budget_dropped +=
+        selected_count - coordinator->issue_page_budget;
+
+    selected_count = coordinator->issue_page_budget;
+  }
+
+  if (selected_count > remaining_pass_budget) {
+    budget_dropped +=
+        selected_count - remaining_pass_budget;
+
+    selected_count = remaining_pass_budget;
+  }
+
+  if (!selected_count) {
+    pthread_mutex_lock(&coordinator->mutex);
+
+    coordinator->metrics.pages_budget_dropped +=
+        budget_dropped;
+
+    coordinator->metrics.pass_budget_exhausted++;
+
+    pthread_mutex_unlock(&coordinator->mutex);
+    pthread_mutex_unlock(&coordinator->flush_mutex);
+
+    return 0;
+  }
+
+  memcpy(coordinator->selected,
+         coordinator->snapshot,
+         selected_count * sizeof(*coordinator->selected));
+
+  pthread_mutex_lock(&coordinator->mutex);
+
+  coordinator->metrics.flushes++;
+
+  coordinator->metrics.pages_selected +=
+      selected_count;
+
+  coordinator->metrics.pages_budget_dropped +=
+      budget_dropped;
+
+  coordinator->pass_pages_issued += selected_count;
+
+  for (i = 0; i < selected_count; i++) {
+    index_shard_prefetch_recent_add(
+        coordinator,
+        &coordinator->selected[i]);
+
+    if (index_shard_prefetch_is_metadata(
+        coordinator->selected[i].kind)) {
+      coordinator->metrics.metadata_pages_selected++;
+    } else {
+      coordinator->metrics.leaf_pages_selected++;
+    }
+  }
+
+  pthread_mutex_unlock(&coordinator->mutex);
+
+  /*
+   * Merge only adjacent pages within the same actual mmap region.
+   */
+  qsort(coordinator->selected,
+        selected_count,
+        sizeof(*coordinator->selected),
+        index_shard_prefetch_page_key_compare);
+
+  i = 0;
+
+  while (i < selected_count) {
+    index_shard_prefetch_page_t *first =
+        &coordinator->selected[i];
+
+    uintptr_t range_start = first->page;
+    uintptr_t range_end;
+
+    size_t j = i + 1;
+    int rc;
+
+    if (first->page_size >
+        UINTPTR_MAX - range_start) {
+      i = j;
+      continue;
+    }
+
+    range_end = range_start + first->page_size;
+
+    while (j < selected_count) {
+      index_shard_prefetch_page_t *next =
+          &coordinator->selected[j];
+
+      if (next->fb != first->fb ||
+          next->map_base != first->map_base ||
+          next->page_size != first->page_size ||
+          next->page != range_end) {
+        break;
+      }
+
+      if (next->page_size >
+          UINTPTR_MAX - range_end) {
+        break;
+      }
+
+      range_end += next->page_size;
+      j++;
+    }
+
+    rc = fitsbin_prefetch_data(
+        first->fb,
+        (const void *)range_start,
+        (size_t)(range_end - range_start));
+
+    ranges_issued++;
+
+    bytes_issued +=
+        (unsigned long long)(range_end - range_start);
+
+    if (rc < 0) {
+      prefetch_failures++;
+    }
+
+    i = j;
+  }
+
+  pthread_mutex_lock(&coordinator->mutex);
+
+  coordinator->metrics.ranges_issued +=
+      ranges_issued;
+
+  coordinator->metrics.bytes_issued +=
+      bytes_issued;
+
+  coordinator->metrics.prefetch_failures +=
+      prefetch_failures;
+
+  if (coordinator->pass_pages_issued >=
+      coordinator->pass_page_budget) {
+    coordinator->metrics.pass_budget_exhausted++;
+  }
+
+  pthread_mutex_unlock(&coordinator->mutex);
+
+  pthread_mutex_unlock(&coordinator->flush_mutex);
+
+  return 0;
+}
+
+static int index_shard_prefetch_sink_flush(void *userdata) {
+  index_shard_prefetch_session_t *session = userdata;
+  int publish_rc;
+  int issue_rc;
+
+  if (!session) {
+    return -1;
+  }
+
+  /*
+   * Publish the tail of the current worker-local batch.
+   */
+  publish_rc =
+      index_shard_prefetch_session_publish(session);
+
+  if (publish_rc < 0) {
+    return -1;
+  }
+
+  if (publish_rc > 0) {
+    session->issue_requested = TRUE;
+  }
+
+  /*
+   * A full local publication may have crossed the shared threshold before
+   * this final flush. Preserve that notification until the coordinator gets
+   * one issue opportunity.
+   */
+  if (!session->issue_requested) {
+    return 0;
+  }
+
+  session->issue_requested = FALSE;
+
+  issue_rc =
+      index_shard_prefetch_coordinator_issue(session);
+
+  return issue_rc;
+}
+
+int index_shard_kdtree_prefetch_sink_init(
+    kdtree_prefetch_sink_t *sink,
+    index_shard_prefetch_session_t *session) {
+  index_shard_pool_t *pool;
+  int usable;
+
+  if (!sink || !session) {
+    return -1;
+  }
+
+  memset(sink, 0, sizeof(*sink));
+  memset(session, 0, sizeof(*session));
+
+  pool = index_shard_current_worker_pool;
+
+ if (!pool || !pool->prefetch.initialized) {
+  return -1;
+}
+
+  pthread_mutex_lock(&pool->control_mutex);
+
+  usable =
+      pool->pass_active &&
+      !pool->shutdown &&
+      !pool->stopping;
+
+  if (usable) {
+    session->pool = pool;
+    session->generation = pool->generation;
+  }
+
+  pthread_mutex_unlock(&pool->control_mutex);
+
+  if (!usable) {
+    return -1;
+  }
+
+  sink->userdata = session;
+  sink->enabled = index_shard_prefetch_sink_enabled;
+  sink->emit = index_shard_prefetch_sink_emit;
+  sink->flush = index_shard_prefetch_sink_flush;
+
+  return 0;
 }
 
 // ANCHOR INDEX-SHARD: auxiliary-group-lifecycle
@@ -2339,9 +5054,13 @@ index_shard_aux_group_t *index_shard_aux_group_new(void) {
 }
 
 void index_shard_aux_group_free(index_shard_aux_group_t *group) {
+  index_shard_pool_t *pool;
+
   if (!group) {
     return;
   }
+
+  pool = group->pool;
 
   pthread_mutex_lock(&group->mutex);
   group->closed = TRUE;
@@ -2352,6 +5071,22 @@ void index_shard_aux_group_free(index_shard_aux_group_t *group) {
    * backstop that prevents freeing a group with accepted tasks outstanding.
    */
   (void)index_shard_kdtree_wait(group);
+
+  /*
+   * pending is now zero, so no queued task can retain this group. Release the
+   * single lending token before destroying the group storage.
+   */
+  if (pool) {
+    pthread_mutex_lock(&pool->auxq.mutex);
+
+    if (pool->lend_group == group) {
+      pool->lend_group = NULL;
+    }
+
+    group->lend_slot = FALSE;
+    group->lend_claimed = FALSE;
+    pthread_mutex_unlock(&pool->auxq.mutex);
+  }
 
   pthread_cond_destroy(&group->cv);
   pthread_mutex_destroy(&group->mutex);
@@ -2434,9 +5169,46 @@ static int index_shard_kdtree_submit(void *userdata,
   return 0;
 }
 
+/*
+ * Wait on a default pthread condition variable for at most seconds.
+ *
+ * The lending gate uses a wall-clock timeout only as a deadlock/stall bound;
+ * it does not influence hypothesis ordering or scientific acceptance.
+ */
+static int index_shard_cond_wait_seconds(pthread_cond_t *cv,
+                                         pthread_mutex_t *mutex,
+                                         double seconds) {
+  struct timespec wake;
+  time_t whole_seconds;
+  long nanoseconds;
+
+  if (!cv || !mutex || seconds <= 0.0) {
+    return ETIMEDOUT;
+  }
+
+  if (clock_gettime(CLOCK_REALTIME, &wake)) {
+    return errno ? errno : EINVAL;
+  }
+
+  whole_seconds = (time_t)seconds;
+  nanoseconds =
+      (long)((seconds - (double)whole_seconds) * 1000000000.0);
+
+  wake.tv_sec += whole_seconds;
+  wake.tv_nsec += nanoseconds;
+
+  if (wake.tv_nsec >= 1000000000L) {
+    wake.tv_sec++;
+    wake.tv_nsec -= 1000000000L;
+  }
+
+  return pthread_cond_timedwait(cv, mutex, &wake);
+}
+
 static int index_shard_kdtree_wait(void *userdata) {
   index_shard_aux_group_t *group = userdata;
   index_shard_pool_t *pool;
+  double lend_wait_deadline = 0.0;
   int failed = FALSE;
 
   if (!group) {
@@ -2451,6 +5223,10 @@ static int index_shard_kdtree_wait(void *userdata) {
 
   while (1) {
     index_shard_aux_task_t *task;
+    index_shard_pass_state_snapshot_t state;
+    int lend_active;
+    int lend_claimed;
+    int pass_healthy;
     int pending;
     unsigned long observed_progress;
 
@@ -2468,10 +5244,62 @@ static int index_shard_kdtree_wait(void *userdata) {
     pthread_mutex_unlock(&group->mutex);
 
     /*
-     * A worker waiting for its child tasks helps the global auxiliary queue.
-     * This prevents nested fork/join deadlock without reserving helper threads.
+     * The owner must leave its reserved helper range queued long enough for a
+     * configured outer worker to reach an index boundary and borrow it. If
+     * the pass becomes unhealthy, release the reservation and execute inline
+     * so cancellation or fatal shutdown can never deadlock the fork/join.
      */
-    task = index_shard_aux_queue_try_pop(&pool->auxq);
+    pthread_mutex_lock(&pool->shared.queue_mutex);
+    index_shard_pass_state_snapshot(&pool->shared, &state);
+    pass_healthy =
+        !state.stop_requested &&
+        !state.fatal_error &&
+        !state.solved_published &&
+        !pool->shared.have_solved_order;
+    pthread_mutex_unlock(&pool->shared.queue_mutex);
+
+    pthread_mutex_lock(&pool->auxq.mutex);
+    lend_active =
+        pool->lend_group == group && group->lend_slot;
+    lend_claimed = lend_active && group->lend_claimed;
+
+    if (lend_active && !lend_claimed) {
+      double now = timenow();
+
+      if (lend_wait_deadline <= 0.0) {
+        lend_wait_deadline =
+            now + INDEX_SHARD_LEND_OWNER_WAIT_SECONDS;
+      }
+
+      /*
+       * Revoke only an unclaimed reservation. The same auxq mutex protects a
+       * lender's claim publication, so this cannot duplicate helper work.
+       */
+      if (!pass_healthy || now >= lend_wait_deadline) {
+        pool->lend_group = NULL;
+        group->lend_slot = FALSE;
+        group->lend_claimed = FALSE;
+        pool->lend_fallback_total++;
+        lend_active = FALSE;
+        lend_claimed = FALSE;
+        lend_wait_deadline = 0.0;
+      }
+    } else if (!lend_active || lend_claimed) {
+      lend_wait_deadline = 0.0;
+    }
+
+    pthread_mutex_unlock(&pool->auxq.mutex);
+
+    /*
+     * Without a lend token, retain the original cooperative no-deadlock
+     * behavior. With a token, the owner may help other groups but excludes
+     * its own reserved range.
+     */
+    task = index_shard_aux_queue_try_pop(
+        &pool->auxq,
+        lend_active ? group : NULL,
+        FALSE,
+        TRUE);
 
     if (task) {
       index_shard_aux_execute_one(task);
@@ -2486,6 +5314,20 @@ static int index_shard_kdtree_wait(void *userdata) {
 
     while (group->pending > 0 &&
            group->progress == observed_progress) {
+      if (lend_active && !lend_claimed) {
+        double remaining = lend_wait_deadline - timenow();
+
+        if (remaining <= 0.0) {
+          break;
+        }
+
+        (void)index_shard_cond_wait_seconds(
+            &group->cv,
+            &group->mutex,
+            remaining);
+        break;
+      }
+
       pthread_cond_wait(&group->cv, &group->mutex);
     }
 
@@ -2583,6 +5425,13 @@ static void index_shard_aux_execute_one(index_shard_aux_task_t *task) {
 
   if (pool) {
     pthread_mutex_lock(&pool->auxq.mutex);
+
+    if (task->group &&
+        task->group->lend_slot &&
+        task->group->lend_claimed) {
+      pool->lend_tasks_total++;
+    }
+
     pool->auxq.executed_total++;
     pthread_mutex_unlock(&pool->auxq.mutex);
   }
@@ -2610,10 +5459,26 @@ int index_shard_aux_available(void) {
   return available;
 }
 
-static int index_shard_kdtree_capacity(void *userdata,
-                                       kdtree_task_capacity_t *capacity) {
-  index_shard_aux_group_t *group = userdata;
+int index_shard_aux_capacity(kdtree_task_capacity_t *capacity) {
   index_shard_pool_t *pool;
+
+  if (!capacity) {
+    return -1;
+  }
+
+  pool = index_shard_current_worker_pool;
+
+  if (!pool) {
+    memset(capacity, 0, sizeof(*capacity));
+    return -1;
+  }
+
+  return index_shard_pool_capacity(pool, NULL, capacity);
+}
+
+static int index_shard_pool_capacity(index_shard_pool_t *pool,
+                                     index_shard_aux_group_t *group,
+                                     kdtree_task_capacity_t *capacity) {
   index_shard_thread_state_t *shared;
 
   size_t pending;
@@ -2621,81 +5486,76 @@ static int index_shard_kdtree_capacity(void *userdata,
   size_t room;
 
   size_t workers_total;
-  size_t workers_effective;
+  size_t outer_active_limit;
   size_t outer_running;
   size_t spare_workers;
 
   index_shard_pass_state_snapshot_t state;
+  int healthy;
   int outer_work_claimable;
   int have_solved_order;
+  int lend_available;
 
-  if (!group || !capacity) {
+  if (!pool || !capacity) {
     return -1;
   }
 
   memset(capacity, 0, sizeof(*capacity));
-
-  pool = group->pool;
-
-  if (!pool) {
-    return -1;
-  }
 
   shared = &pool->shared;
 
   /*
    * Snapshot the outer scheduler.
    *
-   * active_workers is deliberately not used as a capacity limit. It counts
-   * workers still participating in pass completion. A worker which has
-   * finished its outer claims remains alive and can help with inner work.
+   * The pool-wide configured worker count is the total CPU budget. The pass
+   * worker count and active_limit cap outer index solves only; they may be
+   * smaller than the pool when few indexes apply. Such unassigned workers,
+   * plus workers which have finished their outer claims, can help inner work.
+   * active_workers only counts participants still completing the outer pass.
    */
   pthread_mutex_lock(&shared->queue_mutex);
 
   workers_total = 0;
-  workers_effective = 0;
+  outer_active_limit = 0;
   outer_running = 0;
   spare_workers = 0;
 
-  if (shared->worker_count > 0) {
-    workers_total = (size_t)shared->worker_count;
-  }
-
-  workers_effective = workers_total;
-
-  if (shared->active_limit > 0 &&
-      (size_t)shared->active_limit < workers_effective) {
-    workers_effective = (size_t)shared->active_limit;
+  if (pool->worker_count > 0) {
+    workers_total = (size_t)pool->worker_count;
   }
 
   if (shared->running_tasks > 0) {
     outer_running = (size_t)shared->running_tasks;
   }
 
+  if (shared->active_limit > 0) {
+    outer_active_limit = (size_t)shared->active_limit;
+  }
+
   index_shard_pass_state_snapshot(shared, &state);
   have_solved_order = shared->have_solved_order;
 
   outer_work_claimable = FALSE;
-
-  if (!state.stop_requested &&
+  healthy =
+      !state.stop_requested &&
       !state.fatal_error &&
       !state.solved_published &&
-      !have_solved_order &&
+      !have_solved_order;
+
+  if (healthy &&
       shared->next_task < shared->ntasks) {
     outer_work_claimable = TRUE;
   }
 
   /*
-   * Unclaimed outer-index work always has priority. Inner subtasks become
-   * eligible only when the outer queue is exhausted and workers are spare.
+   * Natural spare-worker capacity appears only after the outer queue is
+   * exhausted. The single boundary-lending exception is evaluated separately
+   * below and never interrupts an in-flight outer task.
    */
-  if (!state.stop_requested &&
-      !state.fatal_error &&
-      !state.solved_published &&
-      !have_solved_order &&
+  if (healthy &&
       !outer_work_claimable &&
-      workers_effective > outer_running) {
-    spare_workers = workers_effective - outer_running;
+      workers_total > outer_running) {
+    spare_workers = workers_total - outer_running;
   }
 
   pthread_mutex_unlock(&shared->queue_mutex);
@@ -2705,12 +5565,33 @@ static int index_shard_kdtree_capacity(void *userdata,
   pending = pool->auxq.pending;
   max_pending = pool->auxq.max_pending;
 
-  pthread_mutex_unlock(&pool->auxq.mutex);
-
   if (max_pending > pending) {
     room = max_pending - pending;
   } else {
     room = 0;
+  }
+
+  lend_available =
+      index_shard_config_get()->inner_lending_enabled &&
+      healthy &&
+      room > 0 &&
+      outer_work_claimable &&
+      workers_total > 1 &&
+      outer_active_limit > 1 &&
+      outer_running > 1 &&
+      (!pool->lend_group || pool->lend_group == group);
+
+  /*
+   * Naturally idle configured workers remain the first choice. If the outer
+   * queue drains after a group acquires the token, convert the group back to
+   * ordinary spare-worker execution before publishing its helper range.
+   */
+  if (spare_workers > 0 &&
+      group &&
+      pool->lend_group == group) {
+    pool->lend_group = NULL;
+    group->lend_slot = FALSE;
+    group->lend_claimed = FALSE;
   }
 
   capacity->workers_total = workers_total;
@@ -2723,9 +5604,47 @@ static int index_shard_kdtree_capacity(void *userdata,
    */
   capacity->suggested_subtasks = spare_workers;
 
+  /*
+   * When all workers currently own outer indexes and more ordered indexes
+   * remain, offer exactly one helper range. The group-aware executor probe
+   * atomically reserves that range. A worker finishing its current index then
+   * executes the range before claiming the next index and returns immediately
+   * to the outer queue. No thread is added and no in-flight index is stopped.
+   */
+  if (capacity->suggested_subtasks == 0 && lend_available) {
+    capacity->suggested_subtasks = 1;
+
+    if (group && !pool->lend_group) {
+      pool->lend_group = group;
+      group->lend_slot = TRUE;
+      group->lend_claimed = FALSE;
+      pool->lend_acquired_total++;
+    }
+  } else if (capacity->suggested_subtasks == 0 &&
+             index_shard_config_get()->inner_lending_enabled &&
+             healthy &&
+             outer_work_claimable &&
+             pool->lend_group &&
+             pool->lend_group != group) {
+    pool->lend_busy_total++;
+  }
+
   if (capacity->suggested_subtasks > room) {
     capacity->suggested_subtasks = room;
   }
 
+  pthread_mutex_unlock(&pool->auxq.mutex);
+
   return 0;
+}
+
+static int index_shard_kdtree_capacity(void *userdata,
+                                       kdtree_task_capacity_t *capacity) {
+  index_shard_aux_group_t *group = userdata;
+
+  if (!group) {
+    return -1;
+  }
+
+  return index_shard_pool_capacity(group->pool, group, capacity);
 }

@@ -21,6 +21,7 @@
 #include <getopt.h>
 #include <math.h>
 #include <assert.h>
+#include <errno.h>
 
 #include "os-features.h"
 #include "ioutils.h"
@@ -159,7 +160,9 @@ static an_option_t options[] = {
     {'|', "objs",           required_argument, "int",
      "cut the source list to have this many items (after sorting, if applicable)."},
     {'l', "cpulimit",       required_argument, "seconds",
-     "give up solving after the specified number of seconds of CPU time"},
+     "give up solving after the specified aggregate CPU time"},
+    {'\x98', "wall-limit",    required_argument, "seconds",
+     "give up the solving stage after this elapsed time, independent of worker count"},
     {'r', "resort",         no_argument, NULL,
      "sort the star brightnesses by background-subtracted flux; the default is to sort using a"
      "compromise between background-subtracted and non-background-subtracted flux"},
@@ -270,6 +273,25 @@ void augment_xylist_add_options(bl* opts) {
 
 static int parse_fields_string(il* fields, const char* str);
 
+static int parse_nonnegative_seconds(const char* text, double* value) {
+    char* end;
+    double parsed;
+
+    if (!text || !value) {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtod(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' ||
+        !isfinite(parsed) || parsed < 0.0) {
+        return -1;
+    }
+
+    *value = parsed;
+    return 0;
+}
+
 int augment_xylist_parse_option(char argchar, char* optarg,
                                 augment_xylist_t* axy) {
     double d;
@@ -297,6 +319,13 @@ int augment_xylist_parse_option(char argchar, char* optarg,
         break;
     case '\x94':
         axy->pixel_xscale = atof(optarg);
+        break;
+    case '\x98':
+        if (parse_nonnegative_seconds(optarg, &axy->wall_limit)) {
+            ERROR("wall limit must be a finite, non-negative number of seconds: \"%s\"",
+                  optarg ? optarg : "(null)");
+            return -1;
+        }
         break;
     case ';':
         axy->invert_image = TRUE;
@@ -1183,8 +1212,14 @@ int augment_xylist(augment_xylist_t* axy,
     }
     qfits_header_add(hdr, "ANRUN", "T", "Solve this field!", NULL);
 
-    if (axy->cpulimit > 0)
-        fits_header_add_double(hdr, "ANCLIM", axy->cpulimit, "CPU time limit (seconds)");
+    if (axy->cpulimit > 0) {
+        fits_header_add_double(hdr, "ANCLIM", axy->cpulimit,
+                               "Aggregate CPU time limit (seconds)");
+    }
+    if (axy->wall_limit > 0.0) {
+        fits_header_add_double(hdr, "ANTLIM", axy->wall_limit,
+                               "Elapsed solving-stage limit (seconds)");
+    }
 
     if (axy->xcol)
         qfits_header_add(hdr, "ANXCOL", axy->xcol, "Name of column containing X coords", NULL);
@@ -1465,6 +1500,7 @@ static void delete_existing_an_headers(qfits_header* hdr) {
     char key[64];
     qfits_header_del(hdr, "ANRUN");
     qfits_header_del(hdr, "ANCLIM");
+    qfits_header_del(hdr, "ANTLIM");
     qfits_header_del(hdr, "ANXCOL");
     qfits_header_del(hdr, "ANYCOL");
     qfits_header_del(hdr, "ANTAGALL");

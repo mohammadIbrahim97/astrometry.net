@@ -298,36 +298,61 @@ void onefield_add_field_range(onefield_t* bp, int lo, int hi) {
     }
 }
 
-static void check_time_limits(onefield_t* bp) {
-    if (bp->total_timelimit || bp->timelimit) {
-        double now = timenow();
-        if (bp->total_timelimit && (now - bp->time_total_start > bp->total_timelimit)) {
+static anbool check_total_time_limits(onefield_t* bp) {
+    if (!bp) {
+        return TRUE;
+    }
+
+    if (bp->total_timelimit > 0.0 && !bp->hit_total_timelimit) {
+        double now = monotonic_seconds();
+        if (now >= 0.0 &&
+            now - bp->time_total_start >= bp->total_timelimit) {
             logmsg("Total wall-clock time limit reached!\n");
             bp->hit_total_timelimit = TRUE;
         }
-        if (bp->timelimit && (now - bp->time_start > bp->timelimit)) {
+    }
+
+    if (bp->total_cpulimit > 0.0 && !bp->hit_total_cpulimit) {
+        float now = get_cpu_usage();
+        if (now - bp->cpu_total_start > bp->total_cpulimit) {
+            logmsg("Total CPU time limit reached!\n");
+            bp->hit_total_cpulimit = TRUE;
+        }
+    }
+
+    if (bp->hit_total_timelimit || bp->hit_total_cpulimit) {
+        bp->solver.quit_now = TRUE;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void check_time_limits(onefield_t* bp) {
+    check_total_time_limits(bp);
+
+    if (bp->timelimit > 0.0 && !bp->hit_timelimit) {
+        double now = monotonic_seconds();
+        if (now >= 0.0 && now - bp->time_start >= bp->timelimit) {
             logmsg("Wall-clock time limit reached!\n");
             bp->hit_timelimit = TRUE;
         }
     }
-    if (bp->total_cpulimit || bp->cpulimit) {
+
+    if (bp->cpulimit > 0.0 && !bp->hit_cpulimit) {
         float now = get_cpu_usage();
-        if ((bp->total_cpulimit > 0.0) &&
-            (now - bp->cpu_total_start > bp->total_cpulimit)) {
-            logmsg("Total CPU time limit reached!\n");
-            bp->hit_total_cpulimit = TRUE;
-        }
-        if ((bp->cpulimit > 0.0) &&
-            (now - bp->cpu_start > bp->cpulimit)) {
+        if (now - bp->cpu_start > bp->cpulimit) {
             logmsg("CPU time limit reached!\n");
             bp->hit_cpulimit = TRUE;
         }
     }
+
     if (bp->hit_total_timelimit ||
         bp->hit_total_cpulimit ||
         bp->hit_timelimit ||
-        bp->hit_cpulimit)
+        bp->hit_cpulimit) {
         bp->solver.quit_now = TRUE;
+    }
 }
 // SECTION INDEX-SHARD: bridge
 
@@ -347,18 +372,11 @@ static void onefield_index_shard_done_with_index(onefield_t *bp,
 // ANCHOR INDEX-SHARD: bridge-get-index-name
 static const char *onefield_index_shard_get_index_name(onefield_t *bp,
                                                        size_t index_order) {
-  /*
-   * Use the same candidate index-name container that get_index() uses.
-   * If your local get_index() uses a different field than bp->indexnames,
-   * adapt only this function.
-   */
-  if (!bp || !bp->indexnames)
+  if (!bp) {
     return NULL;
+  }
 
-  if (index_order >= (size_t)sl_size(bp->indexnames))
-    return NULL;
-
-  return sl_get(bp->indexnames, index_order);
+  return get_index_name(bp, index_order);
 }
 
 // ANCHOR INDEX-SHARD: bridge-load-index-by-name
@@ -448,6 +466,8 @@ static int onefield_index_shard_prepare_local_context(onefield_t *local_bp,
 
   local_bp->cpulimit = 0.0;
   local_bp->total_cpulimit = 0.0;
+  local_bp->timelimit = 0.0;
+  local_bp->total_timelimit = 0.0;
 
   local_bp->xyls = xylist_open(master_bp->fieldfname);
   if (!local_bp->xyls) {
@@ -515,7 +535,7 @@ static int onefield_index_shard_solve_one_index(onefield_t *local_bp,
   solver_add_index(&local_bp->solver, index);
 
   local_bp->cpu_start = get_cpu_usage();
-  local_bp->time_start = time(NULL);
+  local_bp->time_start = monotonic_seconds();
 
   solve_fields(local_bp, NULL);
 
@@ -639,6 +659,7 @@ static void onefield_index_shard_free_solutions(bl *solutions) {
 static const index_shard_hooks_t onefield_index_shard_hooks = {
     onefield_index_shard_get_index,
     onefield_index_shard_done_with_index,
+    onefield_index_shard_get_index_name,
 
     onefield_index_shard_prepare_local_context,
     onefield_index_shard_reset_local_context_for_task,
@@ -654,11 +675,16 @@ void onefield_run(onefield_t* bp) {
     size_t i, I;
     size_t Nindexes;
 
-    // Record current time for total wall-clock time limit.
-    bp->time_total_start = timenow();
-
-    // Record current CPU usage for total cpu-usage limit.
-    bp->cpu_total_start = get_cpu_usage();
+    /*
+     * engine_run_job() initializes total-job limits once. Direct onefield
+     * callers arrive with zeroed start values and initialize them here.
+     */
+    if (bp->time_total_start <= 0.0) {
+        bp->time_total_start = monotonic_seconds();
+    }
+    if (bp->cpu_total_start <= 0.0) {
+        bp->cpu_total_start = get_cpu_usage();
+    }
 
     // Parse WCS files submitted for verification.
     load_and_parse_wcsfiles(bp);
@@ -805,7 +831,7 @@ void onefield_run(onefield_t* bp) {
         // Record current CPU usage.
         bp->cpu_start = get_cpu_usage();
         // Record current wall-clock time.
-        bp->time_start = time(NULL);
+        bp->time_start = monotonic_seconds();
 
         // Do it!
         solve_fields(bp, NULL);
@@ -822,29 +848,58 @@ void onefield_run(onefield_t* bp) {
         for (I=0; I<Nindexes; I++) {
             index_t* index;
 
-            if (bp->hit_total_timelimit || bp->hit_total_cpulimit)
+            /*
+             * The serial path creates a fresh solver_run() for every index.
+             * Poll the process-wide limits here so short per-index runs cannot
+             * indefinitely postpone the native deadline callback.
+             */
+            if (check_total_time_limits(bp)) {
                 break;
-            if (bp->single_field_solved)
+            }
+            if (bp->single_field_solved) {
                 break;
-            if (bp->cancelled)
+            }
+            if (bp->cancelled) {
                 break;
+            }
 
             // Load the index...
             index = get_index(bp, I);
+
+            /*
+             * Index loading can fault substantial mapped data. If the native
+             * deadline expired during acquisition, release the index without
+             * entering the scalar solver.
+             */
+            if (check_total_time_limits(bp)) {
+                done_with_index(bp, I, index);
+                break;
+            }
+
             solver_add_index(sp, index);
             logverb("Trying index %s...\n", index->indexname);
 
             // Record current CPU usage.
             bp->cpu_start = get_cpu_usage();
             // Record current wall-clock time.
-            bp->time_start = time(NULL);
+            bp->time_start = monotonic_seconds();
 
             // Do it!
             solve_fields(bp, NULL);
 
+            /*
+             * Persist any total-limit decision across the next solver reset.
+             * This check runs once per completed index, not in CodeKD.
+             */
+            check_total_time_limits(bp);
+
             // Clean up this index...
             done_with_index(bp, I, index);
             solver_clear_indexes(sp);
+
+            if (bp->hit_total_timelimit || bp->hit_total_cpulimit) {
+                break;
+            }
         }
     }
 
@@ -1004,7 +1059,7 @@ void onefield_log_run_parameters(onefield_t* bp) {
     logverb("maxquads %i\n", sp->maxquads);
     logverb("maxmatches %i\n", sp->maxmatches);
     logverb("cpulimit %f\n", bp->cpulimit);
-    logverb("timelimit %i\n", bp->timelimit);
+    logverb("timelimit %g\n", bp->timelimit);
     logverb("total_timelimit %g\n", bp->total_timelimit);
     logverb("total_cpulimit %f\n", bp->total_cpulimit);
 }
@@ -1230,7 +1285,7 @@ static void add_onefield_params(onefield_t* bp, qfits_header* hdr) {
     fits_add_long_comment(hdr, "Maxquads: %i", sp->maxquads);
     fits_add_long_comment(hdr, "Maxmatches: %i", sp->maxmatches);
     fits_add_long_comment(hdr, "Cpu limit: %f s", bp->cpulimit);
-    fits_add_long_comment(hdr, "Time limit: %i s", bp->timelimit);
+    fits_add_long_comment(hdr, "Time limit: %g s", bp->timelimit);
     fits_add_long_comment(hdr, "Total time limit: %g s", bp->total_timelimit);
     fits_add_long_comment(hdr, "Total CPU limit: %f s", bp->total_cpulimit);
 
@@ -1350,20 +1405,21 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
             solved_field(bp, fieldnum);
         } else if (!verify_wcs) {
             // Field unsolved.
-            logerr("Field %i did not solve", fieldnum);
             if (bp->solver.index && bp->solver.index->indexname) {
                 char* copy;
                 char* base;
-                copy = strdup(bp->solver.index->indexname);
-                base = strdup(basename(copy));
+                copy = strdup_safe(bp->solver.index->indexname);
+                base = basename(copy);
+                if (bp->solver.endobj) {
+                    logerr("Field %i did not solve (index %s, field objects %i-%i).\n",
+                           fieldnum, base, bp->solver.startobj+1, bp->solver.endobj);
+                } else {
+                    logerr("Field %i did not solve (index %s).\n", fieldnum, base);
+                }
                 free(copy);
-                logerr(" (index %s", base);
-                free(base);
-                if (bp->solver.endobj)
-                    logerr(", field objects %i-%i", bp->solver.startobj+1, bp->solver.endobj);
-                logerr(")");
+            } else {
+                logerr("Field %i did not solve.\n", fieldnum);
             }
-            logerr(".\n");
             if (sp->have_best_match) {
                 logverb("Best match encountered: ");
                 matchobj_print(&(sp->best_match), log_get_level());

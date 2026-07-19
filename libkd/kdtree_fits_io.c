@@ -20,7 +20,6 @@
 #include "tic.h"
 #include "log.h"
 
-// is the given table name one of the above strings?
 int kdtree_fits_column_is_kdtree(char* columnname) {
     return
         starts_with(columnname, KD_STR_HEADER) ||
@@ -145,12 +144,22 @@ const fitsbin_t* get_fitsbin_const(const kdtree_fits_t* io) {
     return io;
 }
 
+// CodeKD and StarKD enter through kdtree FITS I/O.  Configure their mapping
+// policy before any tree chunks are mapped.
+static kdtree_fits_t* configure_index_mmap_policy(kdtree_fits_t* io) {
+    if (io) {
+        fitsbin_configure_index_mmap(io);
+    }
+
+    return io;
+}
+
 kdtree_fits_t* kdtree_fits_open(const char* fn) {
-    return fitsbin_open(fn);
+    return configure_index_mmap_policy(fitsbin_open(fn));
 }
 
 kdtree_fits_t* kdtree_fits_open_fits(anqfits_t* fits) {
-    return fitsbin_open_fits(fits);
+    return configure_index_mmap_policy(fitsbin_open_fits(fits));
 }
 
 kdtree_fits_t* kdtree_fits_open_for_writing(const char* fn) {

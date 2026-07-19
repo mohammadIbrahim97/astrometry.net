@@ -36,8 +36,8 @@
  ANXCOL   -- X column name
  ANYCOL   -- Y column name
 
- ANTLIM   -- time limit (seconds)
- ANCLIM   -- CPU time limit (seconds)
+ ANTLIM   -- elapsed wall-clock limit for the solving stage (seconds)
+ ANCLIM   -- aggregate CPU time limit (seconds)
  ANODDSPR -- odds ratio to print
  ANODDSKP -- odds ratio to keep
  ANODDSSL -- odds ratio to solve

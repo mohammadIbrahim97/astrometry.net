@@ -3,11 +3,13 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -31,17 +33,31 @@
 #include "tweak2.h"
 #include "index_shard_internal.h"
 #include "kdtree_product_internal.h"
+#include "kdtree_continuation_internal.h"
+#include "solver_hypothesis_internal.h"
 #include "index_shard_config.h"
+
 
 #if TESTING_TRYALLCODES
 #define DEBUGSOLVER 1
-#define TRY_ALL_CODES test_try_all_codes
+#define TRY_ALL_CODES(pq, fieldstars, dimquad, solver, tol2, context) \
+    test_try_all_codes((pquad*)(pq), \
+                       (int*)(fieldstars), \
+                       (dimquad), \
+                       (solver), \
+                       (tol2))
 void test_try_all_codes(pquad* pq,
                         int* fieldstars, int dimquad,
                         solver_t* solver, double tol2);
 
 #else
-#define TRY_ALL_CODES try_all_codes
+#define TRY_ALL_CODES(pq, fieldstars, dimquad, solver, tol2, context) \
+    try_all_codes((pq), \
+                  (fieldstars), \
+                  (dimquad), \
+                  (solver), \
+                  (tol2), \
+                  (context))
 #endif
 
 #if TESTING_TRYPERMUTATIONS
@@ -577,7 +593,17 @@ static void set_diag(solver_t* s) {
 
 void solver_set_field(solver_t* s, starxy_t* field) {
     solver_free_field(s);
+
+    /*
+     * A new field starts a new adaptive-policy history. Do not reset this at
+     * index-shard pass entry because the following pass must observe a
+     * transition made by the preceding pass.
+     */
+    fitsbin_mmap_advice_state_reset(
+        &s->index_mmap_policy);
+
     s->fieldxy_orig = field;
+
     // Preprocessing happens in "solver_preprocess_field()".
 }
 
@@ -682,28 +708,540 @@ void solver_compute_quad_range(const solver_t* sp, const index_t* index,
         *maxAB += scalefudge;
     }
 }
+static void try_all_codes(
+    const pquad* pq,
+    const int* fieldstars,
+    int dimquad,
+    solver_t* solver,
+    double tol2,
+    solver_hypothesis_context_t* context);
 
-static void try_all_codes(const pquad* pq,
-                          const int* fieldstars, int dimquad,
-                          solver_t* solver, double tol2);
+static void try_all_codes_2(
+    const int* fieldstars,
+    int dimquad,
+    const double* code,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    solver_hypothesis_context_t* context);
 
-static void try_all_codes_2(const int* fieldstars, int dimquad,
-                            const double* code, solver_t* solver,
-                            anbool current_parity, double tol2);
+static int try_permutations(
+    const int* origstars,
+    int dimquad,
+    const double* origcode,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    int* stars,
+    double* code,
+    int slot,
+    anbool* placed,
+    solver_hypothesis_context_t* context);
 
-static void try_permutations(const int* origstars, int dimquad,
-                             const double* origcode,
-                             solver_t* solver, anbool current_parity,
-                             double tol2,
-                             int* stars, double* code,
-                             int slot, anbool* placed,
-                             kdtree_qres_t** presult);
+static int solver_hypothesis_context_execute(
+    solver_hypothesis_context_t* context);
 
-static void resolve_matches(kdtree_qres_t* krez, const double *field,
-                            const int* fstars, int dimquads,
-                            solver_t* solver, anbool current_parity);
+static void resolve_matches(kdtree_qres_t* krez,
+                            const double* field,
+                            const int* fstars,
+                            int dimquads,
+                            int quads_tried,
+                            solver_t* solver,
+                            anbool current_parity);
 
-static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* sip, anbool fake_match);
+static int solver_handle_hit(solver_t* sp,
+                             MatchObj* mo,
+                             sip_t* sip,
+                             anbool fake_match);
+
+static void solver_hypothesis_result_storage_clean(
+    solver_hypothesis_result_slot_t* slot) {
+    if (!slot) {
+        return;
+    }
+
+    if (slot->result && slot->result != &slot->storage) {
+        kdtree_free_query(slot->result);
+    }
+
+    free(slot->storage.results.any);
+    free(slot->storage.sdists);
+    free(slot->storage.inds);
+
+    memset(slot, 0, sizeof(*slot));
+}
+
+static void solver_hypothesis_context_init(
+    solver_hypothesis_context_t* context,
+    solver_t* solver) {
+    assert(context);
+    assert(solver);
+
+    memset(context, 0, sizeof(*context));
+    context->solver = solver;
+}
+
+static void solver_hypothesis_context_destroy(
+    solver_hypothesis_context_t* context) {
+    size_t i;
+
+    if (!context) {
+        return;
+    }
+
+    for (i = 0; i < context->capacity; i++) {
+        solver_hypothesis_result_storage_clean(
+            &context->results[i]);
+    }
+
+    free(context->descriptors);
+    free(context->results);
+    free(context->tasks);
+
+    memset(context, 0, sizeof(*context));
+}
+
+static int solver_hypothesis_context_reserve(
+    solver_hypothesis_context_t* context,
+    size_t requested_capacity) {
+    solver_hypothesis_descriptor_t* descriptors;
+    solver_hypothesis_result_slot_t* results;
+    size_t new_capacity;
+
+    if (!context) {
+        return -1;
+    }
+
+    if (requested_capacity <= context->capacity) {
+        return 0;
+    }
+
+    new_capacity = context->capacity ? context->capacity : 4;
+
+    while (new_capacity < requested_capacity) {
+        if (new_capacity > SIZE_MAX / 2) {
+            context->metrics.allocation_failures++;
+            return -1;
+        }
+
+        new_capacity *= 2;
+    }
+
+    if (new_capacity > SIZE_MAX / sizeof(*descriptors) ||
+        new_capacity > SIZE_MAX / sizeof(*results)) {
+        context->metrics.allocation_failures++;
+        return -1;
+    }
+
+    descriptors = calloc(new_capacity, sizeof(*descriptors));
+    results = calloc(new_capacity, sizeof(*results));
+
+    if (!descriptors || !results) {
+        free(descriptors);
+        free(results);
+        context->metrics.allocation_failures++;
+        return -1;
+    }
+
+    if (context->count) {
+        memcpy(descriptors,
+               context->descriptors,
+               context->count * sizeof(*descriptors));
+    }
+
+    if (context->capacity) {
+        size_t i;
+
+        for (i = 0; i < context->capacity; i++) {
+            results[i] = context->results[i];
+
+            if (context->results[i].result ==
+                &context->results[i].storage) {
+                results[i].result = &results[i].storage;
+            }
+        }
+    }
+
+    free(context->descriptors);
+    free(context->results);
+
+    context->descriptors = descriptors;
+    context->results = results;
+    context->capacity = new_capacity;
+    return 0;
+}
+
+static int solver_hypothesis_task_reserve(
+    solver_hypothesis_context_t* context,
+    size_t requested_capacity) {
+    solver_hypothesis_task_range_t* tasks;
+    size_t new_capacity;
+
+    if (!context) {
+        return -1;
+    }
+
+    if (requested_capacity <= context->task_capacity) {
+        return 0;
+    }
+
+    new_capacity = context->task_capacity
+        ? context->task_capacity
+        : 1;
+
+    while (new_capacity < requested_capacity) {
+        if (new_capacity > SIZE_MAX / 2) {
+            context->metrics.allocation_failures++;
+            return -1;
+        }
+
+        new_capacity *= 2;
+    }
+
+    if (new_capacity > SIZE_MAX / sizeof(*tasks)) {
+        context->metrics.allocation_failures++;
+        return -1;
+    }
+
+    tasks = realloc(context->tasks,
+                    new_capacity * sizeof(*tasks));
+
+    if (!tasks) {
+        context->metrics.allocation_failures++;
+        return -1;
+    }
+
+    context->tasks = tasks;
+    context->task_capacity = new_capacity;
+    return 0;
+}
+
+static int solver_hypothesis_context_begin(
+    solver_hypothesis_context_t* context,
+    solver_t* solver) {
+    size_t i;
+
+    if (!context || !solver || !solver->index ||
+        context->solver != solver ||
+        context->batch_generation == ULONG_MAX ||
+        (context->state != SOLVER_HYPOTHESIS_CONTEXT_IDLE &&
+         context->state != SOLVER_HYPOTHESIS_CONTEXT_COMPLETE &&
+         context->state != SOLVER_HYPOTHESIS_CONTEXT_STOPPED &&
+         context->state != SOLVER_HYPOTHESIS_CONTEXT_FAILED)) {
+        return -1;
+    }
+
+    for (i = 0; i < context->count; i++) {
+        solver_hypothesis_result_slot_t* slot =
+            &context->results[i];
+
+        if (slot->result && slot->result != &slot->storage) {
+            kdtree_free_query(slot->result);
+            slot->result = NULL;
+        }
+
+        slot->storage.nres = 0;
+        slot->state = SOLVER_HYPOTHESIS_RESULT_EMPTY;
+    }
+
+    context->bound_index = solver->index;
+    context->count = 0;
+    context->task_count = 0;
+    context->next_reduce = 0;
+    context->batch_target = 0;
+    context->parallel_candidate = FALSE;
+    context->parallel_execution = FALSE;
+    context->batch_first_sequence = context->next_sequence;
+    context->batch_generation++;
+    context->state = SOLVER_HYPOTHESIS_CONTEXT_BUILDING;
+    context->metrics.batches++;
+    return 0;
+}
+
+static size_t solver_hypothesis_parallel_batch_target(void) {
+    const index_shard_config_t* config = index_shard_config_get();
+    kdtree_task_capacity_t capacity;
+    size_t target;
+
+    if (!config->hypothesis_parallel_enabled ||
+        config->kd_product_interval != 0 ||
+        index_shard_aux_capacity(&capacity) ||
+        capacity.suggested_subtasks == 0) {
+        return 0;
+    }
+
+    if (capacity.suggested_subtasks >
+        (SIZE_MAX - SOLVER_HYPOTHESIS_OWNER_PREFIX) /
+            SOLVER_HYPOTHESIS_MIN_TASK_GRAIN) {
+        return SOLVER_HYPOTHESIS_MAX_PARALLEL_BATCH;
+    }
+
+    /*
+     * Keep a short ordered prefix on the owner for low first-hit latency.
+     * Every available helper (naturally spare or the one boundary-lent
+     * configured worker) then receives one coarse query range.
+     */
+    target = SOLVER_HYPOTHESIS_OWNER_PREFIX +
+        capacity.suggested_subtasks *
+            SOLVER_HYPOTHESIS_MIN_TASK_GRAIN;
+
+    if (target < SOLVER_HYPOTHESIS_MIN_PARALLEL_BATCH) {
+        target = SOLVER_HYPOTHESIS_MIN_PARALLEL_BATCH;
+    }
+
+    if (target > SOLVER_HYPOTHESIS_MAX_PARALLEL_BATCH) {
+        target = SOLVER_HYPOTHESIS_MAX_PARALLEL_BATCH;
+    }
+
+    return target;
+}
+
+static int solver_hypothesis_context_prepare(
+    solver_hypothesis_context_t* context,
+    solver_t* solver) {
+    size_t batch_target;
+
+    if (!context || !solver || !solver->index) {
+        return -1;
+    }
+
+    if (context->state == SOLVER_HYPOTHESIS_CONTEXT_BUILDING) {
+        return context->bound_index == solver->index ? 0 : -1;
+    }
+
+    batch_target = solver_hypothesis_parallel_batch_target();
+
+    if (solver_hypothesis_context_begin(context, solver)) {
+        return -1;
+    }
+
+    context->batch_target = batch_target;
+    context->parallel_candidate = batch_target != 0;
+    return 0;
+}
+
+static int solver_hypothesis_context_flush(
+    solver_hypothesis_context_t* context) {
+    if (!context) {
+        return -1;
+    }
+
+    if (context->state != SOLVER_HYPOTHESIS_CONTEXT_BUILDING) {
+        return 0;
+    }
+
+    return solver_hypothesis_context_execute(context);
+}
+
+static int solver_hypothesis_context_flush_before_index(
+    solver_hypothesis_context_t* context,
+    const index_t* next_index) {
+    if (!context || !next_index) {
+        return -1;
+    }
+
+    if (context->state == SOLVER_HYPOTHESIS_CONTEXT_BUILDING &&
+        context->bound_index != next_index) {
+        return solver_hypothesis_context_execute(context);
+    }
+
+    return 0;
+}
+
+static int solver_hypothesis_context_append(
+    solver_hypothesis_context_t* context,
+    const int* stars,
+    const double* code,
+    int dimquad,
+    anbool current_parity,
+    double tol2) {
+    solver_hypothesis_descriptor_t* descriptor;
+    size_t dimcode;
+
+    if (!context || !context->solver ||
+        !context->bound_index ||
+        context->solver->index != context->bound_index ||
+        context->state != SOLVER_HYPOTHESIS_CONTEXT_BUILDING ||
+        !stars || !code ||
+        dimquad < NBACK || dimquad > DQMAX) {
+        return -1;
+    }
+
+    dimcode = (size_t)(dimquad - NBACK) * 2;
+
+    if (dimcode > DCMAX ||
+        context->next_sequence == UINT64_MAX ||
+        context->count == SIZE_MAX ||
+        solver_hypothesis_context_reserve(
+            context,
+            context->count + 1)) {
+        return -1;
+    }
+
+    descriptor = &context->descriptors[context->count];
+    memset(descriptor, 0, sizeof(*descriptor));
+
+    memcpy(descriptor->stars,
+           stars,
+           (size_t)dimquad * sizeof(*stars));
+
+    memcpy(descriptor->code,
+           code,
+           dimcode * sizeof(*code));
+
+    descriptor->sequence = context->next_sequence++;
+    descriptor->tol2 = tol2;
+    descriptor->dimquad = dimquad;
+    descriptor->quads_tried = context->solver->numtries;
+    descriptor->current_parity = current_parity;
+
+    context->count++;
+    context->metrics.hypotheses_generated++;
+
+    if (context->count > context->metrics.max_batch_hypotheses) {
+        context->metrics.max_batch_hypotheses = context->count;
+    }
+
+    return 0;
+}
+
+static int solver_hypothesis_context_plan_tasks(
+    solver_hypothesis_context_t* context,
+    size_t worker_limit) {
+    size_t maximum_helpers;
+    size_t helper_count;
+    size_t task_count;
+    size_t base_count;
+    size_t remainder;
+    size_t begin = 0;
+    size_t i;
+    int configured_workers;
+
+    if (!context || !context->count ||
+        context->state != SOLVER_HYPOTHESIS_CONTEXT_BUILDING) {
+        return -1;
+    }
+
+    configured_workers = index_shard_config_get()->worker_count;
+    if (configured_workers < 1) {
+        configured_workers = 1;
+    }
+
+    if (worker_limit == 0 ||
+        worker_limit > (size_t)configured_workers) {
+        worker_limit = (size_t)configured_workers;
+    }
+
+    helper_count = 0;
+
+    if (worker_limit > 1 &&
+        context->count > SOLVER_HYPOTHESIS_OWNER_PREFIX) {
+        size_t helper_items =
+            context->count - SOLVER_HYPOTHESIS_OWNER_PREFIX;
+
+        maximum_helpers =
+            1 + (helper_items - 1) /
+                SOLVER_HYPOTHESIS_MIN_TASK_GRAIN;
+
+        helper_count = worker_limit - 1;
+        if (helper_count > maximum_helpers) {
+            helper_count = maximum_helpers;
+        }
+    }
+
+    task_count = helper_count + 1;
+
+    if (solver_hypothesis_task_reserve(context, task_count)) {
+        return -1;
+    }
+
+    if (helper_count) {
+        size_t helper_items =
+            context->count - SOLVER_HYPOTHESIS_OWNER_PREFIX;
+
+        base_count = helper_items / helper_count;
+        remainder = helper_items % helper_count;
+    } else {
+        base_count = context->count;
+        remainder = 0;
+    }
+
+    for (i = 0; i < task_count; i++) {
+        solver_hypothesis_task_range_t* task = &context->tasks[i];
+        size_t count;
+
+        if (helper_count && i == 0) {
+            count = SOLVER_HYPOTHESIS_OWNER_PREFIX;
+        } else if (helper_count) {
+            size_t helper_index = i - 1;
+
+            count = base_count +
+                (helper_index < remainder ? 1 : 0);
+        } else {
+            count = base_count;
+        }
+
+        assert(count > 0);
+
+        task->begin = begin;
+        task->end = begin + count;
+        task->first_sequence =
+            context->descriptors[task->begin].sequence;
+        task->last_sequence =
+            context->descriptors[task->end - 1].sequence;
+        task->generation = context->batch_generation;
+
+        begin = task->end;
+    }
+
+    assert(begin == context->count);
+
+    context->task_count = task_count;
+    context->state = SOLVER_HYPOTHESIS_CONTEXT_FROZEN;
+    context->metrics.task_ranges_planned += task_count;
+
+    if (task_count > context->metrics.max_task_ranges) {
+        context->metrics.max_task_ranges = task_count;
+    }
+
+    return 0;
+}
+
+static void solver_hypothesis_context_report(
+    const solver_hypothesis_context_t* context) {
+    if (!context || !index_shard_trace_enabled()) {
+        return;
+    }
+
+    logmsg("[solver] hypothesis-context batches=%llu completed=%llu "
+           "stopped=%llu failed=%llu hypotheses=%llu executed=%llu "
+           "reduced=%llu "
+           "task_ranges=%llu tasks_executed=%llu submitted=%llu "
+           "inline=%llu parallel_batches=%llu observed_parallel=%llu "
+           "parallel_hypotheses=%llu "
+           "alloc_failures=%llu "
+           "search_failures=%llu max_batch=%zu max_tasks=%zu "
+           "max_parallel=%zu\n",
+           context->metrics.batches,
+           context->metrics.batches_completed,
+           context->metrics.batches_stopped,
+           context->metrics.batches_failed,
+           context->metrics.hypotheses_generated,
+           context->metrics.hypotheses_executed,
+           context->metrics.hypotheses_reduced,
+           context->metrics.task_ranges_planned,
+           context->metrics.task_ranges_executed,
+           context->metrics.task_ranges_submitted,
+           context->metrics.task_ranges_inline,
+           context->metrics.parallel_batches,
+           context->metrics.parallel_batches_observed,
+           context->metrics.parallel_hypotheses,
+           context->metrics.allocation_failures,
+           context->metrics.search_failures,
+           context->metrics.max_batch_hypotheses,
+           context->metrics.max_task_ranges,
+           context->metrics.max_parallel_ranges);
+}
 
 static void check_scale(pquad* pq, solver_t* s) {
     double dx, dy;
@@ -882,7 +1420,8 @@ static double get_tolerance(solver_t* solver) {
 static void add_stars(const pquad* pq, int* field, int fieldoffset,
                       int n_to_add, int adding, int fieldtop,
                       int dimquad,
-                      solver_t* solver, double tol2) {
+                      solver_t* solver, double tol2,
+                      solver_hypothesis_context_t* context) {
     int bottom;
     int* f = field + fieldoffset;
     // When we're adding the first star, we start from index zero.
@@ -903,11 +1442,16 @@ static void add_stars(const pquad* pq, int* field, int fieldoffset,
         // call try_all_codes to try the quad we've built.
         if (adding == n_to_add-1) {
             // (when not testing, TRY_ALL_CODES is just try_all_codes.)
-            TRY_ALL_CODES(pq, field, dimquad, solver, tol2);
+            TRY_ALL_CODES(pq,
+                          field,
+                          dimquad,
+                          solver,
+                          tol2,
+                          context);
         } else {
             // Else recurse.
             add_stars(pq, field, fieldoffset, n_to_add, adding+1,
-                      fieldtop, dimquad, solver, tol2);
+                      fieldtop, dimquad, solver, tol2, context);
         }
     }
 }
@@ -923,6 +1467,7 @@ void solver_run(solver_t* solver) {
     size_t i, num_indexes;
     double tol2;
     int field[DQMAX];
+    solver_hypothesis_context_t hypothesis_context;
 
     get_resource_stats(&usertime, &systime, NULL);
 
@@ -936,8 +1481,12 @@ void solver_run(solver_t* solver) {
     numxy = starxy_n(solver->fieldxy);
     if (solver->endobj && (numxy > solver->endobj))
         numxy = solver->endobj;
-    if (solver->startobj >= numxy)
+    if (solver->startobj >= numxy) {
         return;
+    }
+
+    solver_hypothesis_context_init(&hypothesis_context, solver);
+
     if (numxy >= 1000) {
         logverb("Limiting search to first 1000 objects\n");
         numxy = 1000;
@@ -1101,6 +1650,14 @@ void solver_run(solver_t* solver) {
             for (i = 0; i < num_indexes; i++) {
                 index_t* index = pl_get(solver->indexes, i);
                 int dimquads;
+
+                if (solver_hypothesis_context_flush_before_index(
+                        &hypothesis_context,
+                        index)) {
+                    solver->quit_now = TRUE;
+                    goto quitnow;
+                }
+
                 set_index(solver, index);
                 dimquads = index_dimquads(index);
                 for (field[A] = 0; field[A] < newpoint; field[A]++) {
@@ -1116,10 +1673,24 @@ void solver_run(solver_t* solver) {
                     tol2 = get_tolerance(solver);
                     // Now look at all sets of (C, D, ...) stars (subject to field[C] < field[D] < ...)
                     // ("dimquads - 2" because we've set stars A and B at this point)
-                    add_stars(pq, field, C, dimquads-2, 0, newpoint, dimquads, solver, tol2);
+                    add_stars(pq,
+                              field,
+                              C,
+                              dimquads - 2,
+                              0,
+                              newpoint,
+                              dimquads,
+                              solver,
+                              tol2,
+                              &hypothesis_context);
                     if (solver->quit_now)
                         goto quitnow;
                 }
+            }
+
+            if (solver_hypothesis_context_flush(&hypothesis_context)) {
+                solver->quit_now = TRUE;
+                goto quitnow;
             }
 
             if (solver->quit_now)
@@ -1158,6 +1729,14 @@ void solver_run(solver_t* solver) {
                         if ((pq->scale < minAB2s[i]) ||
                             (pq->scale > maxAB2s[i]))
                             continue;
+
+                        if (solver_hypothesis_context_flush_before_index(
+                                &hypothesis_context,
+                                index)) {
+                            solver->quit_now = TRUE;
+                            goto quitnow;
+                        }
+
                         set_index(solver, index);
                         dimquads = index_dimquads(index);
 
@@ -1165,15 +1744,35 @@ void solver_run(solver_t* solver) {
 
                         if (dimquads > 3) {
                             // ("dimquads - 3" because we've set stars A, B, and C at this point)
-                            add_stars(pq, field, D, dimquads-3, 0, newpoint, dimquads, solver, tol2);
+                            add_stars(pq,
+                                      field,
+                                      D,
+                                      dimquads - 3,
+                                      0,
+                                      newpoint,
+                                      dimquads,
+                                      solver,
+                                      tol2,
+                                      &hypothesis_context);
                         } else {
-                            TRY_ALL_CODES(pq, field, dimquads, solver, tol2);
+                            TRY_ALL_CODES(pq,
+                                          field,
+                                          dimquads,
+                                          solver,
+                                          tol2,
+                                          &hypothesis_context);
                         }
                         if (solver->quit_now)
                             goto quitnow;
                     }
                 }
             }
+
+            if (solver_hypothesis_context_flush(&hypothesis_context)) {
+                solver->quit_now = TRUE;
+                goto quitnow;
+            }
+
             logverb("object %u of %u: %i quads tried, %i matched.\n",
                     newpoint + 1, numxy, solver->numtries, solver->nummatches);
 
@@ -1184,6 +1783,14 @@ void solver_run(solver_t* solver) {
         }
 
     quitnow:
+        if (!solver->quit_now &&
+            solver_hypothesis_context_flush(&hypothesis_context)) {
+            solver->quit_now = TRUE;
+        }
+
+        solver_hypothesis_context_report(&hypothesis_context);
+        solver_hypothesis_context_destroy(&hypothesis_context);
+
         for (i = 0; i < (numxy*numxy); i++) {
             pquad* pq = pquads + i;
             free(pq->inbox);
@@ -1199,7 +1806,8 @@ void solver_run(solver_t* solver) {
  */
 static void try_all_codes(const pquad* pq,
                           const int* fieldstars, int dimquad,
-                          solver_t* solver, double tol2) {
+                          solver_t* solver, double tol2,
+                          solver_hypothesis_context_t* context) {
     int dimcode = (dimquad - 2) * 2;
     double code[DCMAX];
     double flipcode[DCMAX];
@@ -1226,7 +1834,13 @@ static void try_all_codes(const pquad* pq,
             debug("%s%g", (i?", ":""), code[i]);
         debug("].\n");
 
-        try_all_codes_2(fieldstars, dimquad, code, solver, FALSE, tol2);
+        try_all_codes_2(fieldstars,
+                        dimquad,
+                        code,
+                        solver,
+                        FALSE,
+                        tol2,
+                        context);
     }
     if (solver->parity == PARITY_FLIP ||
         solver->parity == PARITY_BOTH) {
@@ -1238,53 +1852,99 @@ static void try_all_codes(const pquad* pq,
             debug("%s%g", (i?", ":""), flipcode[i]);
         debug("].\n");
 
-        try_all_codes_2(fieldstars, dimquad, flipcode, solver, TRUE, tol2);
+        try_all_codes_2(fieldstars,
+                        dimquad,
+                        flipcode,
+                        solver,
+                        TRUE,
+                        tol2,
+                        context);
     }
 }
-
 /**
  This function tries the quad with the "backbone" stars A and B in
  normal and flipped configurations.
  */
-static void try_all_codes_2(const int* fieldstars, int dimquad,
-                            const double* code, solver_t* solver,
-                            anbool current_parity, double tol2) {
+static void try_all_codes_2(
+    const int* fieldstars,
+    int dimquad,
+    const double* code,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    solver_hypothesis_context_t* context) {
     int i;
-    kdtree_qres_t* result = NULL;
     int dimcode = (dimquad - NBACK) * 2;
     int stars[DQMAX];
     double flipcode[DCMAX];
-
-    // We actually only use elements up to dimquads-2.
     anbool placed[DQMAX];
 
-    // Un-flipped:
+    if (!context ||
+        solver_hypothesis_context_prepare(context, solver)) {
+        ERROR("Failed to prepare index-owned hypothesis batch");
+        solver->quit_now = TRUE;
+        return;
+    }
+
+    // Un-flipped backbone.
     stars[0] = fieldstars[0];
     stars[1] = fieldstars[1];
 
-    for (i=0; i<DQMAX; i++)
+    for (i = 0; i < DQMAX; i++) {
         placed[i] = FALSE;
+    }
 
-    try_permutations(fieldstars, dimquad, code, solver, current_parity,
-                     tol2, stars, NULL, 0, placed, &result);
-    if (unlikely(solver->quit_now))
-        goto bailout;
+    if (try_permutations(fieldstars,
+                         dimquad,
+                         code,
+                         solver,
+                         current_parity,
+                         tol2,
+                         stars,
+                         NULL,
+                         0,
+                         placed,
+                         context)) {
+        solver->quit_now = TRUE;
+        return;
+    }
 
-    // Flipped:
+    if (unlikely(solver->quit_now)) {
+        return;
+    }
+
+    // Flipped backbone.
     stars[0] = fieldstars[1];
     stars[1] = fieldstars[0];
 
-    for (i=0; i<dimcode; i++)
+    for (i = 0; i < dimcode; i++) {
         flipcode[i] = 1.0 - code[i];
+    }
 
-    for (i=0; i<DQMAX; i++)
+    for (i = 0; i < DQMAX; i++) {
         placed[i] = FALSE;
+    }
 
-    try_permutations(fieldstars, dimquad, flipcode, solver, current_parity,
-                     tol2, stars, NULL, 0, placed, &result);
+    if (try_permutations(fieldstars,
+                         dimquad,
+                         flipcode,
+                         solver,
+                         current_parity,
+                         tol2,
+                         stars,
+                         NULL,
+                         0,
+                         placed,
+                         context)) {
+        solver->quit_now = TRUE;
+        return;
+    }
 
- bailout:
-    kdtree_free_query(result);
+    if ((!context->parallel_candidate ||
+         context->count >= context->batch_target) &&
+        solver_hypothesis_context_execute(context)) {
+        solver->quit_now = TRUE;
+    }
 }
 /*
  * ------------------------------------------------------------------------
@@ -1332,8 +1992,53 @@ static anbool solver_kd_product_selected(void) {
 }
 
 /*
- * Execute a normal scalar search unless this call was explicitly sampled
- * and the shared index-shard executor can accept nested work.
+ * Execute one CodeKD query through the continuation compatibility boundary.
+ *
+ * Ordered hypothesis waves parallelize complete independent queries. Within
+ * each query, the configured zero budget retains the established scalar
+ * run-to-completion traversal and avoids fine-grained continuation overhead.
+ */
+static kdtree_qres_t *solver_codekd_rangesearch_local(
+    const kdtree_t *tree,
+    kdtree_qres_t *reuse,
+    const void *code,
+    double tol2,
+    int options) {
+    const index_shard_config_t *config;
+    kdtree_qres_t *result;
+
+    config = index_shard_config_get();
+
+    if (config->kd_continuation_enabled) {
+        result = kdtree_rangesearch_continuation_execute(
+            tree,
+            reuse,
+            code,
+            tol2,
+            options,
+            config->kd_continuation_node_budget);
+
+        if (result) {
+            return result;
+        }
+
+        /*
+         * Unsupported tree modes retain the historical one-shot path.  A
+         * continuation failure must never change solver correctness.
+         */
+    }
+
+    return kdtree_rangesearch_options_reuse(
+        tree,
+        reuse,
+        code,
+        tol2,
+        options);
+}
+
+/*
+ * Execute a normal local search unless this call was explicitly sampled and
+ * the shared index-shard executor can accept nested Product work.
  */
 static kdtree_qres_t *solver_codekd_rangesearch(
     solver_t *solver,
@@ -1348,7 +2053,7 @@ static kdtree_qres_t *solver_codekd_rangesearch(
 
     if (!solver_kd_product_selected() ||
         !index_shard_aux_available()) {
-        return kdtree_rangesearch_options_reuse(
+        return solver_codekd_rangesearch_local(
             tree,
             reuse,
             code,
@@ -1358,7 +2063,7 @@ static kdtree_qres_t *solver_codekd_rangesearch(
 
     group = index_shard_aux_group_new();
     if (!group) {
-        return kdtree_rangesearch_options_reuse(
+        return solver_codekd_rangesearch_local(
             tree,
             reuse,
             code,
@@ -1371,7 +2076,7 @@ static kdtree_qres_t *solver_codekd_rangesearch(
     if (index_shard_kdtree_executor_init(&executor, group)) {
         index_shard_aux_group_free(group);
 
-        return kdtree_rangesearch_options_reuse(
+        return solver_codekd_rangesearch_local(
             tree,
             reuse,
             code,
@@ -1394,6 +2099,547 @@ static kdtree_qres_t *solver_codekd_rangesearch(
     index_shard_aux_group_free(group);
     return result;
 }
+/*
+ * Reduce one privately produced result in exact descriptor order.
+ *
+ * The owner calls this immediately for its leading range. Helpers may fill
+ * later READY slots concurrently, but only the owner invokes this reducer and
+ * only for context->next_reduce.
+ */
+static int solver_hypothesis_reduce_one(
+    solver_hypothesis_context_t* context,
+    size_t index) {
+    const solver_hypothesis_descriptor_t* descriptor;
+    solver_hypothesis_result_slot_t* slot;
+    solver_t* solver;
+    double pixvals[DQMAX * 2];
+    int j;
+
+    if (!context || !context->solver ||
+        context->state != SOLVER_HYPOTHESIS_CONTEXT_EXECUTING ||
+        index >= context->count ||
+        index != context->next_reduce) {
+        return -1;
+    }
+
+    solver = context->solver;
+    descriptor = &context->descriptors[index];
+    slot = &context->results[index];
+
+    if (context->bound_index != solver->index ||
+        descriptor->sequence !=
+            context->batch_first_sequence + index ||
+        slot->sequence != descriptor->sequence ||
+        slot->generation != context->batch_generation ||
+        slot->state != SOLVER_HYPOTHESIS_RESULT_READY ||
+        !slot->result) {
+        return -1;
+    }
+
+    if (slot->result->nres) {
+        for (j = 0; j < descriptor->dimquad; j++) {
+            setx(pixvals,
+                 j,
+                 field_getx(solver, descriptor->stars[j]));
+
+            sety(pixvals,
+                 j,
+                 field_gety(solver, descriptor->stars[j]));
+        }
+
+        resolve_matches(slot->result,
+                        pixvals,
+                        descriptor->stars,
+                        descriptor->dimquad,
+                        descriptor->quads_tried,
+                        solver,
+                        descriptor->current_parity);
+    }
+
+    slot->state = SOLVER_HYPOTHESIS_RESULT_REDUCED;
+    context->next_reduce++;
+    context->metrics.hypotheses_reduced++;
+    return 0;
+}
+
+typedef struct solver_hypothesis_search_work {
+    solver_hypothesis_context_t* context;
+    size_t begin;
+    size_t end;
+    unsigned long generation;
+    size_t executed;
+    double wall_start;
+    double wall_end;
+    pthread_t thread_id;
+    anbool submitted;
+    anbool ran;
+    anbool failed;
+} solver_hypothesis_search_work_t;
+
+static int solver_hypothesis_task_range_valid(
+    const solver_hypothesis_context_t* context,
+    const solver_hypothesis_task_range_t* task) {
+    if (!context || !task ||
+        task->begin >= task->end ||
+        task->end > context->count ||
+        task->first_sequence !=
+            context->descriptors[task->begin].sequence ||
+        task->last_sequence !=
+            context->descriptors[task->end - 1].sequence ||
+        task->generation != context->batch_generation) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static int solver_hypothesis_search_one(
+    solver_hypothesis_context_t* context,
+    size_t descriptor_index) {
+    const int options =
+        KD_OPTIONS_SMALL_RADIUS |
+        KD_OPTIONS_COMPUTE_DISTS |
+        KD_OPTIONS_NO_RESIZE_RESULTS |
+        KD_OPTIONS_USE_SPLIT;
+    const solver_hypothesis_descriptor_t* descriptor;
+    solver_hypothesis_result_slot_t* slot;
+    kdtree_qres_t* result;
+
+    if (!context || !context->solver || !context->bound_index ||
+        context->state != SOLVER_HYPOTHESIS_CONTEXT_EXECUTING ||
+        descriptor_index >= context->count) {
+        return -1;
+    }
+
+    descriptor = &context->descriptors[descriptor_index];
+    slot = &context->results[descriptor_index];
+
+    if (descriptor->sequence !=
+        context->batch_first_sequence + descriptor_index) {
+        return -1;
+    }
+
+    if (slot->result && slot->result != &slot->storage) {
+        kdtree_free_query(slot->result);
+        slot->result = NULL;
+    }
+
+    slot->storage.nres = 0;
+    slot->sequence = descriptor->sequence;
+    slot->generation = context->batch_generation;
+    slot->state = SOLVER_HYPOTHESIS_RESULT_EMPTY;
+
+    if (context->parallel_execution) {
+        result = solver_codekd_rangesearch_local(
+            context->bound_index->codekd->tree,
+            &slot->storage,
+            descriptor->code,
+            descriptor->tol2,
+            options);
+    } else {
+        result = solver_codekd_rangesearch(
+            context->solver,
+            &slot->storage,
+            descriptor->code,
+            descriptor->tol2,
+            options);
+    }
+
+    if (!result) {
+        return -1;
+    }
+
+    slot->result = result;
+    slot->state = SOLVER_HYPOTHESIS_RESULT_READY;
+    return 0;
+}
+
+static void solver_hypothesis_search_range(void* userdata) {
+    solver_hypothesis_search_work_t* work = userdata;
+    size_t descriptor_index;
+
+    if (!work || !work->context ||
+        work->generation != work->context->batch_generation ||
+        work->begin >= work->end ||
+        work->end > work->context->count) {
+        if (work) {
+            work->failed = TRUE;
+        }
+        return;
+    }
+
+    work->ran = TRUE;
+    work->thread_id = pthread_self();
+    work->wall_start = timenow();
+
+    for (descriptor_index = work->begin;
+         descriptor_index < work->end;
+         descriptor_index++) {
+        if (solver_hypothesis_search_one(
+                work->context,
+                descriptor_index)) {
+            work->failed = TRUE;
+            break;
+        }
+
+        work->executed++;
+    }
+
+    work->wall_end = timenow();
+}
+
+static int solver_hypothesis_execute_owner_range(
+    solver_hypothesis_search_work_t* work) {
+    solver_hypothesis_context_t* context;
+    size_t descriptor_index;
+    int rc = 0;
+
+    if (!work || !work->context) {
+        return -1;
+    }
+
+    context = work->context;
+    work->ran = TRUE;
+    work->thread_id = pthread_self();
+    work->wall_start = timenow();
+
+    for (descriptor_index = work->begin;
+         descriptor_index < work->end;
+         descriptor_index++) {
+        if (unlikely(context->solver->quit_now)) {
+            break;
+        }
+
+        if (descriptor_index != context->next_reduce ||
+            solver_hypothesis_search_one(context, descriptor_index)) {
+            work->failed = TRUE;
+            rc = -1;
+            break;
+        }
+
+        work->executed++;
+
+        if (solver_hypothesis_reduce_one(
+                context,
+                descriptor_index)) {
+            work->failed = TRUE;
+            rc = -1;
+            break;
+        }
+    }
+
+    work->wall_end = timenow();
+    return rc;
+}
+
+static size_t solver_hypothesis_observed_parallel_ranges(
+    const solver_hypothesis_search_work_t* work,
+    size_t work_count) {
+    size_t maximum = 0;
+    size_t i;
+
+    for (i = 0; i < work_count; i++) {
+        size_t concurrent = 0;
+        size_t j;
+
+        if (!work[i].ran ||
+            work[i].wall_end < work[i].wall_start) {
+            continue;
+        }
+
+        for (j = 0; j < work_count; j++) {
+            if (work[j].ran &&
+                work[j].wall_start <= work[i].wall_start &&
+                work[j].wall_end > work[i].wall_start &&
+                (j == i ||
+                 !pthread_equal(work[j].thread_id,
+                                work[i].thread_id))) {
+                concurrent++;
+            }
+        }
+
+        if (concurrent > maximum) {
+            maximum = concurrent;
+        }
+    }
+
+    return maximum;
+}
+
+static void solver_hypothesis_account_work(
+    solver_hypothesis_context_t* context,
+    const solver_hypothesis_search_work_t* work,
+    size_t work_count) {
+    size_t i;
+
+    for (i = 0; i < work_count; i++) {
+        context->metrics.hypotheses_executed += work[i].executed;
+
+        if (work[i].ran) {
+            context->metrics.task_ranges_executed++;
+        }
+
+        if (work[i].submitted) {
+            context->metrics.task_ranges_submitted++;
+        } else if (work[i].ran) {
+            context->metrics.task_ranges_inline++;
+        }
+    }
+}
+
+static int solver_hypothesis_execute_serial(
+    solver_hypothesis_context_t* context) {
+    solver_hypothesis_search_work_t work;
+    const solver_hypothesis_task_range_t* task;
+
+    if (!context || context->task_count != 1) {
+        return -1;
+    }
+
+    task = &context->tasks[0];
+
+    if (!solver_hypothesis_task_range_valid(context, task)) {
+        return -1;
+    }
+
+    memset(&work, 0, sizeof(work));
+    work.context = context;
+    work.begin = task->begin;
+    work.end = task->end;
+    work.generation = task->generation;
+
+    if (solver_hypothesis_execute_owner_range(&work)) {
+        solver_hypothesis_account_work(context, &work, 1);
+        return -1;
+    }
+
+    solver_hypothesis_account_work(context, &work, 1);
+    return 0;
+}
+
+static int solver_hypothesis_execute_parallel(
+    solver_hypothesis_context_t* context,
+    index_shard_aux_group_t* group,
+    kdtree_task_executor_t* executor) {
+    solver_hypothesis_search_work_t* work;
+    size_t submitted_count = 0;
+    size_t observed_parallel_ranges;
+    size_t i;
+    int failed = FALSE;
+
+    if (!context || !group || !executor ||
+        context->task_count < 2) {
+        return -1;
+    }
+
+    work = calloc(context->task_count, sizeof(*work));
+
+    if (!work) {
+        context->metrics.allocation_failures++;
+        return -1;
+    }
+
+    for (i = 0; i < context->task_count; i++) {
+        const solver_hypothesis_task_range_t* task = &context->tasks[i];
+
+        if (!solver_hypothesis_task_range_valid(context, task)) {
+            free(work);
+            return -1;
+        }
+
+        work[i].context = context;
+        work[i].begin = task->begin;
+        work[i].end = task->end;
+        work[i].generation = task->generation;
+    }
+
+    /*
+     * Publish later contiguous ranges first. The owner keeps the first range
+     * and reduces it immediately in exact serial order, preserving the fast
+     * path for an early valid solution.
+     */
+    for (i = 1; i < context->task_count; i++) {
+        if (!executor->submit(
+                executor->userdata,
+                solver_hypothesis_search_range,
+                &work[i])) {
+            work[i].submitted = TRUE;
+            submitted_count++;
+        }
+    }
+
+    if (solver_hypothesis_execute_owner_range(&work[0])) {
+        failed = TRUE;
+    }
+
+    if (!failed && !context->solver->quit_now) {
+        for (i = 1; i < context->task_count; i++) {
+            if (!work[i].submitted) {
+                solver_hypothesis_search_range(&work[i]);
+            }
+        }
+    }
+
+    if (executor->wait(executor->userdata)) {
+        failed = TRUE;
+    }
+
+    solver_hypothesis_account_work(
+        context,
+        work,
+        context->task_count);
+
+    if (submitted_count) {
+        context->metrics.parallel_batches++;
+
+        observed_parallel_ranges =
+            solver_hypothesis_observed_parallel_ranges(
+                work,
+                context->task_count);
+
+        if (observed_parallel_ranges > 1) {
+            context->metrics.parallel_batches_observed++;
+        }
+
+        if (observed_parallel_ranges >
+            context->metrics.max_parallel_ranges) {
+            context->metrics.max_parallel_ranges =
+                observed_parallel_ranges;
+        }
+
+        for (i = 0; i < context->task_count; i++) {
+            context->metrics.parallel_hypotheses += work[i].executed;
+        }
+    }
+
+    for (i = 0; i < context->task_count; i++) {
+        if (work[i].failed) {
+            failed = TRUE;
+        }
+    }
+
+    free(work);
+
+    if (failed) {
+        return -1;
+    }
+
+    if (context->solver->quit_now) {
+        return 0;
+    }
+
+    while (context->next_reduce < context->count) {
+        if (solver_hypothesis_reduce_one(
+                context,
+                context->next_reduce)) {
+            return -1;
+        }
+
+        if (unlikely(context->solver->quit_now)) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Execute one index-owned wave. Helpers perform only immutable CodeKD
+ * searches into private slots. The owner alone reduces slots in generation
+ * order and therefore remains the only writer of solver-visible state.
+ */
+static int solver_hypothesis_context_execute(
+    solver_hypothesis_context_t* context) {
+    index_shard_aux_group_t* group = NULL;
+    kdtree_task_executor_t executor;
+    kdtree_task_capacity_t capacity;
+    solver_t* solver;
+    size_t worker_limit = 1;
+    anbool use_parallel = FALSE;
+    int rc;
+
+    if (!context || !context->solver || !context->bound_index) {
+        return -1;
+    }
+
+    if (!context->count) {
+        if (context->state != SOLVER_HYPOTHESIS_CONTEXT_BUILDING) {
+            return -1;
+        }
+
+        context->state = SOLVER_HYPOTHESIS_CONTEXT_COMPLETE;
+        context->metrics.batches_completed++;
+        return 0;
+    }
+
+    solver = context->solver;
+    memset(&executor, 0, sizeof(executor));
+    memset(&capacity, 0, sizeof(capacity));
+
+    if (context->parallel_candidate &&
+        context->count >= SOLVER_HYPOTHESIS_MIN_PARALLEL_BATCH) {
+        group = index_shard_aux_group_new();
+
+        if (group &&
+            !index_shard_kdtree_executor_init(&executor, group) &&
+            executor.capacity &&
+            !executor.capacity(executor.userdata, &capacity) &&
+            capacity.suggested_subtasks > 0) {
+            worker_limit = capacity.suggested_subtasks + 1;
+            use_parallel = TRUE;
+        }
+    }
+
+    if (solver->index != context->bound_index ||
+        solver_hypothesis_context_plan_tasks(
+            context,
+            use_parallel ? worker_limit : 1) ||
+        context->state != SOLVER_HYPOTHESIS_CONTEXT_FROZEN) {
+        index_shard_aux_group_free(group);
+        context->state = SOLVER_HYPOTHESIS_CONTEXT_FAILED;
+        context->metrics.batches_failed++;
+        return -1;
+    }
+
+    context->state = SOLVER_HYPOTHESIS_CONTEXT_EXECUTING;
+    context->parallel_execution =
+        use_parallel && context->task_count > 1;
+
+    if (context->parallel_execution) {
+        rc = solver_hypothesis_execute_parallel(
+            context,
+            group,
+            &executor);
+    } else {
+        rc = solver_hypothesis_execute_serial(context);
+    }
+
+    index_shard_aux_group_free(group);
+
+    if (rc) {
+        context->metrics.search_failures++;
+        context->state = SOLVER_HYPOTHESIS_CONTEXT_FAILED;
+        context->metrics.batches_failed++;
+        ERROR("CodeKD hypothesis wave failed");
+        return -1;
+    }
+
+    if (unlikely(solver->quit_now)) {
+        context->state = SOLVER_HYPOTHESIS_CONTEXT_STOPPED;
+        context->metrics.batches_stopped++;
+        return 0;
+    }
+
+    if (context->next_reduce != context->count) {
+        context->state = SOLVER_HYPOTHESIS_CONTEXT_FAILED;
+        context->metrics.batches_failed++;
+        return -1;
+    }
+
+    context->state = SOLVER_HYPOTHESIS_CONTEXT_COMPLETE;
+    context->metrics.batches_completed++;
+    return 0;
+}
 /**
  This functions tries different permutations of the non-backbone
  stars C [, D [,E ] ]
@@ -1405,16 +2651,18 @@ static kdtree_qres_t *solver_codekd_rangesearch(
  slot: 0 on initial call; incremented on recursive calls
 
  */
-static void try_permutations(const int* origstars, int dimquad,
-                             const double* origcode,
-                             solver_t* solver, anbool current_parity,
-                             double tol2,
-                             int* stars, double* code,
-                             int slot, anbool* placed,
-                             kdtree_qres_t** presult) {
+static int try_permutations(const int* origstars,
+                            int dimquad,
+                            const double* origcode,
+                            solver_t* solver,
+                            anbool current_parity,
+                            double tol2,
+                            int* stars,
+                            double* code,
+                            int slot,
+                            anbool* placed,
+                            solver_hypothesis_context_t* context) {
     int i;
-    int options = KD_OPTIONS_SMALL_RADIUS | KD_OPTIONS_COMPUTE_DISTS |
-        KD_OPTIONS_NO_RESIZE_RESULTS | KD_OPTIONS_USE_SPLIT;
     double mycode[DCMAX];
     int Nstars = dimquad - NBACK;
     int lastslot = dimquad - NBACK - 1;
@@ -1446,18 +2694,21 @@ static void try_permutations(const int* origstars, int dimquad,
      elements are already filled by stars A and B.
      */
 
-    if (code == NULL)
+    if (code == NULL) {
         code = mycode;
+    }
 
     // try to convince the compiler that this is okay
-    if (slot >= DCMAX/2)
-        return;
+    if (slot >= DCMAX / 2) {
+        return 0;
+    }
 
     // We try putting each star that hasn't already been placed in
     // this "slot".
-    for (i=0; i<Nstars; i++) {
-        if (placed[i])
+    for (i = 0; i < Nstars; i++) {
+        if (placed[i]) {
             continue;
+        }
 
         // Check cx <= dx, if we're a "dx".
         if (slot > 0 && solver->index->cx_less_than_dx) {
@@ -1483,8 +2734,9 @@ static void try_permutations(const int* origstars, int dimquad,
             // mean(x) <= 1/2.
             int j;
             double meanx = 0;
-            for (j=0; j<=slot; j++)
+            for (j = 0; j <= slot; j++) {
                 meanx += code[2*j];
+            }
             meanx /= (slot+1);
             if (meanx > 0.5 + solver->cxdx_margin) {
                 debug("meanx <= 0.5 check failed: %g > 0.5 + %g\n",
@@ -1497,63 +2749,52 @@ static void try_permutations(const int* origstars, int dimquad,
         // If we have more slots to fill...
         if (slot < lastslot) {
             placed[i] = TRUE;
-            try_permutations(origstars, dimquad, origcode, solver,
-                             current_parity, tol2, stars, code,
-                             slot+1, placed, presult);
+            if (try_permutations(origstars,
+                                 dimquad,
+                                 origcode,
+                                 solver,
+                                 current_parity,
+                                 tol2,
+                                 stars,
+                                 code,
+                                 slot + 1,
+                                 placed,
+                                 context)) {
+                placed[i] = FALSE;
+                return -1;
+            }
             placed[i] = FALSE;
 
         } else {
 #if defined(TESTING_TRYPERMUTATIONS)
-            TEST_TRY_PERMUTATIONS(stars, code, dimquad, solver);
-            continue;
-#endif
-
+            TEST_TRY_PERMUTATIONS(stars,
+                                  code,
+                                  dimquad,
+                                  solver);
+#else
             /*
-            * CodeKD search.
-            *
-            * Product decomposition is disabled by default. Explicitly sampled
-            * searches may use only capacity admitted by the shared executor; every
-            * other query follows the scalar implementation.
-            */
-            *presult = solver_codekd_rangesearch(
-                solver,
-                *presult,
-                code,
-                tol2,
-                options);
-
-            if (!*presult) {
-                ERROR("CodeKD range search failed");
-                solver->quit_now = TRUE;
-                return;
+             * Preserve exact generation order while separating immutable
+             * search input from private result storage.
+             */
+            if (solver_hypothesis_context_append(context,
+                                                 stars,
+                                                 code,
+                                                 dimquad,
+                                                 current_parity,
+                                                 tol2)) {
+                ERROR("Failed to append CodeKD hypothesis descriptor");
+                return -1;
             }
-
-            if ((*presult)->nres) {
-                double pixvals[DQMAX * 2];
-                int j;
-
-                for (j = 0; j < dimquad; j++) {
-                    setx(pixvals, j, field_getx(solver, stars[j]));
-                    sety(pixvals, j, field_gety(solver, stars[j]));
-                }
-
-                resolve_matches(*presult,
-                                pixvals,
-                                stars,
-                                dimquad,
-                                solver,
-                                current_parity);
-            }
-
-            if (unlikely(solver->quit_now)) {
-                return;
-            }
+#endif
         }
     }
+
+    return 0;
 }
 
 static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
                             const int* fieldstars, int dimquads,
+                            int quads_tried,
                             solver_t* solver, anbool current_parity) {
     // "field_xy" contains the xy pixel coordinates of stars A,B,C,D forming the quad
     //    [x_A,y_A, x_B,y_B, x_C,y_C, ...]
@@ -1589,12 +2830,16 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
         startree_prefetch_stars(
             solver->index->starkd, star, dimquads);
 
-        for (i = 0; i < dimquads; i++) {
-            startree_get(solver->index->starkd,
-                         star[i],
-                         starxyz + 3 * i);
+        if (solver->use_radec) {
+            /*
+             * Preserve the original all-star loading and rejection order
+             * when the sky-position constraint depends on every quad star.
+             */
+            for (i = 0; i < dimquads; i++) {
+                startree_get(solver->index->starkd,
+                             star[i],
+                             starxyz + 3 * i);
 
-            if (solver->use_radec) {
                 if (distsq(starxyz + 3 * i,
                            solver->centerxyz,
                            3) > solver->r2) {
@@ -1602,11 +2847,22 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
                     break;
                 }
             }
-        }
-        if (outofbounds) {
-            debug("Quad match is out of bounds.\n");
-            solver->num_radec_skipped++;
-            continue;
+            if (outofbounds) {
+                debug("Quad match is out of bounds.\n");
+                solver->num_radec_skipped++;
+                continue;
+            }
+        } else {
+            /*
+             * The quick scale gate uses only A and B. Delay C/D/E decoding
+             * until the candidate has passed that gate.
+             */
+            startree_get(solver->index->starkd,
+                         star[0],
+                         starxyz);
+            startree_get(solver->index->starkd,
+                         star[1],
+                         starxyz + 3);
         }
 
         debug("        stars [");
@@ -1622,6 +2878,14 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
             abscale < solver->abscale_low) {
             solver->num_abscale_skipped++;
             continue;
+        }
+
+        if (!solver->use_radec) {
+            for (i = 2; i < dimquads; i++) {
+                startree_get(solver->index->starkd,
+                             star[i],
+                             starxyz + 3 * i);
+            }
         }
 
         // compute TAN projection from the matching quad alone.
@@ -1647,7 +2911,7 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
         mo.code_err = krez->sdists[jj];
         mo.scale = arcsecperpix;
         mo.parity = current_parity;
-        mo.quads_tried = solver->numtries;
+        mo.quads_tried = quads_tried;
         mo.quads_matched = solver->nummatches;
         mo.quads_scaleok = solver->numscaleok;
         mo.quad_npeers = krez->nres;
@@ -1972,6 +3236,11 @@ solver_t* solver_new() {
 
 void solver_set_default_values(solver_t* solver) {
     memset(solver, 0, sizeof(solver_t));
+
+    fitsbin_mmap_advice_state_init(
+        &solver->index_mmap_policy,
+        fitsbin_get_configured_mmap_policy());
+
     solver->indexes = pl_new(16);
     solver->funits_upper = LARGE_VAL;
     solver->logratio_bail_threshold = log(1e-100);

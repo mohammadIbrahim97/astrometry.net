@@ -7,9 +7,19 @@
 
 typedef struct index_shard_config {
   anbool pthread_enabled;
-  anbool trace_enabled;
+  anbool discovery_frontier_enabled;
+  anbool hypothesis_parallel_enabled;
+  anbool inner_lending_enabled;
 
   int worker_count;
+
+  /*
+   * The continuation API remains available for exact stepped traversal.
+   * Production one-shot queries use the scalar fast path represented by a
+   * zero node budget until coarse hypothesis tasks activate resumability.
+   */
+  anbool kd_continuation_enabled;
+  size_t kd_continuation_node_budget;
 
   unsigned long kd_product_interval;
 } index_shard_config_t;
@@ -17,7 +27,8 @@ typedef struct index_shard_config {
 /*
  * Return the immutable process configuration.
  *
- * Environment and platform defaults are resolved exactly once.
+ * ASTROMETRY_INDEX_SHARD_WORKERS is the only environment input. Platform
+ * defaults and all internal policies are resolved exactly once.
  */
 const index_shard_config_t *index_shard_config_get(void);
 

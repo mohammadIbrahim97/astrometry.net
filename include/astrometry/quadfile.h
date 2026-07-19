@@ -57,6 +57,11 @@ int quadfile_check(const quadfile_t* qf);
 int quadfile_get_stars(const quadfile_t* qf, unsigned int quadid,
                        unsigned int* stars);
 
+// Schedules the mapped rows for a bounded group of upcoming quad lookups.
+int quadfile_prefetch_stars(const quadfile_t* qf,
+                            const unsigned int* quadids,
+                            int nquads);
+
 int quadfile_write_quad(quadfile_t* qf, unsigned int* stars);
 
 int quadfile_dimquads(const quadfile_t* qf);

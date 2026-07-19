@@ -7,6 +7,7 @@
 #define KDTREE_H
 
 #include <stdio.h>
+#include <stddef.h>
 #include <stdint.h>
 
 
@@ -18,6 +19,7 @@
 
 enum kd_rangesearch_options {
     KD_OPTIONS_COMPUTE_DISTS    = 0x1,
+    /* Materialize matching point coordinates in kdtree_qres_t.results. */
     KD_OPTIONS_RETURN_POINTS    = 0x2,
     KD_OPTIONS_SORT_DISTS       = 0x4,
     KD_OPTIONS_SMALL_RADIUS     = 0x8,
@@ -140,6 +142,10 @@ typedef struct kdtree kdtree_t;
 struct kdtree_qres;
 typedef struct kdtree_qres kdtree_qres_t;
 
+struct kdtree_rangesearch_continuation;
+typedef struct kdtree_rangesearch_continuation
+    kdtree_rangesearch_continuation_t;
+
 struct kdtree_funcs {
     void* (*get_data)(const kdtree_t* kd, int i);
     void  (*copy_data_double)(const kdtree_t* kd, int start, int N, double* dest);
@@ -151,6 +157,28 @@ struct kdtree_funcs {
 
     void  (*nearest_neighbour_internal)(const kdtree_t* kd, const void* query, double* bestd2, int* pbest);
     kdtree_qres_t* (*rangesearch)(const kdtree_t* kd, kdtree_qres_t* res, const void* pt, double maxd2, int options);
+
+    /*
+     * Private resumable split-tree range-search implementation.
+     * Public callers continue to use the existing one-call API.
+     */
+    int (*rangesearch_continuation_init)(
+        kdtree_rangesearch_continuation_t* continuation,
+        const kdtree_t* kd,
+        kdtree_qres_t* res,
+        const void* pt,
+        double maxd2,
+        int options);
+
+    int (*rangesearch_continuation_step)(
+        kdtree_rangesearch_continuation_t* continuation,
+        size_t node_budget);
+
+    kdtree_qres_t* (*rangesearch_continuation_finish)(
+        kdtree_rangesearch_continuation_t* continuation);
+
+    void (*rangesearch_continuation_cleanup)(
+        kdtree_rangesearch_continuation_t* continuation);
 
     void (*nodes_contained)(const kdtree_t* kd,
                             const void* querylow, const void* queryhi,
@@ -587,7 +615,9 @@ kdtree_qres_t* KDFUNC(kdtree_rangesearch_nosort)(const kdtree_t *kd, const void 
 
 /*
  Like kdtree_rangesearch, but you get to call the shots; see
- kd_rangesearch_options for what the "options" are.
+ kd_rangesearch_options for what the "options" are.  Point coordinates
+ are returned only when KD_OPTIONS_RETURN_POINTS is set; indices and any
+ requested squared distances remain available independently.
  */
 kdtree_qres_t* KDFUNC(kdtree_rangesearch_options)(const kdtree_t *kd, const void *pt, double maxd2, int options);
 

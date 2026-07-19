@@ -96,6 +96,7 @@ struct augment_xylist_s {
     int parity;
 
     float cpulimit;
+    double wall_limit;
 
     anbool tweak;
     int tweakorder;
