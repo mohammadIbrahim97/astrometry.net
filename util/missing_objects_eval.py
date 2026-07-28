@@ -46,9 +46,9 @@ except ImportError:
 
 IMG_EXTS = (".fits", ".fit", ".fts", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
 DEFAULT_BANDS = (
-    ("0.50-0.70", 0.50, 0.70, 10),
-    ("0.70-0.85", 0.70, 0.85, 10),
-    ("0.85-1.00", 0.85, 1.000000001, 10),
+    ("0.00-0.15", 0.0, 0.15, 10),
+    ("0.15-0.30", 0.15, 0.30, 10),
+    ("0.30-0.50", 0.30, 0.500000001, 10),
 )
 SCORE_FIELDS = ("image", "status", "fwhm", "ellipticity", "n_sources", "score", "error")
 SELECTION_FIELDS = ("image", "band", "score", "fwhm", "ellipticity", "n_sources")

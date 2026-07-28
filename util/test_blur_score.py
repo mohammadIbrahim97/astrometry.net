@@ -54,17 +54,17 @@ class TestBlurScore(unittest.TestCase):
         self.assertGreaterEqual(s, 0.0)
         self.assertLessEqual(s, 1.0)
 
-    def test_sharp_better_than_blurred(self):
+    def test_sharp_scores_lower_than_blurred(self):
         sharp = self._save("sharp", _starfield(40, fwhm=3.0, seed=2))
         blurry = self._save("blurry", _starfield(40, fwhm=8.0, seed=2))
-        self.assertGreater(compute_blur_score(sharp),
-                           compute_blur_score(blurry))
+        self.assertLess(compute_blur_score(sharp),
+                        compute_blur_score(blurry))
 
-    def test_round_better_than_streaked(self):
+    def test_round_scores_lower_than_streaked(self):
         round_p = self._save("round", _starfield(40, fwhm=3.0, ellipticity=0.0, seed=3))
         streaked = self._save("streaked", _starfield(40, fwhm=3.0, ellipticity=0.6, seed=3))
-        self.assertGreater(compute_blur_score(round_p),
-                           compute_blur_score(streaked))
+        self.assertLess(compute_blur_score(round_p),
+                        compute_blur_score(streaked))
 
     def test_determinism(self):
         path = self._save("det", _starfield(40, fwhm=3.0, seed=42))
@@ -78,15 +78,15 @@ class TestBlurScore(unittest.TestCase):
 
     def test_score_from_psf_formula(self):
         # Perfect: target FWHM, round, saturated count
-        self.assertEqual(score_from_psf(3.0, 0.0, 10, target_fwhm=3.0), 1.0)
-        # FWHM 2x target → halves the score
+        self.assertEqual(score_from_psf(3.0, 0.0, 10, target_fwhm=3.0), 0.0)
+        # FWHM 2x target → halfway blurred
         self.assertAlmostEqual(score_from_psf(6.0, 0.0, 10, target_fwhm=3.0), 0.5)
-        # Heavy ellipticity → halves the score
+        # Heavy ellipticity → halfway blurred
         self.assertAlmostEqual(score_from_psf(3.0, 0.5, 10, target_fwhm=3.0), 0.5)
         # Few sources → linear penalty
         self.assertAlmostEqual(score_from_psf(3.0, 0.0, 5, target_fwhm=3.0), 0.5)
         # Degenerate FWHM
-        self.assertEqual(score_from_psf(0.0, 0.0, 10, target_fwhm=3.0), 0.0)
+        self.assertEqual(score_from_psf(0.0, 0.0, 10, target_fwhm=3.0), 1.0)
 
 
 if __name__ == "__main__":

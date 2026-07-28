@@ -2,14 +2,14 @@
 
 Runs source-extractor to detect stars, takes the median FWHM and
 ellipticity of the brightest detections, and maps to a [0, 1] score
-(1 = sharp pinpoint stars, 0 = severely blurred).
+(0 = sharp pinpoint stars, 1 = severely blurred).
 
 The score is FWHM-driven (penalizing wide PSFs from defocus / poor
 seeing), down-weighted by ellipticity (penalizing tracking-error
 streaks), and down-weighted by source count (severely blurred frames
 lose faint stars below the detection threshold). Satellite trails do
 not affect the score: the metric is local to detected stars, so a
-single bright trail on an otherwise sharp frame still scores high.
+single bright trail on an otherwise sharp frame still scores low.
 """
 import os
 import shutil
@@ -206,9 +206,9 @@ def measure_psf(image, bright_quantile=BRIGHT_QUANTILE, **kwargs):
 
 
 def compute_blur_score(image, target_fwhm=DEFAULT_TARGET_FWHM, **kwargs):
-    """Return blur score in [0, 1]. 1 = sharp, 0 = severely blurred.
+    """Return blur score in [0, 1]. 0 = sharp, 1 = severely blurred.
 
-    score = fwhm_score * shape_weight * count_weight, where
+    score = 1 - fwhm_score * shape_weight * count_weight, where
         fwhm_score   = clip(target_fwhm / median_bright_fwhm, 0, 1)
         shape_weight = clip(1 - median_bright_ellipticity, 0, 1)
         count_weight = clip(n_bright / COUNT_SATURATION, 0, 1)
@@ -220,14 +220,14 @@ def score_from_psf(fwhm, ecc, n_bright, target_fwhm):
     fwhm_score = min(1.0, target_fwhm / fwhm) if fwhm > 0 else 0.0
     shape_weight = max(0.0, 1.0 - ecc)
     count_weight = min(1.0, n_bright / COUNT_SATURATION)
-    return float(fwhm_score * shape_weight * count_weight)
+    return float(1.0 - fwhm_score * shape_weight * count_weight)
 
 
 def _main(argv=None):
     import argparse, sys
     p = argparse.ArgumentParser(
         prog="blur_score",
-        description="Astro blur score (1 = sharp, 0 = blurred) via stellar PSF.",
+        description="Astro blur score (0 = sharp, 1 = blurred) via stellar PSF.",
     )
     p.add_argument("image")
     p.add_argument("--backend", choices=SOURCE_BACKENDS, default=BACKEND_SOURCE_EXTRACTOR)
