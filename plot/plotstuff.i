@@ -125,7 +125,7 @@ void free(void* ptr);
         Py_DECREF($result);
         $result = PyList_New(3);
         for (i=0; i<3; i++) {
-            PyObject *o = PyInt_FromLong((long)$1[i]);
+            PyObject *o = PyLong_FromLong((long)$1[i]);
             PyList_SetItem($result,i,o);
         }
     }
@@ -142,7 +142,7 @@ void free(void* ptr);
     for (i=0; i<3; i++) {
         PyObject *o = PySequence_GetItem($input, i);
         if (PyNumber_Check(o)) {
-            temp[i] = (int)PyInt_AsLong(o);
+            temp[i] = (int)PyLong_AsLong(o);
         } else {
             PyErr_SetString(PyExc_ValueError,"Sequence elements must be numbers");
             return NULL;
