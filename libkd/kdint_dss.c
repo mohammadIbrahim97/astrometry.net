@@ -3,6 +3,9 @@
 # Licensed under a 3-clause BSD style license - see LICENSE
 */
 
+#include <errno.h>
+#include <limits.h>
+
 #include "kdtree.h"
 #include "kdtree_internal_common.h"
 
@@ -49,4 +52,3 @@
 #undef KDTREE_CODEKD_DSS_U16_FAST_PATH
 
 #include "kdtree_internal_fits.c"
-

@@ -59,8 +59,6 @@ CFLAGS += $(ANFILES_INC)
 CFLAGS += -I$(ANUTILS_DIR)
 # wcs-resample.h
 CFLAGS += -I.
-# private Product-KD/executor interfaces
-CFLAGS += -I$(BASEDIR)/libkd
 CFLAGS += $(CFITS_INC)
 
 SHAREDLIBFLAGS := $(SHAREDLIBFLAGS_DEF)
@@ -118,10 +116,28 @@ ANLIBS := $(ANFILES_LIB) $(LIBKD_LIB) $(ANUTILS_LIB) $(GSL_LIB) $(QFITS_LIB)
 
 INSTALL_LIB := $(ENGINE_LIB) $(ENGINE_SO)
 
-ENGINE_OBJS := \
-		engine.o solverutils.o onefield.o index_shard.o solver.o quad-utils.o \
-		solvedfile.o tweak2.o index_shard_config.o \
-		verify.o tweak.o
+ENGINE_CORE_OBJS := engine.o engine_job.o engine_pass.o engine_policy.o \
+	engine_residency.o
+ONEFIELD_OBJS := onefield.o onefield_job_cache.o onefield_index_shard.o
+INDEX_SHARD_OBJS := index_shard.o index_shard_control.o \
+	index_shard_helper.o index_shard_inverse.o index_shard_pass.o \
+	index_shard_pool.o index_shard_profile.o index_shard_reducer.o \
+	index_shard_scheduler.o index_shard_staged.o index_shard_worker.o \
+	index_shard_config.o
+SOLVER_CORE_OBJS := solver.o solver_profile.o solver_field_geometry.o \
+	solver_hypothesis.o
+SOLVER_CODEKD_OBJS := solver_codekd_plan.o solver_codekd_delivery.o \
+	solver_codekd_verification.o solver_codekd_staged.o \
+	solver_codekd_retire.o
+VERIFY_OBJS := verify.o verify_score.o verify_projection.o verify_prepared.o
+CONTROL_PROGRAM_ENGINE_OBJS := $(ENGINE_CORE_OBJS) codetree.o codefile.o \
+	$(ONEFIELD_OBJS) $(INDEX_SHARD_OBJS) solverutils.o quad-utils.o \
+	image2xy-files.o solvedfile.o $(SOLVER_CORE_OBJS) \
+	$(SOLVER_CODEKD_OBJS) tweak2.o $(VERIFY_OBJS)
+
+ENGINE_OBJS := $(ENGINE_CORE_OBJS) solverutils.o $(ONEFIELD_OBJS) \
+	$(INDEX_SHARD_OBJS) $(SOLVER_CORE_OBJS) $(SOLVER_CODEKD_OBJS) \
+	solvedfile.o tweak2.o $(VERIFY_OBJS) tweak.o
 
 # These are required by solve-field and friends
 ENGINE_OBJS += new-wcs.o fits-guess-scale.o cut-table.o \
@@ -134,10 +150,21 @@ ENGINE_OBJS += $(BUILD_INDEX_OBJS)
 
 #augment-xylist.o
 
+CORE_STATE_HEADERS := engine_internal.h engine_private.h \
+	index_shard_internal.h index_shard_private.h index_shard_config.h \
+	onefield_internal.h solver_codekd_internal.h \
+	solver_field_geometry_internal.h solver_inline_internal.h \
+	solver_hypothesis_internal.h solver_profile_internal.h \
+	verify_internal.h verify_prepared_internal.h \
+	../include/astrometry/index_shard.h \
+	../include/astrometry/onefield.h ../include/astrometry/solver.h \
+	../include/astrometry/fitsbin.h ../include/astrometry/starkd.h
+
 $(ENGINE_LIB): $(ENGINE_OBJS)
 	-rm -f $@
 	$(AR) rc $@ $(ENGINE_OBJS)
 	$(RANLIB) $@
+
 
 $(ENGINE_SO): $(ENGINE_OBJS) $(SLIB)
 	$(CC) $(LDFLAGS) $(SHAREDLIBFLAGS) -o $@ $^ $(LDLIBS)
@@ -163,10 +190,12 @@ INSTALL_H := allquads.h augment-xylist.h axyfile.h \
 	unpermute-quads.h unpermute-stars.h verify.h \
 	tweak2.h
 
-ALL_OBJ := $(UTIL_OBJS) $(KDTREE_OBJS) $(QFITS_OBJ) \
+ALL_OBJ := $(UTIL_OBJS) $(KDTREE_OBJS) $(QFITS_OBJ) $(ENGINE_OBJS) \
 	$(PIPELINE_MAIN_OBJ) $(PROSPECTUS_MAIN_OBJ) $(CFITS_UTILS_MAIN_OBJ) \
 	$(FITS_UTILS_MAIN_OBJ) $(OTHER_OBJS)
 ALL_EXECS :=
+
+include makefile.solver-tests
 
 all: $(QFITS_SLIB) $(LIBKD_LIB_FILE) \
 	$(ANUTILS_LIB_FILE) $(ANFILES_LIB_FILE) \
@@ -240,11 +269,10 @@ install-cfitsutils: $(CFITS_UTILS)
 		$(CP) $$x '$(INSTALL_DIR)/bin'; \
 	done
 
-test-solver: test-solver.o solver_test.o $(SLIB)
-test-solver-2: test-solver-2.o solver_test_2.o $(SLIB)
-
-NODEP_OBJS += solver_test.o solver_test_2.o
-ALL_OBJ += test-solver.o test-solver-2.o
+test-solver: test-solver.o solver_test.o test-solver-geometry.o \
+	test-solver-regressions.o $(SLIB)
+test-solver-2: test-solver-2.o solver_test_2.o test-solver-codekd.o \
+	solver_codekd_test_support.o $(SLIB)
 
 CFLAGS_DEBUG = $(subst -DNDEBUG,,$(CFLAGS))
 
@@ -253,11 +281,9 @@ test-solver.o: test-solver.c
 test-solver-2.o: test-solver-2.c
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
 
-solver_test.o: solver.c
-	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -DTESTING=1 -DTESTING_TRYALLCODES=1 -o $@ -c $<
-solver_test_2.o: solver.c
-	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -DTESTING=1 -DTESTING_TRYPERMUTATIONS=1 -o $@ -c $<
-
+$(ENGINE_CORE_OBJS) $(ONEFIELD_OBJS) $(INDEX_SHARD_OBJS) \
+	$(SOLVER_CORE_OBJS) $(SOLVER_CODEKD_OBJS) $(VERIFY_OBJS): \
+	$(CORE_STATE_HEADERS)
 
 #######################################
 
@@ -278,7 +304,10 @@ ALL_TEST_LIBS := $(SLIB)
 # Add the dependencies here...
 #test_multiindex2: test_multiindex2.o $(SLIB)
 
-tests: $(ALL_TEST_FILES)
+tests: $(ALL_TEST_FILES) test-index-shard-config \
+	test-index-shard-staged \
+	test-engine-passes test-solver-parallel-integration \
+	test-verify-theta-tail
 .PHONY: tests
 
 include $(COMMON)/makefile.tests
@@ -301,13 +330,14 @@ ALL_OBJ += control-program.o
 
 # This is an extra makefile target that explicitly lists all the object files required
 # to link the control-program.o (including the FITS reading part).
-control-program-2: control-program.o $(SLIB)
+control-program-2: control-program.o $(CONTROL_PROGRAM_ENGINE_OBJS) $(SLIB)
 	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) control-program.o \
-		engine.o codetree.o codefile.o onefield.o solverutils.o quad-utils.o image2xy-files.o solvedfile.o solver.o tweak2.o verify.o \
+		$(CONTROL_PROGRAM_ENGINE_OBJS) \
 		$(addprefix ../qfits-an/,anqfits.o qfits_tools.o qfits_table.o qfits_float.o qfits_error.o qfits_time.o qfits_card.o qfits_header.o qfits_rw.o qfits_memory.o qfits_convert.o qfits_byteswap.o) \
 		$(addprefix ../libkd/,kdtree.o kdtree_dim.o kdtree_fits_io.o kdint_ddd.o kdint_dds.o kdint_ddu.o kdint_dss.o kdint_duu.o kdint_fff.o kdint_lll.o) \
-		$(addprefix ../util/,index.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
+		$(addprefix ../util/,index.o index_residency.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starkd_payload.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsbin_mmap.o fitsbin_payload_source.o fitsbin_payload_plan.o fitsbin_payload_service.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
 		$(CFITS_LIB) $(LDLIBS)
+ALL_EXECS += control-program-2
 
 whynot: whynot.o $(PLOTSTUFF) $(CAIRO_SLIB) $(SLIB)
 	$(CC) -o $@ $(LDFLAGS) $^ $(CAIRO_LIBS) $(LDLIBS)
@@ -373,7 +403,7 @@ py: pysolver
 pysolver: _solver$(PYTHON_SO_EXT)
 .PHONY: pysolver
 
-_solver$(PYTHON_SO_EXT): solver.i $(ENGINE_OBJS)
+_solver$(PYTHON_SO_EXT): solver.i setup-solver.py $(ENGINE_OBJS) $(SLIB)
 	LDFLAGS="$(LDFLAGS)" LDLIBS="$(LDLIBS)" \
 	SLIB="$(SLIB)" \
 	INC="$(ANFILES_INC)" \

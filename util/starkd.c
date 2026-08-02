@@ -3,11 +3,14 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "starkd.h"
+#include "starkd_internal.h"
 #include "kdtree.h"
 #include "kdtree_fits_io.h"
 #include "starutil.h"
@@ -131,21 +134,26 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
     int i, N;
 
     opts = KD_OPTIONS_SMALL_RADIUS;
-    if (xyzresults || radecresults)
+    if (xyzresults || radecresults) {
         opts |= KD_OPTIONS_RETURN_POINTS;
+    }
 
     res = kdtree_rangesearch_options(s->tree, xyzcenter, radius2, opts);
 
     if (!res || !res->nres) {
-        if (xyzresults)
+        if (xyzresults) {
             *xyzresults = NULL;
-        if (radecresults)
+        }
+        if (radecresults) {
             *radecresults = NULL;
-        if (starinds)
+        }
+        if (starinds) {
             *starinds = NULL;
+        }
         *nresults = 0;
-        if (res)
+        if (res) {
             kdtree_free_query(res);
+        }
         return;
     }
 
@@ -155,8 +163,9 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
 
     if (radecresults) {
         *radecresults = malloc(N * 2 * sizeof(double));
-        for (i=0; i<N; i++)
+        for (i=0; i<N; i++) {
             xyzarr2radecdegarr(xyz + i*3, (*radecresults) + i*2);
+        }
     }
     if (xyzresults) {
         // Steal the results array.
@@ -165,8 +174,9 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
     }
     if (starinds) {
         *starinds = malloc(res->nres * sizeof(int));
-        for (i=0; i<N; i++)
+        for (i=0; i<N; i++) {
             (*starinds)[i] = res->inds[i];
+        }
     }
     kdtree_free_query(res);
 }
@@ -214,7 +224,8 @@ static bl* get_chunks(startree_t* s, il* wordsizes) {
     return chunks;
 }
 
-static startree_t* my_open(const char* fn, anqfits_t* fits) {
+static startree_t* my_open(const char* fn, anqfits_t* fits,
+                           anbool metadata_only) {
     struct timeval tv1, tv2;
     startree_t* s;
     bl* chunks;
@@ -252,7 +263,11 @@ static startree_t* my_open(const char* fn, anqfits_t* fits) {
     debug("kdtree_fits_contains_tree() took %g ms\n", millis_between(&tv1, &tv2));
 
     gettimeofday(&tv1, NULL);
-    s->tree = kdtree_fits_read_tree(io, treename, &s->header);
+    if (metadata_only) {
+        s->tree = kdtree_fits_read_tree_header(io, treename, &s->header);
+    } else {
+        s->tree = kdtree_fits_read_tree(io, treename, &s->header);
+    }
     gettimeofday(&tv2, NULL);
     debug("kdtree_fits_read_tree() took %g ms\n", millis_between(&tv1, &tv2));
     if (!s->tree) {
@@ -266,20 +281,23 @@ static startree_t* my_open(const char* fn, anqfits_t* fits) {
         logverb("File %s contains a kd-tree with dim %i (not 3), named %s\n",
                 thefn, s->tree->ndim, treename);
         s->tree->io = NULL;
+        s->tree->io_is_fitsbin = FALSE;
         goto bailout;
     }
 
-    gettimeofday(&tv1, NULL);
-    chunks = get_chunks(s, NULL);
-    for (i=0; i<bl_size(chunks); i++) {
-        fitsbin_chunk_t* chunk = bl_access(chunks, i);
-        void** dest = chunk->userdata;
-        kdtree_fits_read_chunk(io, chunk);
-        *dest = chunk->data;
+    if (!metadata_only) {
+        gettimeofday(&tv1, NULL);
+        chunks = get_chunks(s, NULL);
+        for (i=0; i<bl_size(chunks); i++) {
+            fitsbin_chunk_t* chunk = bl_access(chunks, i);
+            void** dest = chunk->userdata;
+            kdtree_fits_read_chunk(io, chunk);
+            *dest = chunk->data;
+        }
+        bl_free(chunks);
+        gettimeofday(&tv2, NULL);
+        debug("reading chunks took %g ms\n", millis_between(&tv1, &tv2));
     }
-    bl_free(chunks);
-    gettimeofday(&tv2, NULL);
-    debug("reading chunks took %g ms\n", millis_between(&tv1, &tv2));
 
     // kdtree_fits_t is a typedef of fitsbin_t
     fitsbin_close_fd(io);
@@ -293,11 +311,15 @@ static startree_t* my_open(const char* fn, anqfits_t* fits) {
 }
 
 startree_t* startree_open_fits(anqfits_t* fits) {
-    return my_open(NULL, fits);
+    return my_open(NULL, fits, FALSE);
+}
+
+startree_t* startree_open_fits_metadata(anqfits_t* fits) {
+    return my_open(NULL, fits, TRUE);
 }
 
 startree_t* startree_open(const char* fn) {
-    return my_open(fn, NULL);
+    return my_open(fn, NULL, FALSE);
 }
 
 /*
@@ -308,23 +330,28 @@ startree_t* startree_open(const char* fn) {
  }
  */
 int startree_close(startree_t* s) {
-    if (!s) return 0;
-    if (s->inverse_perm)
+    if (!s) {
+        return 0;
+    }
+    if (s->inverse_perm && s->inverse_perm_owned) {
         free(s->inverse_perm);
-    if (s->header)
+    }
+    if (s->header) {
         qfits_header_destroy(s->header);
+    }
     if (s->tree) {
         if (s->writing) {
             free(s->tree->data.any);
             s->tree->data.any = NULL;
             kdtree_free(s->tree);
             free(s->sweep);
-        }
-        else
+        } else {
             kdtree_fits_close(s->tree);
+        }
     }
-    if (s->tagalong)
+    if (s->tagalong) {
         fitstable_close(s->tagalong);
+    }
     free(s);
     return 0;
 }
@@ -389,7 +416,7 @@ anbool startree_has_tagalong(startree_t* s) {
     return (startree_get_tagalong(s) != NULL);
 }
 
-static int Ndata(const startree_t* s) {
+int startree_data_count_internal(const startree_t* s) {
     return s->tree->ndata;
 }
 
@@ -397,8 +424,8 @@ int startree_check_inverse_perm(startree_t* s) {
     // ensure that each value appears exactly once.
     int i, N;
     uint8_t* counts;
-    N = Ndata(s);
-    counts = calloc(Ndata(s), sizeof(uint8_t));
+    N = startree_data_count_internal(s);
+    counts = calloc(startree_data_count_internal(s), sizeof(uint8_t));
     for (i=0; i<N; i++) {
         assert(s->inverse_perm[i] >= 0);
         assert(s->inverse_perm[i] < N);
@@ -411,29 +438,196 @@ int startree_check_inverse_perm(startree_t* s) {
 }
 
 void startree_compute_inverse_perm(startree_t* s) {
-    if (s->inverse_perm)
+    int* inverse_perm = NULL;
+    fitsbin_t* fb = NULL;
+    fitsbin_mmap_advice_t restore_advice =
+        FITSBIN_MMAP_ADVICE_NORMAL;
+    size_t inverse_bytes;
+    size_t permutation_bytes;
+    int range_advice_status = 0;
+    anbool callback_prepared = FALSE;
+    anbool restore_range = FALSE;
+
+    if (!s || s->inverse_perm) {
         return;
+    }
+    if (!s->tree || startree_data_count_internal(s) <= 0) {
+        return;
+    }
+    if ((size_t)startree_data_count_internal(s) >
+            SIZE_MAX / sizeof(*s->tree->perm) ||
+        (size_t)startree_data_count_internal(s) >
+            SIZE_MAX / sizeof(*inverse_perm)) {
+        fprintf(stderr, "Star kdtree inverse permutation is too large.\n");
+        return;
+    }
+    permutation_bytes =
+        (size_t)startree_data_count_internal(s) * sizeof(*s->tree->perm);
+    inverse_bytes =
+        (size_t)startree_data_count_internal(s) * sizeof(*inverse_perm);
+
+    if (s->inverse_prepare_callback) {
+        callback_prepared = TRUE;
+        s->inverse_prepare_callback(
+            s->inverse_callback_opaque,
+            inverse_bytes);
+        if (s->inverse_perm) {
+            goto cleanup;
+        }
+    }
+
+    /*
+     * kdtree_inverse_permutation() is a compulsory sequential sweep over
+     * PERM. Apply NORMAL only to this range for the duration of the sweep;
+     * DATA and every unrelated FITS chunk retain the current index policy.
+     */
+    if (s->tree->perm && s->tree->io) {
+        fb = (fitsbin_t*)s->tree->io;
+        restore_advice = fitsbin_get_mmap_advice(fb);
+        if (restore_advice != FITSBIN_MMAP_ADVICE_NORMAL) {
+            range_advice_status = fitsbin_set_mmap_range_advice(
+                fb,
+                s->tree->perm,
+                permutation_bytes,
+                FITSBIN_MMAP_ADVICE_NORMAL);
+            if (range_advice_status > 0) {
+                restore_range = TRUE;
+            } else if (range_advice_status < 0) {
+                SYSERROR("Failed to apply sequential StarKD PERM "
+                         "mmap advice");
+            }
+        }
+    }
+
     // compute inverse permutation vector.
-    s->inverse_perm = malloc(Ndata(s) * sizeof(int));
-    if (!s->inverse_perm) {
+    inverse_perm = malloc(inverse_bytes);
+    if (!inverse_perm) {
         fprintf(stderr, "Failed to allocate star kdtree inverse permutation vector.\n");
-        return;
+        goto cleanup;
     }
 #ifndef NDEBUG
     {
         int i;
-        for (i=0; i<Ndata(s); i++)
-            s->inverse_perm[i] = -1;
+        for (i=0; i<startree_data_count_internal(s); i++)
+            inverse_perm[i] = -1;
     }
 #endif
-    kdtree_inverse_permutation(s->tree, s->inverse_perm);
+    kdtree_inverse_permutation(s->tree, inverse_perm);
 #ifndef NDEBUG
     {
         int i;
-        for (i=0; i<Ndata(s); i++)
-            assert(s->inverse_perm[i] != -1);
+        for (i=0; i<startree_data_count_internal(s); i++)
+            assert(inverse_perm[i] != -1);
     }
 #endif
+    /*
+     * Publish only the complete vector. Callers serialize construction for a
+     * shared live index; ordinary single-owner paths need no extra lock.
+     */
+    s->inverse_perm = inverse_perm;
+    s->inverse_perm_owned = TRUE;
+    inverse_perm = NULL;
+
+cleanup:
+    free(inverse_perm);
+    if (callback_prepared &&
+        s->inverse_complete_callback) {
+        s->inverse_complete_callback(
+            s->inverse_callback_opaque,
+            inverse_bytes,
+            s->inverse_perm != NULL);
+    }
+    if (restore_range) {
+        if (fitsbin_set_mmap_range_advice(
+                fb,
+                s->tree->perm,
+                permutation_bytes,
+                restore_advice) <= 0) {
+            SYSERROR("Failed to restore StarKD PERM mmap advice");
+            /*
+             * The owning fitsbin still records the payload policy. Reapply it
+             * to all existing chunks as a conservative recovery path.
+             */
+            if (fitsbin_set_mmap_advice(
+                    fb,
+                    FITSBIN_MMAP_ADVICE_NORMAL,
+                    FALSE) ||
+                fitsbin_set_mmap_advice(
+                    fb,
+                    restore_advice,
+                    TRUE)) {
+                SYSERROR("Failed to restore StarKD mmap policy");
+            }
+        }
+    }
+}
+
+int* startree_take_inverse_perm(startree_t* s) {
+    int* inverse_perm;
+
+    if (!s || !s->inverse_perm || !s->inverse_perm_owned) {
+        return NULL;
+    }
+    inverse_perm = s->inverse_perm;
+    s->inverse_perm = NULL;
+    s->inverse_perm_owned = FALSE;
+    return inverse_perm;
+}
+
+int startree_borrow_inverse_perm(startree_t* s,
+                                 int* inverse_perm,
+                                 int count) {
+    if (!s || !s->tree || !inverse_perm ||
+        count != startree_data_count_internal(s) || s->inverse_perm) {
+        return -1;
+    }
+    s->inverse_perm = inverse_perm;
+    s->inverse_perm_owned = FALSE;
+    return 0;
+}
+
+int* startree_release_borrowed_inverse_perm(startree_t* s) {
+    int* inverse_perm;
+
+    if (!s || !s->inverse_perm || s->inverse_perm_owned) {
+        return NULL;
+    }
+    inverse_perm = s->inverse_perm;
+    s->inverse_perm = NULL;
+    return inverse_perm;
+}
+
+int startree_set_inverse_perm_callbacks(
+    startree_t* s,
+    void (*prepare_callback)(void* opaque, size_t bytes),
+    void (*complete_callback)(void* opaque,
+                              size_t bytes,
+                              anbool allocated),
+    void* opaque) {
+    if (!s || !prepare_callback || !complete_callback ||
+        s->inverse_perm ||
+        s->inverse_prepare_callback ||
+        s->inverse_complete_callback ||
+        s->inverse_callback_opaque) {
+        return -1;
+    }
+    s->inverse_prepare_callback = prepare_callback;
+    s->inverse_complete_callback = complete_callback;
+    s->inverse_callback_opaque = opaque;
+    return 0;
+}
+
+int startree_clear_inverse_perm_callbacks(
+    startree_t* s,
+    void* opaque) {
+    if (!s ||
+        s->inverse_callback_opaque != opaque) {
+        return -1;
+    }
+    s->inverse_prepare_callback = NULL;
+    s->inverse_complete_callback = NULL;
+    s->inverse_callback_opaque = NULL;
+    return 0;
 }
 
 int startree_get_cut_nside(const startree_t* s) {
@@ -478,12 +672,12 @@ void startree_set_jitter(startree_t* s, double jitter_arcsec) {
 }
 
 int startree_get_sweep(const startree_t* s, int ind) {
-    if (ind < 0 || ind >= Ndata(s) || !s->sweep)
+    if (ind < 0 || ind >= startree_data_count_internal(s) || !s->sweep)
         return -1;
     return s->sweep[ind];
 }
 
-static int startree_data_index(startree_t* s, int starid) {
+int startree_data_index_internal(startree_t* s, int starid) {
     if (s->tree->perm && !s->inverse_perm) {
         startree_compute_inverse_perm(s);
         if (!s->inverse_perm) {
@@ -491,9 +685,9 @@ static int startree_data_index(startree_t* s, int starid) {
         }
     }
 
-    if (starid < 0 || starid >= Ndata(s)) {
+    if (starid < 0 || starid >= startree_data_count_internal(s)) {
         fprintf(stderr, "Invalid star ID %i; expected [0, %i).\n",
-                starid, Ndata(s));
+                starid, startree_data_count_internal(s));
         assert(0);
         return -1;
     }
@@ -505,43 +699,8 @@ static int startree_data_index(startree_t* s, int starid) {
     return starid;
 }
 
-int startree_prefetch_stars(startree_t* s,
-                            const unsigned int* starids,
-                            int nstars) {
-    fitsbin_t* fb;
-    size_t row_size;
-    int i;
-
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || Ndata(s) <= 0) {
-        return 0;
-    }
-
-    fb = s->tree->io;
-    row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
-
-    for (i = 0; i < nstars; i++) {
-        int data_index;
-        void* row;
-
-        if (starids[i] >= (unsigned int)Ndata(s)) {
-            return -1;
-        }
-
-        data_index = startree_data_index(s, (int)starids[i]);
-        if (data_index < 0) {
-            return -1;
-        }
-
-        row = kdtree_get_data(s->tree, data_index);
-        fitsbin_prefetch_data(fb, row, row_size);
-    }
-
-    return 0;
-}
-
 int startree_get(startree_t* s, int starid, double* posn) {
-    int data_index = startree_data_index(s, starid);
+    int data_index = startree_data_index_internal(s, starid);
 
     if (data_index < 0) {
         return -1;
@@ -650,4 +809,3 @@ int startree_write_to_file_flipped(startree_t* s, const char* fn) {
 int startree_append_to(startree_t* s, FILE* fid) {
     return write_to_file(s, NULL, FALSE, fid);
 }
-
