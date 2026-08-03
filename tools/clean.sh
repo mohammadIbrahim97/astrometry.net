@@ -1,7 +1,7 @@
 #!/bin/sh
 
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <PATH> <FILE-PREFIX>"
+    echo "Usage: $0 <PATH> <FILE-STEM>"
     echo "  Examples:"
     echo "    $0 demo apod2"
     echo "    $0 demo \"*\""
