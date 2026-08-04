@@ -2,11 +2,16 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <pthread.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdarg.h>
@@ -27,17 +32,49 @@
 #include "kdtree.h"
 #include "quad-utils.h"
 #include "errors.h"
+#include "../libkd/kdtree_prefetch_internal.h"
 #include "tweak2.h"
+#include "astrometry/fitsbin.h"
+#include "index_shard_internal.h"
+#include "solver_codekd_internal.h"
+#include "solver_field_geometry_internal.h"
+#include "solver_inline_internal.h"
+#include "solver_hypothesis_internal.h"
+#include "solver_profile_internal.h"
+kdtree_qres_t* solver_codekd_rangesearch(
+    const kdtree_t* tree,
+    kdtree_qres_t* result,
+    const double* query,
+    double maxd2,
+    int options) {
+    return kdtree_rangesearch_options_reuse(
+        tree,
+        result,
+        query,
+        maxd2,
+        options);
+}
 
 #if TESTING_TRYALLCODES
 #define DEBUGSOLVER 1
-#define TRY_ALL_CODES test_try_all_codes
+#define TRY_ALL_CODES(pq, fieldstars, dimquad, solver, tol2, presult) \
+    test_try_all_codes((pquad*)(pq), \
+                       (int*)(fieldstars), \
+                       (dimquad), \
+                       (solver), \
+                       (tol2))
 void test_try_all_codes(pquad* pq,
                         int* fieldstars, int dimquad,
                         solver_t* solver, double tol2);
 
 #else
-#define TRY_ALL_CODES try_all_codes
+#define TRY_ALL_CODES(pq, fieldstars, dimquad, solver, tol2, presult) \
+    try_all_codes((pq), \
+                  (fieldstars), \
+                  (dimquad), \
+                  (solver), \
+                  (tol2), \
+                  (presult))
 #endif
 
 #if TESTING_TRYPERMUTATIONS
@@ -49,7 +86,13 @@ void test_try_permutations(int* stars, double* code, int dimquad, solver_t* s);
 #define TEST_TRY_PERMUTATIONS(u,v,x,y)  // no-op.
 #endif
 
-
+static void solver_discard_verified_match(MatchObj* mo) {
+    verify_free_matchobj(mo);
+    if (mo->sip) {
+        sip_free(mo->sip);
+        mo->sip = NULL;
+    }
+}
 
 
 
@@ -133,14 +176,21 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
     double Q2;
     // initial WCS
     sip_t startsip;
-    int* theta;
-    double* odds;
+    int* theta = NULL;
+    double* odds = NULL;
+    sip_t* tuned_sip = NULL;
     double* refradec;
     int i;
     double newodds;
     int nm, nc, nd;
     int besti;
     int startorder;
+
+    if (!sp || !mo || !sp->fieldxy ||
+        !mo->refxyz || mo->nindex <= 0 ||
+        (size_t)mo->nindex > SIZE_MAX / (2U * sizeof(double))) {
+        return;
+    }
 
     indexjitter = mo->index_jitter; // ref cat positional error, in arcsec.
     xy = starxy_to_xy_array(sp->fieldxy, NULL);
@@ -157,7 +207,14 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
     }
 
     // mo->refradec may be NULL at this point, so get it from refxyz instead...
-    refradec = malloc(3 * mo->nindex * sizeof(double));
+    refradec = malloc(2 * mo->nindex * sizeof(double));
+    if (!xy || !refradec) {
+        free(refradec);
+        free(xy);
+        logverb("solver_tweak2: allocation failed; "
+                "preserving verified TAN solution\n");
+        return;
+    }
     for (i=0; i<mo->nindex; i++)
         xyzarr2radecdegarr(mo->refxyz + i*3, refradec + i*2);
 
@@ -175,12 +232,11 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
     logverb("solver_tweak2: setting orders %i, %i\n", sp->tweak_aborder, sp->tweak_abporder);
 
     // for TWEAK_DEBUG_PLOTs
-    theta = mo->theta;
     besti = mo->nbest-1;//mo->nmatch + mo->nconflict + mo->ndistractor;
 
     logverb("solver_tweak2: set_crpix %i, crpix (%.1f,%.1f)\n",
             sp->set_crpix, sp->crpix[0], sp->crpix[1]);
-    mo->sip = tweak2(xy, Nxy,
+    tuned_sip = tweak2(xy, Nxy,
                      sp->verify_pix, // pixel positional noise sigma
                      solver_field_width(sp),
                      solver_field_height(sp),
@@ -193,11 +249,26 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
                      sp->set_crpix ? sp->crpix : NULL,
                      &newodds, &besti, mo->testperm, startorder);
     free(refradec);
+    free(xy);
+    xy = NULL;
 
-    // FIXME -- update refxy?  Nobody uses it, right?
+    if (!tuned_sip || !theta || !odds ||
+        besti < 0 || besti >= Nxy || !isfinite(newodds)) {
+        sip_free(tuned_sip);
+        free(theta);
+        free(odds);
+        logverb("solver_tweak2: tune failed; "
+                "preserving verified TAN solution\n");
+        return;
+    }
+
+    // Commit the tuned result only after every output is complete.
+    if (mo->sip) {
+        sip_free(mo->sip);
+    }
+    mo->sip = tuned_sip;
     free(mo->refxy);
     mo->refxy = NULL;
-    // FIXME -- and testperm?
     free(mo->testperm);
     mo->testperm = NULL;
 
@@ -219,7 +290,6 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
         mo->ndistractor = nd;
         matchobj_compute_derived(mo);
     }
-    free(xy);
 }
 
 void solver_log_params(const solver_t* sp) {
@@ -304,54 +374,25 @@ void solver_print_to(const solver_t* sp, FILE* stream) {
  verify_matchobj_deep_copy(mo, dest);
  return dest;
  }
- 
+
  static void matchobj_free_data(MatchObj* mo) {
  verify_free_matchobj(mo);
  onefield_free_matchobj(mo);
  }
  */
 
-static const int A = 0, B = 1, C = 2, D = 3;
-
-// Number of stars in the "backbone" of the quad: stars A and B.
-static const int NBACK = 2;
-
 static void find_field_boundaries(solver_t* solver);
 
-static inline double getx(const double* d, int ind) {
-    return d[ind*2];
-}
-static inline double gety(const double* d, int ind) {
-    return d[ind*2 + 1];
-}
-static inline void setx(double* d, int ind, double val) {
-    d[ind*2] = val;
-}
-static inline void sety(double* d, int ind, double val) {
-    d[ind*2 + 1] = val;
-}
-
-static void field_getxy(solver_t* sp, int index, double* x, double* y) {
+static void field_getxy(
+    const solver_t* sp,
+    int index,
+    double* x,
+    double* y) {
     *x = starxy_getx(sp->fieldxy, index);
     *y = starxy_gety(sp->fieldxy, index);
 }
 
-static double field_getx(solver_t* sp, int index) {
-    return starxy_getx(sp->fieldxy, index);
-}
-static double field_gety(solver_t* sp, int index) {
-    return starxy_gety(sp->fieldxy, index);
-}
-
-static void update_timeused(solver_t* sp) {
-    double usertime, systime;
-    get_resource_stats(&usertime, &systime, NULL);
-    sp->timeused = (usertime + systime) - sp->starttime;
-    if (sp->timeused < 0.0)
-        sp->timeused = 0.0;
-}
-
-static void set_matchobj_template(solver_t* solver, MatchObj* mo) {
+void set_matchobj_template(solver_t* solver, MatchObj* mo) {
     if (solver->mo_template)
         memcpy(mo, solver->mo_template, sizeof(MatchObj));
     else
@@ -399,8 +440,8 @@ void solver_clear_radec(solver_t* s) {
     s->use_radec = FALSE;
 }
 
-static void set_center_and_radius(solver_t* solver, MatchObj* mo,
-                                  tan_t* tan, sip_t* sip) {
+void set_center_and_radius(solver_t* solver, MatchObj* mo,
+                           tan_t* tan, sip_t* sip) {
     double cx, cy, lx, ly;
     double xyz[3];
     get_field_center(solver, &cx, &cy);
@@ -415,7 +456,6 @@ static void set_center_and_radius(solver_t* solver, MatchObj* mo,
     mo->radius = sqrt(distsq(mo->center, xyz, 3));
     mo->radius_deg = dist2deg(mo->radius);
 }
-
 static void set_index(solver_t* s, index_t* index) {
     s->index = index;
     s->rel_index_noise2 = square(index->index_jitter / index->index_scale_lower);
@@ -427,7 +467,17 @@ static void set_diag(solver_t* s) {
 
 void solver_set_field(solver_t* s, starxy_t* field) {
     solver_free_field(s);
+
+    /*
+     * Reset the compatibility policy counters at the field boundary.
+     * Shard workers apply RANDOM only to sparse payload chunks; compact
+     * topology and serial solving retain original NORMAL mappings.
+     */
+    fitsbin_mmap_advice_state_reset(
+        &s->index_mmap_policy);
+
     s->fieldxy_orig = field;
+
     // Preprocessing happens in "solver_preprocess_field()".
 }
 
@@ -517,9 +567,9 @@ void solver_compute_quad_range(const solver_t* sp, const index_t* index,
     // -that divided by the smallest arcsec-per-pixel scale
     //  gives the largest motion in pixels.
 
-    //logverb("Index scale %f, %f\n", 
+    //logverb("Index scale %f, %f\n",
     //index->index_scale_upper, index->index_scale_lower);
-            
+
     scalefudge = index->index_scale_upper * M_SQRT1_2 *
         sp->codetol / sp->funits_upper;
 
@@ -532,28 +582,114 @@ void solver_compute_quad_range(const solver_t* sp, const index_t* index,
         *maxAB += scalefudge;
     }
 }
+static void try_all_codes(
+    const pquad* pq,
+    const int* fieldstars,
+    int dimquad,
+    solver_t* solver,
+    double tol2,
+    kdtree_qres_t** presult);
 
-static void try_all_codes(const pquad* pq,
-                          const int* fieldstars, int dimquad,
-                          solver_t* solver, double tol2);
+static void try_all_codes_2(
+    const int* fieldstars,
+    int dimquad,
+    const double* code,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    kdtree_qres_t** presult);
 
-static void try_all_codes_2(const int* fieldstars, int dimquad,
-                            const double* code, solver_t* solver,
-                            anbool current_parity, double tol2);
+static void try_permutations(
+    const int* origstars,
+    int dimquad,
+    const double* origcode,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    int* stars,
+    double* code,
+    int slot,
+    anbool* placed,
+    kdtree_qres_t** presult);
 
-static void try_permutations(const int* origstars, int dimquad,
-                             const double* origcode,
-                             solver_t* solver, anbool current_parity,
-                             double tol2,
-                             int* stars, double* code,
-                             int slot, anbool* placed,
-                             kdtree_qres_t** presult);
+void solver_execute_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    kdtree_qres_t** presult);
 
-static void resolve_matches(kdtree_qres_t* krez, const double *field,
-                            const int* fstars, int dimquads,
-                            solver_t* solver, anbool current_parity);
+void solver_begin_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity);
 
-static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* sip, anbool fake_match);
+void solver_execute_prepared_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    kdtree_qres_t* result,
+    double search_wall_seconds,
+    solver_candidate_delivery_record_t* prepared,
+    size_t prepared_quad_count,
+    size_t prepared_star_count);
+
+void solver_retire_codekd_failure_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    int search_errno,
+    double search_wall_seconds);
+
+static void resolve_matches_with_delivery(
+    kdtree_qres_t* krez,
+    const double* field,
+    const int* fstars,
+    int dimquads,
+    int quads_tried,
+    solver_t* solver,
+    anbool current_parity,
+    solver_candidate_delivery_record_t* prepared,
+    size_t prepared_first,
+    size_t prepared_quad_count,
+    size_t prepared_star_count);
+
+void resolve_matches_native_range(
+    kdtree_qres_t* krez,
+    const double* field_xy,
+    const int* fieldstars,
+    int dimquads,
+    int quads_tried,
+    solver_t* solver,
+    anbool current_parity,
+    int candidate_first,
+    int candidate_end,
+    solver_candidate_delivery_record_t* prepared,
+    size_t prepared_first,
+    size_t prepared_quad_count,
+    size_t prepared_star_count);
+
+static int solver_handle_query_hit(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* sip,
+    anbool fake_match,
+    verify_index_query_t** query);
+
+static int solver_handle_scored_query_hit(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* sip,
+    anbool fake_match,
+    solver_candidate_delivery_record_t* record);
 
 static void check_scale(pquad* pq, solver_t* s) {
     double dx, dy;
@@ -574,20 +710,33 @@ static void check_scale(pquad* pq, solver_t* s) {
 static void check_inbox(pquad* pq, int start, solver_t* solver) {
     int i;
     double Ax, Ay;
+
+    if (start == 0) {
+        pq->eligible_count = 0;
+    }
     field_getxy(solver, pq->fieldA, &Ax, &Ay);
     // check which C, D points are inside the circle.
     for (i = start; i < pq->ninbox; i++) {
         double r;
-        double Cx, Cy, xxtmp;
+        double Cx, Cy;
         double tol = solver->codetol;
-        if (!pq->inbox[i])
+        if (!pq->inbox[i]) {
+            if (pq->inbox_prefix) {
+                pq->inbox_prefix[i] =
+                    (uint16_t)pq->eligible_count;
+            }
             continue;
+        }
         field_getxy(solver, i, &Cx, &Cy);
         Cx -= Ax;
         Cy -= Ay;
-        xxtmp = Cx;
-        Cx = Cx * pq->costheta + Cy * pq->sintheta;
-        Cy = -xxtmp * pq->sintheta + Cy * pq->costheta;
+        solver_transform_code_coordinates(
+            Cx,
+            Cy,
+            pq->costheta,
+            pq->sintheta,
+            &Cx,
+            &Cy);
 
         // make sure it's in the circle centered at (0.5, 0.5)
         // with radius 1/sqrt(2) (plus codetol for fudge):
@@ -598,11 +747,56 @@ static void check_inbox(pquad* pq, int start, solver_t* solver) {
         r = (Cx * Cx - Cx) + (Cy * Cy - Cy);
         if (r > (tol * (M_SQRT2 + tol))) {
             pq->inbox[i] = FALSE;
+            if (pq->inbox_prefix) {
+                pq->inbox_prefix[i] =
+                    (uint16_t)pq->eligible_count;
+            }
             continue;
         }
         setx(pq->xy, i, Cx);
         sety(pq->xy, i, Cy);
+        pq->eligible_count++;
+        if (pq->inbox_prefix) {
+            pq->inbox_prefix[i] =
+                (uint16_t)pq->eligible_count;
+        }
     }
+}
+
+static int solver_allocate_pquad_storage(
+    solver_t* solver,
+    pquad* pq,
+    int numxy) {
+    size_t inbox_bytes;
+    size_t xy_bytes;
+
+    if (!solver || !pq || numxy <= 0 ||
+        (size_t)numxy > SIZE_MAX / sizeof(anbool) ||
+        (size_t)numxy > SIZE_MAX /
+            (2U * sizeof(double))) {
+        if (solver) {
+            solver->profile.allocation_failures++;
+            solver->profile.execution_failed = TRUE;
+            solver->quit_now = TRUE;
+        }
+        return -1;
+    }
+    inbox_bytes = (size_t)numxy * sizeof(anbool);
+    xy_bytes = (size_t)numxy * 2U * sizeof(double);
+    pq->inbox = malloc(inbox_bytes);
+    pq->xy = malloc(xy_bytes);
+    if (!pq->inbox || !pq->xy) {
+        free(pq->inbox);
+        free(pq->xy);
+        pq->inbox = NULL;
+        pq->xy = NULL;
+        solver->profile.allocation_failures++;
+        solver->profile.execution_failed = TRUE;
+        solver->quit_now = TRUE;
+        SYSERROR("Failed to allocate solver pquad storage");
+        return -1;
+    }
+    return 0;
 }
 
 #if defined DEBUGSOLVER
@@ -686,14 +880,18 @@ void solver_preprocess_field(solver_t* solver) {
 }
 
 void solver_free_field(solver_t* solver) {
-    if (solver->fieldxy)
+    solver_release_field_geometry(solver);
+    if (solver->fieldxy) {
         starxy_free(solver->fieldxy);
+    }
     solver->fieldxy = NULL;
-    if (solver->fieldxy_orig)
+    if (solver->fieldxy_orig) {
         starxy_free(solver->fieldxy_orig);
+    }
     solver->fieldxy_orig = NULL;
-    if (solver->vf)
+    if (solver->vf) {
         verify_field_free(solver->vf);
+    }
     solver->vf = NULL;
 }
 
@@ -701,17 +899,29 @@ starxy_t* solver_get_field(solver_t* solver) {
     return solver->fieldxy;
 }
 
-static double get_tolerance(solver_t* solver) {
-    return square(solver->codetol);
+double get_tolerance_for_noise(
+    double codetol,
+    double rel_field_noise2,
+    double rel_index_noise2) {
+    (void)rel_field_noise2;
+    (void)rel_index_noise2;
+    return square(codetol);
     /*
-     double maxtol2 = square(solver->codetol);
+     double maxtol2 = square(codetol);
      double tol2;
-     tol2 = 49.0 * (solver->rel_field_noise2 + solver->rel_index_noise2);
+     tol2 = 49.0 * (rel_field_noise2 + rel_index_noise2);
      //printf("code tolerance %g.\n", sqrt(tol2));
      if (tol2 > maxtol2)
      tol2 = maxtol2;
      return tol2;
      */
+}
+
+static double get_tolerance(solver_t* solver) {
+    return get_tolerance_for_noise(
+        solver->codetol,
+        solver->rel_field_noise2,
+        solver->rel_index_noise2);
 }
 
 /*
@@ -732,7 +942,8 @@ static double get_tolerance(solver_t* solver) {
 static void add_stars(const pquad* pq, int* field, int fieldoffset,
                       int n_to_add, int adding, int fieldtop,
                       int dimquad,
-                      solver_t* solver, double tol2) {
+                      solver_t* solver, double tol2,
+                      kdtree_qres_t** presult) {
     int bottom;
     int* f = field + fieldoffset;
     // When we're adding the first star, we start from index zero.
@@ -753,26 +964,520 @@ static void add_stars(const pquad* pq, int* field, int fieldoffset,
         // call try_all_codes to try the quad we've built.
         if (adding == n_to_add-1) {
             // (when not testing, TRY_ALL_CODES is just try_all_codes.)
-            TRY_ALL_CODES(pq, field, dimquad, solver, tol2);
+            TRY_ALL_CODES(pq,
+                          field,
+                          dimquad,
+                          solver,
+                          tol2,
+                          presult);
         } else {
             // Else recurse.
             add_stars(pq, field, fieldoffset, n_to_add, adding+1,
-                      fieldtop, dimquad, solver, tol2);
+                      fieldtop, dimquad, solver, tol2, presult);
         }
     }
 }
 
+static int solver_ab_descriptor_execute_phase(
+    solver_t* solver,
+    solver_ab_phase_kind_t phase,
+    int newpoint,
+    const solver_field_geometry_t* field_geometry,
+    int dimquads,
+    double min_ab2,
+    double max_ab2,
+    kdtree_qres_t** query_result,
+    solver_ab_phase_mode_t* mode_out) {
+    solver_ab_descriptor_workspace_t* workspace;
+    solver_ab_descriptor_planner_t* planner;
+    solver_codekd_packet_wave_t* wave = NULL;
+    kdtree_t* code_tree;
+    fitsbin_t* delivery_source;
+    solver_ab_pair_t* pairs = NULL;
+    size_t pair_count = 0U;
+    unsigned long long total_combinations = 0U;
+    unsigned long long combination_cursor = 0U;
+    unsigned long long reduced = 0U;
+    unsigned long long parallel_reduced = 0U;
+    size_t staged_capacity;
+    size_t compute_width;
+    size_t participants;
+    size_t expansion;
+    size_t max_task_combinations;
+    anbool assisted = FALSE;
+    anbool packet_cleanup_failed = FALSE;
+    int result = 0;
+
+    if (mode_out) {
+        *mode_out = SOLVER_AB_MODE_NATIVE;
+    }
+    if (!solver || !field_geometry || !query_result ||
+        !solver->index || !solver->index->codekd ||
+        !solver->index->codekd->tree ||
+        solver->maxquads != 0 ||
+        solver->maxmatches != 0 ||
+        pl_size(solver->indexes) != 1U ||
+        !index_shard_worker_context_active()) {
+        return 0;
+    }
+    code_tree = solver->index->codekd->tree;
+    if (!code_tree->io || !code_tree->io_is_fitsbin) {
+        return 0;
+    }
+    delivery_source = (fitsbin_t*)code_tree->io;
+    if (fitsbin_payload_io_service_width() <= 0 ||
+        fitsbin_payload_is_fully_resident(delivery_source) ||
+        fitsbin_get_mmap_advice(delivery_source) !=
+            FITSBIN_MMAP_ADVICE_RANDOM) {
+        return 0;
+    }
+    staged_capacity = index_shard_staged_capacity();
+    compute_width = index_shard_staged_compute_width();
+    participants = MIN(staged_capacity, compute_width);
+    if (!participants) {
+        return 0;
+    }
+    expansion = solver_ab_descriptor_expansion(
+        dimquads,
+        solver->parity);
+    if (!expansion ||
+        expansion > SOLVER_AB_DESCRIPTOR_CAPACITY) {
+        return 0;
+    }
+    max_task_combinations =
+        SOLVER_AB_DESCRIPTOR_CAPACITY / expansion;
+    if (max_task_combinations <
+        SOLVER_AB_DESCRIPTOR_MIN_COMBINATIONS) {
+        return 0;
+    }
+
+    workspace = solver_ab_descriptor_workspace_get();
+    if (!workspace ||
+        solver_ab_descriptor_workspace_reserve_outputs(
+            workspace, participants)) {
+        return 0;
+    }
+    planner = &workspace->planner;
+    planner->snapshot.codetol = solver->codetol;
+    planner->snapshot.rel_index_noise2 =
+        solver->rel_index_noise2;
+    if (solver_ab_collect_pairs(
+            planner,
+            phase,
+            newpoint,
+            dimquads,
+            field_geometry,
+            min_ab2,
+            max_ab2,
+            &pairs,
+            &pair_count,
+            &total_combinations)) {
+        solver_ab_descriptor_release_pairs(workspace);
+        return 0;
+    }
+    planner->pair_count = pair_count;
+    if (!pair_count || !total_combinations ||
+        total_combinations == ULLONG_MAX ||
+        total_combinations >
+            ULLONG_MAX / (unsigned long long)expansion ||
+        total_combinations * (unsigned long long)expansion <
+            SOLVER_AB_DESCRIPTOR_DELIVERY_MIN_HYPOTHESES) {
+        solver_ab_descriptor_release_pairs(workspace);
+        return 0;
+    }
+    wave = solver_codekd_packet_wave_create(participants);
+    if (!wave) {
+        solver_ab_descriptor_release_pairs(workspace);
+        return 0;
+    }
+
+    while (combination_cursor < total_combinations) {
+        solver_codekd_packet_task_input_t* inputs = wave->inputs;
+        solver_codekd_search_packet_t* packets = wave->packets;
+        index_shard_staged_task_t* tasks = wave->tasks;
+        unsigned long long remaining =
+            total_combinations - combination_cursor;
+        unsigned long long wave_capacity =
+            (unsigned long long)max_task_combinations *
+            (unsigned long long)participants;
+        unsigned long long wave_combinations =
+            MIN(remaining, wave_capacity);
+        unsigned long long base;
+        unsigned long long remainder;
+        unsigned long long task_cursor = combination_cursor;
+        size_t task_count =
+            solver_ab_descriptor_partition_count(
+                wave_combinations,
+                expansion,
+                max_task_combinations,
+                participants);
+        size_t task_index;
+        size_t candidate_budget_per_task;
+        size_t prepared_packets = 0U;
+        index_shard_helper_run_status_t run_status =
+            INDEX_SHARD_HELPER_UNAVAILABLE;
+        index_shard_staged_run_stats_t run_stats;
+        solver_codekd_packet_retire_context_t retire_context;
+        anbool run_inline = FALSE;
+        anbool wave_assisted = FALSE;
+        unsigned long long reduced_before = reduced;
+
+        if (!task_count) {
+            result = -1;
+            goto fail;
+        }
+        candidate_budget_per_task =
+            solver_verification_wave_memory_budget() / task_count;
+        base = wave_combinations /
+            (unsigned long long)task_count;
+        remainder = wave_combinations %
+            (unsigned long long)task_count;
+        memset(
+            inputs, 0,
+            participants * sizeof(*inputs));
+        memset(
+            packets, 0,
+            participants * sizeof(*packets));
+        memset(
+            tasks, 0,
+            participants * sizeof(*tasks));
+        memset(&run_stats, 0, sizeof(run_stats));
+        memset(&retire_context, 0, sizeof(retire_context));
+        retire_context.solver = solver;
+        retire_context.dimquads = dimquads;
+        retire_context.query_result = query_result;
+        retire_context.reduced = &reduced;
+        retire_context.next_sequence = combination_cursor;
+
+        for (task_index = 0U;
+             task_index < task_count;
+             task_index++) {
+            solver_ab_descriptor_task_input_t* descriptor_input =
+                &inputs[task_index].descriptor;
+            unsigned long long task_combinations =
+                base + (task_index < remainder ? 1U : 0U);
+            unsigned long long work_units;
+
+            if (!task_combinations ||
+                task_combinations > max_task_combinations) {
+                result = -1;
+                goto fail;
+            }
+            descriptor_input->field_geometry = field_geometry;
+            descriptor_input->pairs = pairs;
+            descriptor_input->pair_count = pair_count;
+            descriptor_input->combination_first = task_cursor;
+            task_cursor += task_combinations;
+            descriptor_input->combination_end = task_cursor;
+            descriptor_input->phase = phase;
+            descriptor_input->newpoint = newpoint;
+            descriptor_input->dimquads = dimquads;
+            descriptor_input->parity = solver->parity;
+            descriptor_input->cx_less_than_dx =
+                solver->index->cx_less_than_dx;
+            descriptor_input->meanx_less_than_half =
+                solver->index->meanx_less_than_half;
+            descriptor_input->cxdx_margin = solver->cxdx_margin;
+            inputs[task_index].tree = code_tree;
+            inputs[task_index].quads = solver->index->quads;
+            inputs[task_index].starkd = solver->index->starkd;
+            inputs[task_index].detailed = solver->profile.detailed;
+            inputs[task_index].use_radec = solver->use_radec;
+            inputs[task_index].field_minx = solver->field_minx;
+            inputs[task_index].field_maxx = solver->field_maxx;
+            inputs[task_index].field_miny = solver->field_miny;
+            inputs[task_index].field_maxy = solver->field_maxy;
+            inputs[task_index].abscale_low = solver->abscale_low;
+            inputs[task_index].abscale_high = solver->abscale_high;
+            inputs[task_index].funits_lower = solver->funits_lower;
+            inputs[task_index].funits_upper = solver->funits_upper;
+            if (solver->mo_template) {
+                memcpy(
+                    &inputs[task_index].verification.match_template,
+                    solver->mo_template,
+                    sizeof(*solver->mo_template));
+            }
+            inputs[task_index].verification.field = solver->vf;
+            inputs[task_index].verification.index_cutnside =
+                solver->index->cutnside;
+            inputs[task_index].verification.indexid =
+                solver->index->indexid;
+            inputs[task_index].verification.healpix =
+                solver->index->healpix;
+            inputs[task_index].verification.hpnside =
+                solver->index->hpnside;
+            inputs[task_index].verification.index_jitter =
+                solver->index->index_jitter;
+            inputs[task_index].verification.verify_pix =
+                solver->verify_pix;
+            inputs[task_index].verification.distractor_ratio =
+                solver->distractor_ratio;
+            inputs[task_index].verification.logratio_bail_threshold =
+                solver->logratio_bail_threshold;
+            inputs[task_index].verification.logaccept = MIN(
+                solver->logratio_tokeep,
+                solver->logratio_totune);
+            inputs[task_index].verification.logratio_stoplooking =
+                solver->logratio_stoplooking;
+            inputs[task_index].verification.distance_from_quad_bonus =
+                solver->distance_from_quad_bonus;
+            inputs[task_index].verification.enabled =
+                solver->vf && !verify_datalog_enabled();
+
+            work_units = task_combinations *
+                (unsigned long long)expansion;
+            tasks[task_index].input = &inputs[task_index];
+            tasks[task_index].input_bytes = sizeof(inputs[task_index]);
+            tasks[task_index].output = &packets[task_index];
+            tasks[task_index].output_bytes = sizeof(packets[task_index]);
+            tasks[task_index].work_units = work_units;
+        }
+        if (task_cursor !=
+            combination_cursor + wave_combinations) {
+            result = -1;
+            goto fail;
+        }
+
+        solver->profile.hypothesis_batches++;
+        solver->profile.task_ranges_planned += task_count;
+        solver->profile.task_ranges_submitted += task_count;
+        solver->profile.task_ranges_executed += task_count;
+        solver->profile.max_task_ranges = MAX(
+            solver->profile.max_task_ranges,
+            task_count);
+
+        if (task_count) {
+            int packet_prepare_status = 0;
+
+            for (task_index = 0U;
+                 task_index < task_count;
+                 task_index++) {
+                packet_prepare_status =
+                    solver_codekd_search_packet_prepare(
+                        solver,
+                        &packets[task_index],
+                        &workspace->outputs[task_index],
+                        inputs[task_index].tree,
+                        inputs[task_index].quads,
+                        inputs[task_index].starkd,
+                        inputs[task_index].descriptor.dimquads,
+                        inputs[task_index].use_radec,
+                        candidate_budget_per_task,
+                        inputs[task_index].descriptor.combination_first,
+                        inputs[task_index].detailed);
+                if (packet_prepare_status) {
+                    break;
+                }
+                prepared_packets++;
+            }
+            if (packet_prepare_status < 0) {
+                for (task_index = 0U;
+                     task_index < prepared_packets;
+                     task_index++) {
+                    if (solver_codekd_search_packet_cleanup(
+                            &packets[task_index])) {
+                        packet_cleanup_failed = TRUE;
+                    }
+                }
+                result = -1;
+                goto fail;
+            }
+            if (packet_prepare_status > 0) {
+                solver->profile.allocation_failures++;
+                solver->profile.page_plan_allocation_refused++;
+                for (task_index = 0U;
+                     task_index < prepared_packets;
+                     task_index++) {
+                    if (solver_codekd_search_packet_cleanup(
+                            &packets[task_index])) {
+                        packet_cleanup_failed = TRUE;
+                    }
+                }
+                if (packet_cleanup_failed) {
+                    result = -1;
+                    goto fail;
+                }
+                run_inline = TRUE;
+            } else {
+                run_status = index_shard_staged_run_ordered(
+                    &solver_codekd_packet_staged_ops,
+                    tasks,
+                    task_count,
+                    solver_codekd_search_packet_retire,
+                    &retire_context,
+                    &run_stats);
+                for (task_index = 0U;
+                     task_index < prepared_packets;
+                     task_index++) {
+                    solver_codekd_packet_profile_accumulate(
+                        solver, &packets[task_index]);
+                    if (solver_codekd_search_packet_cleanup(
+                            &packets[task_index])) {
+                        packet_cleanup_failed = TRUE;
+                    }
+                }
+                solver->profile.staged_owner_claims +=
+                    run_stats.owner_claims;
+                solver->profile.staged_foreign_claims +=
+                    run_stats.foreign_claims;
+                solver->profile.staged_io_submitted +=
+                    run_stats.io_submitted;
+                solver->profile.staged_io_completed +=
+                    run_stats.io_completed;
+                solver->profile.max_staged_io_submitted = MAX(
+                    solver->profile.max_staged_io_submitted,
+                    run_stats.max_io_submitted);
+                solver->profile.max_staged_compute_ready = MAX(
+                    solver->profile.max_staged_compute_ready,
+                    run_stats.max_compute_ready);
+
+                if (packet_cleanup_failed) {
+                    result = -1;
+                    goto fail;
+                }
+
+                if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE) {
+                    run_inline = TRUE;
+                } else if (run_status == INDEX_SHARD_HELPER_STOPPED) {
+                    (void)solver_poll_worker_stop(solver);
+                    solver->quit_now = TRUE;
+                    solver->profile.hypothesis_batches_stopped++;
+                    result = 1;
+                    goto cleanup;
+                } else if (run_status != INDEX_SHARD_HELPER_OK) {
+                    result = -1;
+                    goto fail;
+                } else {
+                    if (run_stats.io_completed >
+                            run_stats.io_submitted ||
+                        run_stats.owner_claims +
+                            run_stats.foreign_claims == 0U) {
+                        result = -1;
+                        goto fail;
+                    }
+                    if (run_stats.foreign_compute_executes) {
+                        wave_assisted = TRUE;
+                        assisted = TRUE;
+                        solver->profile.parallel_batches++;
+                        solver->profile.parallel_batches_observed++;
+                        solver->profile.ab_helper_tasks =
+                            solver_ab_saturating_add(
+                                solver->profile.ab_helper_tasks,
+                                run_stats.foreign_compute_executes);
+                        solver->profile.max_parallel_ranges = MAX(
+                            solver->profile.max_parallel_ranges,
+                            run_stats.max_compute_running);
+                    }
+                }
+            }
+        } else {
+            run_inline = TRUE;
+        }
+
+        if (run_inline) {
+            solver->profile.task_ranges_inline += task_count;
+            for (task_index = 0U;
+                 task_index < task_count;
+                 task_index++) {
+                const solver_ab_descriptor_task_input_t* descriptor_input =
+                    &inputs[task_index].descriptor;
+                index_shard_helper_task_status_t task_status;
+                int owner_status;
+
+                task_status = solver_ab_descriptor_helper_execute(
+                    descriptor_input,
+                    sizeof(*descriptor_input),
+                    &workspace->outputs[task_index],
+                    sizeof(workspace->outputs[task_index]));
+                if (task_status == INDEX_SHARD_HELPER_TASK_STOPPED) {
+                    (void)solver_poll_worker_stop(solver);
+                    solver->profile.hypothesis_batches_stopped++;
+                    result = 1;
+                    goto cleanup;
+                }
+                if (task_status != INDEX_SHARD_HELPER_TASK_OK) {
+                    result = -1;
+                    goto fail;
+                }
+                owner_status = solver_codekd_descriptor_execute_owner(
+                    &workspace->outputs[task_index],
+                    solver,
+                    dimquads,
+                    query_result,
+                    &reduced);
+                if (owner_status < 0) {
+                    result = -1;
+                    goto fail;
+                }
+                if (owner_status > 0) {
+                    solver->profile.hypothesis_batches_stopped++;
+                    result = 1;
+                    goto cleanup;
+                }
+                retire_context.next_task_index++;
+                retire_context.next_sequence =
+                    descriptor_input->combination_end;
+            }
+        }
+
+        if (retire_context.next_task_index != task_count ||
+            retire_context.next_sequence != task_cursor) {
+            result = -1;
+            goto fail;
+        }
+
+        if (wave_assisted) {
+            parallel_reduced = solver_ab_saturating_add(
+                parallel_reduced,
+                reduced - reduced_before);
+        }
+        solver->profile.hypothesis_batches_completed++;
+        combination_cursor += wave_combinations;
+    }
+
+    result = 1;
+    goto cleanup;
+
+fail:
+    solver->profile.hypothesis_batches_failed++;
+    solver->profile.execution_failed = TRUE;
+    solver->quit_now = TRUE;
+
+cleanup:
+    solver->profile.parallel_hypotheses =
+        solver_ab_saturating_add(
+            solver->profile.parallel_hypotheses,
+            parallel_reduced);
+    if (mode_out && result > 0) {
+        *mode_out = assisted
+            ? SOLVER_AB_MODE_ASSISTED
+            : SOLVER_AB_MODE_FLATTENED_OWNER;
+    }
+    solver_ab_descriptor_release_pairs(workspace);
+    if (!packet_cleanup_failed) {
+        solver_codekd_packet_wave_destroy(wave);
+    }
+    return result;
+}
 
 // The real deal
-void solver_run(solver_t* solver) {
+int solver_run(solver_t* solver) {
     int numxy, newpoint;
     double usertime, systime;
+    double run_wall_start;
     // first timer callback is called after 1 second
     time_t next_timer_callback_time = time(NULL) + 1;
-    pquad* pquads;
+    pquad* pquads = NULL;
+    const solver_field_geometry_t* field_geometry = NULL;
     size_t i, num_indexes;
     double tol2;
     int field[DQMAX];
+    // Reuse CodeKD result capacity across all hypotheses in this run.
+    kdtree_qres_t* codekd_result = NULL;
+
+    run_wall_start = monotonic_seconds();
+    memset(&solver->profile, 0, sizeof(solver->profile));
+    solver->profile.detailed = index_shard_trace_enabled();
 
     get_resource_stats(&usertime, &systime, NULL);
 
@@ -786,14 +1491,28 @@ void solver_run(solver_t* solver) {
     numxy = starxy_n(solver->fieldxy);
     if (solver->endobj && (numxy > solver->endobj))
         numxy = solver->endobj;
-    if (solver->startobj >= numxy)
-        return;
+    if (solver->startobj >= numxy) {
+        solver->profile.solver_run_wall_seconds =
+            monotonic_seconds() - run_wall_start;
+        solver_profile_report(solver);
+        return 0;
+    }
+
+
     if (numxy >= 1000) {
         logverb("Limiting search to first 1000 objects\n");
         numxy = 1000;
     }
 
+    if (solver->field_geometry &&
+        !solver_field_geometry_compatible(
+            solver, numxy)) {
+        solver_release_field_geometry(solver);
+    }
     num_indexes = pl_size(solver->indexes);
+    if (solver_field_geometry_compatible(solver, numxy)) {
+        field_geometry = solver->field_geometry;
+    }
     {
         double minAB2s[num_indexes];
         double maxAB2s[num_indexes];
@@ -836,7 +1555,16 @@ void solver_run(solver_t* solver) {
          MIN(M_PI, arcsec2rad(field_diag * solver->funits_upper)) ...
          */
 
-        pquads = calloc((size_t)numxy * (size_t)numxy, sizeof(pquad));
+        {
+            pquads = calloc(
+                (size_t)numxy * (size_t)numxy,
+                sizeof(pquad));
+            if (!pquads) {
+                SYSERROR("Failed to allocate solver pquad array");
+                solver->profile.execution_failed = TRUE;
+                goto finish;
+            }
+        }
 
         /* We maintain an array of "potential quads" (pquad) structs, where
          * each struct corresponds to one choice of stars A and B; the struct
@@ -872,8 +1600,10 @@ void solver_run(solver_t* solver) {
                         debug("  bad scale for A=%i, B=%i\n", field[A], field[B]);
                         continue;
                     }
-                    pq->xy = malloc(numxy * 2 * sizeof(double));
-                    pq->inbox = malloc(numxy * sizeof(anbool));
+                    if (solver_allocate_pquad_storage(
+                            solver, pq, numxy)) {
+                        goto quitnow;
+                    }
                     memset(pq->inbox, TRUE, solver->startobj);
                     pq->ninbox = solver->startobj;
                     pq->inbox[field[A]] = FALSE;
@@ -889,7 +1619,7 @@ void solver_run(solver_t* solver) {
          * ("newpoint").  First, we try building all quads that have the new
          * star on the diagonal (star B).  Then, we try building all quads that
          * have the star not on the diagonal (star D).
-         * 
+         *
          * For each AB pair, we have a "potential_quad" or "pquad" struct.
          * This caches the computation we need to do: deciding whether the
          * scale is acceptable, computing the transformation to code
@@ -899,6 +1629,10 @@ void solver_run(solver_t* solver) {
 
             debug("Trying newpoint=%i (%.1f,%.1f)\n", newpoint,
                   field_getx(solver,newpoint), field_gety(solver,newpoint));
+
+            if (solver_poll_worker_stop(solver)) {
+                break;
+            }
 
             // Give our caller a chance to cancel us midway. The callback
             // returns how long to wait before calling again.
@@ -919,40 +1653,84 @@ void solver_run(solver_t* solver) {
             // quads with the new star on the diagonal:
             field[B] = newpoint;
             debug("Trying quads with B=%i\n", newpoint);
-	
+
             // first do an index-independent scale check...
-            for (field[A] = 0; field[A] < newpoint; field[A]++) {
-                // initialize the "pquad" struct for this AB combo.
-                pquad* pq = pquads + field[B] * numxy + field[A];
-                pq->fieldA = field[A];
-                pq->fieldB = field[B];
-                debug("  trying A=%i, B=%i\n", field[A], field[B]);
-                check_scale(pq, solver);
-                if (!pq->scale_ok) {
-                    debug("    bad scale for A=%i, B=%i\n", field[A], field[B]);
-                    continue;
+            {
+                for (field[A] = 0; field[A] < newpoint; field[A]++) {
+                    // initialize the "pquad" struct for this AB combo.
+                    pquad* pq = pquads + field[B] * numxy + field[A];
+                    pq->fieldA = field[A];
+                    pq->fieldB = field[B];
+                    debug("  trying A=%i, B=%i\n", field[A], field[B]);
+                    check_scale(pq, solver);
+                    if (!pq->scale_ok) {
+                        debug("    bad scale for A=%i, B=%i\n", field[A], field[B]);
+                        continue;
+                    }
+                    // initialize the "inbox" array:
+                    if (solver_allocate_pquad_storage(
+                            solver, pq, numxy)) {
+                        goto quitnow;
+                    }
+                    // -try all stars up to "newpoint"...
+                    assert(sizeof(anbool) == 1);
+                    memset(pq->inbox, TRUE, newpoint + 1);
+                    pq->ninbox = newpoint + 1;
+                    // -except A and B.
+                    pq->inbox[field[A]] = FALSE;
+                    pq->inbox[field[B]] = FALSE;
+                    check_inbox(pq, 0, solver);
+                    debug("    inbox(A=%i, B=%i): ", field[A], field[B]);
+                    print_inbox(pq);
                 }
-                // initialize the "inbox" array:
-                pq->inbox = malloc(numxy * sizeof(anbool));
-                pq->xy = malloc(numxy * 2 * sizeof(double));
-                // -try all stars up to "newpoint"...
-                assert(sizeof(anbool) == 1);
-                memset(pq->inbox, TRUE, newpoint + 1);
-                pq->ninbox = newpoint + 1;
-                // -except A and B.
-                pq->inbox[field[A]] = FALSE;
-                pq->inbox[field[B]] = FALSE;
-                check_inbox(pq, 0, solver);
-                debug("    inbox(A=%i, B=%i): ", field[A], field[B]);
-                print_inbox(pq);
             }
 
             // Now iterate through the different indices
             for (i = 0; i < num_indexes; i++) {
                 index_t* index = pl_get(solver->indexes, i);
                 int dimquads;
+                int ab_phase_result = 0;
+                solver_ab_phase_mode_t phase_mode =
+                    SOLVER_AB_MODE_NATIVE;
+                solver_ab_phase_telemetry_t phase_telemetry;
+
                 set_index(solver, index);
                 dimquads = index_dimquads(index);
+                solver_ab_phase_telemetry_begin(
+                    solver,
+                    &phase_telemetry);
+                if (num_indexes == 1U &&
+                    field_geometry) {
+                    ab_phase_result =
+                        solver_ab_descriptor_execute_phase(
+                            solver,
+                            SOLVER_AB_PHASE_DIAGONAL,
+                            newpoint,
+                            field_geometry,
+                            dimquads,
+                            minAB2s[i],
+                            maxAB2s[i],
+                            &codekd_result,
+                            &phase_mode);
+                    if (ab_phase_result < 0) {
+                        solver_ab_phase_telemetry_report(
+                            solver,
+                            &phase_telemetry,
+                            newpoint,
+                            SOLVER_AB_PHASE_DIAGONAL,
+                            phase_mode);
+                        goto quitnow;
+                    }
+                    if (ab_phase_result > 0) {
+                        solver_ab_phase_telemetry_report(
+                            solver,
+                            &phase_telemetry,
+                            newpoint,
+                            SOLVER_AB_PHASE_DIAGONAL,
+                            phase_mode);
+                        continue;
+                    }
+                }
                 for (field[A] = 0; field[A] < newpoint; field[A]++) {
                     // initialize the "pquad" struct for this AB combo.
                     pquad* pq = pquads + field[B] * numxy + field[A];
@@ -966,10 +1744,32 @@ void solver_run(solver_t* solver) {
                     tol2 = get_tolerance(solver);
                     // Now look at all sets of (C, D, ...) stars (subject to field[C] < field[D] < ...)
                     // ("dimquads - 2" because we've set stars A and B at this point)
-                    add_stars(pq, field, C, dimquads-2, 0, newpoint, dimquads, solver, tol2);
-                    if (solver->quit_now)
+                    add_stars(pq,
+                              field,
+                              C,
+                              dimquads - 2,
+                              0,
+                              newpoint,
+                              dimquads,
+                              solver,
+                              tol2,
+                              &codekd_result);
+                    if (solver->quit_now) {
+                        solver_ab_phase_telemetry_report(
+                            solver,
+                            &phase_telemetry,
+                            newpoint,
+                            SOLVER_AB_PHASE_DIAGONAL,
+                            SOLVER_AB_MODE_NATIVE);
                         goto quitnow;
+                    }
                 }
+                solver_ab_phase_telemetry_report(
+                    solver,
+                    &phase_telemetry,
+                    newpoint,
+                    SOLVER_AB_PHASE_DIAGONAL,
+                    SOLVER_AB_MODE_NATIVE);
             }
 
             if (solver->quit_now)
@@ -979,51 +1779,191 @@ void solver_run(solver_t* solver) {
             field[C] = newpoint;
             // (in this loop field[C] > field[D])
             debug("Trying quads with C=%i\n", newpoint);
-            for (field[A] = 0; field[A] < newpoint; field[A]++) {
-                for (field[B] = field[A] + 1; field[B] < newpoint; field[B]++) {
-                    // grab the "pquad" for this AB combo
-                    pquad* pq = pquads + field[B] * numxy + field[A];
-                    if (!pq->scale_ok) {
-                        debug("  bad scale for A=%i, B=%i\n", field[A], field[B]);
-                        continue;
+            {
+                int ab_phase_result = 0;
+                solver_ab_phase_mode_t phase_mode =
+                    SOLVER_AB_MODE_NATIVE;
+                anbool phase_pquads_prepared = FALSE;
+                solver_ab_phase_telemetry_t phase_telemetry;
+
+                if (num_indexes == 1U) {
+                    set_index(
+                        solver,
+                        pl_get(solver->indexes, 0));
+                }
+                solver_ab_phase_telemetry_begin(
+                    solver,
+                    &phase_telemetry);
+
+                if (num_indexes == 1U &&
+                    field_geometry) {
+                    index_t* index = pl_get(solver->indexes, 0);
+                    int dimquads;
+
+                    set_index(solver, index);
+                    dimquads = index_dimquads(index);
+                    ab_phase_result =
+                        solver_ab_descriptor_execute_phase(
+                            solver,
+                            SOLVER_AB_PHASE_OFF_DIAGONAL,
+                            newpoint,
+                            field_geometry,
+                            dimquads,
+                            minAB2s[0],
+                            maxAB2s[0],
+                            &codekd_result,
+                            &phase_mode);
+                    if (ab_phase_result < 0) {
+                        solver_ab_phase_telemetry_report(
+                            solver,
+                            &phase_telemetry,
+                            newpoint,
+                            SOLVER_AB_PHASE_OFF_DIAGONAL,
+                            phase_mode);
+                        goto quitnow;
                     }
-                    // test if this C is in the box:
-                    pq->inbox[field[C]] = TRUE;
-                    pq->ninbox = field[C] + 1;
-                    check_inbox(pq, field[C], solver);
-                    if (!pq->inbox[field[C]]) {
-                        debug("  C is not in the box for A=%i, B=%i\n", field[A], field[B]);
-                        continue;
-                    }
-                    debug("  C is in the box for A=%i, B=%i\n", field[A], field[B]);
-                    debug("    box now:");
-                    print_inbox(pq);
-                    debug("\n");
+                    /*
+                     * A later phase may need the native fallback path.
+                     * Preserve its incremental pquad state only after the
+                     * index-free descriptor path accepted this phase.
+                     */
+                    if (ab_phase_result > 0 &&
+                        !solver->quit_now &&
+                        !phase_pquads_prepared) {
+                        for (field[A] = 0;
+                             field[A] < newpoint;
+                             field[A]++) {
+                            if (solver_ab_poll_phase_stop(
+                                    solver,
+                                    &next_timer_callback_time)) {
+                                goto quitnow;
+                            }
+                            for (field[B] = field[A] + 1;
+                                 field[B] < newpoint;
+                                 field[B]++) {
+                                pquad* pq =
+                                    pquads +
+                                    field[B] * numxy +
+                                    field[A];
 
-                    solver->rel_field_noise2 = pq->rel_field_noise2;
-
-                    for (i = 0; i < pl_size(solver->indexes); i++) {
-                        int dimquads;
-                        index_t* index = pl_get(solver->indexes, i);
-                        if ((pq->scale < minAB2s[i]) ||
-                            (pq->scale > maxAB2s[i]))
-                            continue;
-                        set_index(solver, index);
-                        dimquads = index_dimquads(index);
-
-                        tol2 = get_tolerance(solver);
-
-                        if (dimquads > 3) {
-                            // ("dimquads - 3" because we've set stars A, B, and C at this point)
-                            add_stars(pq, field, D, dimquads-3, 0, newpoint, dimquads, solver, tol2);
-                        } else {
-                            TRY_ALL_CODES(pq, field, dimquads, solver, tol2);
+                                if (!pq->scale_ok) {
+                                    continue;
+                                }
+                                pq->inbox[field[C]] = TRUE;
+                                pq->ninbox = field[C] + 1;
+                                check_inbox(
+                                    pq,
+                                    field[C],
+                                    solver);
+                            }
                         }
-                        if (solver->quit_now)
-                            goto quitnow;
+                        phase_pquads_prepared = TRUE;
                     }
                 }
+                if (ab_phase_result <= 0) {
+                    for (field[A] = 0;
+                         field[A] < newpoint;
+                         field[A]++) {
+                        for (field[B] = field[A] + 1;
+                             field[B] < newpoint;
+                             field[B]++) {
+                            // grab the "pquad" for this AB combo
+                            pquad* pq =
+                                pquads +
+                                field[B] * numxy +
+                                field[A];
+                            if (!pq->scale_ok) {
+                                debug("  bad scale for A=%i, B=%i\n",
+                                      field[A],
+                                      field[B]);
+                                continue;
+                            }
+                            // test if this C is in the box:
+                            if (!phase_pquads_prepared) {
+                                pq->inbox[field[C]] = TRUE;
+                                pq->ninbox = field[C] + 1;
+                                check_inbox(pq, field[C], solver);
+                            }
+                            if (!pq->inbox[field[C]]) {
+                                debug("  C is not in the box for A=%i, "
+                                      "B=%i\n",
+                                      field[A],
+                                      field[B]);
+                                continue;
+                            }
+                            debug("  C is in the box for A=%i, B=%i\n",
+                                  field[A],
+                                  field[B]);
+                            debug("    box now:");
+                            print_inbox(pq);
+                            debug("\n");
+
+                            solver->rel_field_noise2 =
+                                pq->rel_field_noise2;
+
+                            for (i = 0;
+                                 i < pl_size(solver->indexes);
+                                 i++) {
+                                int dimquads;
+                                index_t* index =
+                                    pl_get(solver->indexes, i);
+                                if ((pq->scale < minAB2s[i]) ||
+                                    (pq->scale > maxAB2s[i])) {
+                                    continue;
+                                }
+
+                                set_index(solver, index);
+                                dimquads =
+                                    index_dimquads(index);
+
+                                tol2 = get_tolerance(solver);
+
+                                if (dimquads > 3) {
+                                    /*
+                                     * dimquads - 3 because A, B, and C
+                                     * are already fixed.
+                                     */
+                                    add_stars(
+                                        pq,
+                                        field,
+                                        D,
+                                        dimquads - 3,
+                                        0,
+                                        newpoint,
+                                        dimquads,
+                                        solver,
+                                        tol2,
+                                        &codekd_result);
+                                } else {
+                                    TRY_ALL_CODES(
+                                        pq,
+                                        field,
+                                        dimquads,
+                                        solver,
+                                        tol2,
+                                        &codekd_result);
+                                }
+                                if (solver->quit_now) {
+                                    solver_ab_phase_telemetry_report(
+                                        solver,
+                                        &phase_telemetry,
+                                        newpoint,
+                                        SOLVER_AB_PHASE_OFF_DIAGONAL,
+                                        SOLVER_AB_MODE_NATIVE);
+                                    goto quitnow;
+                                }
+                            }
+                        }
+                    }
+                }
+                solver_ab_phase_telemetry_report(
+                    solver,
+                    &phase_telemetry,
+                    newpoint,
+                    SOLVER_AB_PHASE_OFF_DIAGONAL,
+                    phase_mode);
             }
+
             logverb("object %u of %u: %i quads tried, %i matched.\n",
                     newpoint + 1, numxy, solver->numtries, solver->nummatches);
 
@@ -1034,13 +1974,23 @@ void solver_run(solver_t* solver) {
         }
 
     quitnow:
-        for (i = 0; i < (numxy*numxy); i++) {
-            pquad* pq = pquads + i;
-            free(pq->inbox);
-            free(pq->xy);
+        kdtree_free_query(codekd_result);
+
+        {
+            for (i = 0; i < (numxy*numxy); i++) {
+                pquad* pq = pquads + i;
+                free(pq->inbox);
+                free(pq->xy);
+            }
+            free(pquads);
         }
-        free(pquads);
     }
+
+finish:
+    solver->profile.solver_run_wall_seconds =
+        monotonic_seconds() - run_wall_start;
+    solver_profile_report(solver);
+    return solver->profile.execution_failed ? -1 : 0;
 }
 
 /**
@@ -1049,7 +1999,8 @@ void solver_run(solver_t* solver) {
  */
 static void try_all_codes(const pquad* pq,
                           const int* fieldstars, int dimquad,
-                          solver_t* solver, double tol2) {
+                          solver_t* solver, double tol2,
+                          kdtree_qres_t** presult) {
     int dimcode = (dimquad - 2) * 2;
     double code[DCMAX];
     double flipcode[DCMAX];
@@ -1076,8 +2027,13 @@ static void try_all_codes(const pquad* pq,
             debug("%s%g", (i?", ":""), code[i]);
         debug("].\n");
 
-        try_all_codes_2(fieldstars, dimquad, code, solver, FALSE, tol2);
+        try_all_codes_2(fieldstars, dimquad, code, solver, FALSE,
+                        tol2, presult);
     }
+
+    if (unlikely(solver->quit_now))
+        return;
+
     if (solver->parity == PARITY_FLIP ||
         solver->parity == PARITY_BOTH) {
 
@@ -1088,7 +2044,8 @@ static void try_all_codes(const pquad* pq,
             debug("%s%g", (i?", ":""), flipcode[i]);
         debug("].\n");
 
-        try_all_codes_2(fieldstars, dimquad, flipcode, solver, TRUE, tol2);
+        try_all_codes_2(fieldstars, dimquad, flipcode, solver, TRUE,
+                        tol2, presult);
     }
 }
 
@@ -1098,15 +2055,18 @@ static void try_all_codes(const pquad* pq,
  */
 static void try_all_codes_2(const int* fieldstars, int dimquad,
                             const double* code, solver_t* solver,
-                            anbool current_parity, double tol2) {
+                            anbool current_parity, double tol2,
+                            kdtree_qres_t** presult) {
     int i;
-    kdtree_qres_t* result = NULL;
     int dimcode = (dimquad - NBACK) * 2;
     int stars[DQMAX];
     double flipcode[DCMAX];
+    anbool placed[DQMAX];
+
+    if (unlikely(solver->quit_now))
+        return;
 
     // We actually only use elements up to dimquads-2.
-    anbool placed[DQMAX];
 
     // Un-flipped:
     stars[0] = fieldstars[0];
@@ -1115,10 +2075,12 @@ static void try_all_codes_2(const int* fieldstars, int dimquad,
     for (i=0; i<DQMAX; i++)
         placed[i] = FALSE;
 
-    try_permutations(fieldstars, dimquad, code, solver, current_parity,
-                     tol2, stars, NULL, 0, placed, &result);
+    try_permutations(fieldstars, dimquad, code, solver,
+                     current_parity, tol2, stars, NULL, 0,
+                     placed, presult);
+
     if (unlikely(solver->quit_now))
-        goto bailout;
+        return;
 
     // Flipped:
     stars[0] = fieldstars[1];
@@ -1130,11 +2092,9 @@ static void try_all_codes_2(const int* fieldstars, int dimquad,
     for (i=0; i<DQMAX; i++)
         placed[i] = FALSE;
 
-    try_permutations(fieldstars, dimquad, flipcode, solver, current_parity,
-                     tol2, stars, NULL, 0, placed, &result);
-
- bailout:
-    kdtree_free_query(result);
+    try_permutations(fieldstars, dimquad, flipcode, solver,
+                     current_parity, tol2, stars, NULL, 0,
+                     placed, presult);
 }
 
 /**
@@ -1146,7 +2106,6 @@ static void try_all_codes_2(const int* fieldstars, int dimquad,
  stars: only elements [0] and [1] are set; they will be equal to origstars [0],[1] or [1],[0].
  code: may be NULL, in which case use a local variable
  slot: 0 on initial call; incremented on recursive calls
- 
  */
 static void try_permutations(const int* origstars, int dimquad,
                              const double* origcode,
@@ -1156,8 +2115,6 @@ static void try_permutations(const int* origstars, int dimquad,
                              int slot, anbool* placed,
                              kdtree_qres_t** presult) {
     int i;
-    int options = KD_OPTIONS_SMALL_RADIUS | KD_OPTIONS_COMPUTE_DISTS |
-        KD_OPTIONS_NO_RESIZE_RESULTS | KD_OPTIONS_USE_SPLIT;
     double mycode[DCMAX];
     int Nstars = dimquad - NBACK;
     int lastslot = dimquad - NBACK - 1;
@@ -1204,7 +2161,8 @@ static void try_permutations(const int* origstars, int dimquad,
 
         // Check cx <= dx, if we're a "dx".
         if (slot > 0 && solver->index->cx_less_than_dx) {
-            if (code[2*(slot - 1) +0] > origcode[2*i +0] + solver->cxdx_margin) {
+            if (code[2*(slot - 1) +0] >
+                origcode[2*i +0] + solver->cxdx_margin) {
                 debug("cx <= dx check failed: %g > %g + %g\n",
                       code[2*(slot - 1) +0], origcode[2*i +0],
                       solver->cxdx_margin);
@@ -1230,7 +2188,7 @@ static void try_permutations(const int* origstars, int dimquad,
                 meanx += code[2*j];
             meanx /= (slot+1);
             if (meanx > 0.5 + solver->cxdx_margin) {
-                debug("meanx <= 0.5 check failed: %g > 0.5 + %g\n", 
+                debug("meanx <= 0.5 check failed: %g > 0.5 + %g\n",
                       meanx, solver->cxdx_margin);
                 solver->num_meanx_skipped++;
                 continue;
@@ -1241,73 +2199,381 @@ static void try_permutations(const int* origstars, int dimquad,
         if (slot < lastslot) {
             placed[i] = TRUE;
             try_permutations(origstars, dimquad, origcode, solver,
-                             current_parity, tol2, stars, code, 
+                             current_parity, tol2, stars, code,
                              slot+1, placed, presult);
             placed[i] = FALSE;
 
+            if (unlikely(solver->quit_now))
+                return;
         } else {
 #if defined(TESTING_TRYPERMUTATIONS)
             TEST_TRY_PERMUTATIONS(stars, code, dimquad, solver);
             continue;
 #endif
-				
-            // Search with the code we've built.
-            *presult = kdtree_rangesearch_options_reuse
-                (solver->index->codekd->tree, *presult, code, tol2, options);
-            //debug("      trying ABCD = [%i %i %i %i]: %i results.\n",
-            //fstars[A], fstars[B], fstars[C], fstars[D], result->nres);
-
-            if ((*presult)->nres) {
-                double pixvals[DQMAX*2];
-                int j;
-                for (j=0; j<dimquad; j++) {
-                    setx(pixvals, j, field_getx(solver, stars[j]));
-                    sety(pixvals, j, field_gety(solver, stars[j]));
-                }
-                resolve_matches(*presult, pixvals, stars, dimquad, solver,
-                                current_parity);
-            }
+            solver_execute_hypothesis_owner(
+                stars,
+                code,
+                dimquad,
+                solver,
+                current_parity,
+                tol2,
+                presult);
             if (unlikely(solver->quit_now))
                 return;
         }
     }
 }
 
-static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
-                            const int* fieldstars, int dimquads,
-                            solver_t* solver, anbool current_parity) {
-    // "field_xy" contains the xy pixel coordinates of stars A,B,C,D forming the quad
-    //    [x_A,y_A, x_B,y_B, x_C,y_C, ...]
+void solver_begin_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity) {
+    solver->profile.hypotheses_generated++;
+    if (solver->profile.max_batch_hypotheses < 1U) {
+        solver->profile.max_batch_hypotheses = 1U;
+    }
+    if (solver->profile.detailed) {
+        uint64_t hypothesis_digest =
+            solver_hypothesis_order_digest(
+                stars,
+                code,
+                dimquad,
+                current_parity);
+
+        solver->profile.hypothesis_order_hash =
+            solver_order_hash_mix(
+                solver->profile.hypothesis_order_hash,
+                hypothesis_digest);
+    }
+}
+
+static void solver_reduce_codekd_result_owner(
+    const int* stars,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    kdtree_qres_t* result,
+    double search_wall_seconds,
+    solver_candidate_delivery_record_t* prepared,
+    size_t prepared_quad_count,
+    size_t prepared_star_count) {
+    solver->profile.codekd_calls++;
+    solver->profile.hypotheses_executed++;
+    if (solver->profile.detailed) {
+        uint64_t kd_result_digest =
+            solver_kd_result_order_digest(result);
+
+        solver->profile.codekd_wall_seconds += search_wall_seconds;
+        solver->profile.kd_result_order_hash =
+            solver_order_hash_mix(
+                solver->profile.kd_result_order_hash,
+                kd_result_digest);
+    }
+    solver->profile.codekd_hits +=
+        (unsigned long long)result->nres;
+
+    if (solver_poll_worker_stop(solver)) {
+        return;
+    }
+    if (result->nres) {
+        double pixvals[DQMAX * 2];
+        double resolve_wall_start = 0.0;
+        int j;
+
+        for (j = 0; j < dimquad; j++) {
+            setx(pixvals, j, field_getx(solver, stars[j]));
+            sety(pixvals, j, field_gety(solver, stars[j]));
+        }
+        if (solver->profile.detailed) {
+            resolve_wall_start = monotonic_seconds();
+        }
+        resolve_matches_with_delivery(
+            result,
+            pixvals,
+            stars,
+            dimquad,
+            solver->numtries,
+            solver,
+            current_parity,
+            prepared,
+            0U,
+            prepared_quad_count,
+            prepared_star_count);
+        solver->profile.resolve_calls++;
+        if (solver->profile.detailed) {
+            solver->profile.resolve_wall_seconds +=
+                monotonic_seconds() - resolve_wall_start;
+        }
+    }
+    solver->profile.hypotheses_reduced++;
+}
+
+void solver_execute_prepared_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    kdtree_qres_t* result,
+    double search_wall_seconds,
+    solver_candidate_delivery_record_t* prepared,
+    size_t prepared_quad_count,
+    size_t prepared_star_count) {
+    if (!result || solver_poll_worker_stop(solver)) {
+        return;
+    }
+    solver_begin_hypothesis_owner(
+        stars, code, dimquad, solver, current_parity);
+    solver_reduce_codekd_result_owner(
+        stars,
+        dimquad,
+        solver,
+        current_parity,
+        result,
+        search_wall_seconds,
+        prepared,
+        prepared_quad_count,
+        prepared_star_count);
+}
+
+void solver_retire_codekd_failure_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    int search_errno,
+    double search_wall_seconds) {
+    if (!solver) {
+        return;
+    }
+    solver_begin_hypothesis_owner(
+        stars, code, dimquad, solver, current_parity);
+    solver->profile.codekd_calls++;
+    solver->profile.hypotheses_executed++;
+    if (solver->profile.detailed) {
+        solver->profile.codekd_wall_seconds += search_wall_seconds;
+    }
+    errno = search_errno;
+    if (search_errno == ECANCELED &&
+        solver_poll_worker_stop(solver)) {
+        solver->quit_now = TRUE;
+        return;
+    }
+    solver->profile.search_failures++;
+    solver->profile.execution_failed = TRUE;
+    solver->quit_now = TRUE;
+}
+
+void solver_execute_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    kdtree_qres_t** presult) {
+    double search_wall_seconds = 0.0;
+    double search_wall_start = 0.0;
+
+    if (solver_poll_worker_stop(solver)) {
+        return;
+    }
+    solver_begin_hypothesis_owner(
+        stars, code, dimquad, solver, current_parity);
+    if (solver->profile.detailed) {
+        search_wall_start = monotonic_seconds();
+    }
+    *presult = solver_codekd_rangesearch(
+        solver->index->codekd->tree,
+        *presult,
+        code,
+        tol2,
+        SOLVER_CODEKD_SEARCH_OPTIONS);
+    if (solver->profile.detailed) {
+        search_wall_seconds =
+            monotonic_seconds() - search_wall_start;
+    }
+
+    if (!*presult) {
+        solver->profile.codekd_calls++;
+        solver->profile.hypotheses_executed++;
+        if (solver->profile.detailed) {
+            solver->profile.codekd_wall_seconds +=
+                search_wall_seconds;
+        }
+        if (errno == ECANCELED &&
+            solver_poll_worker_stop(solver)) {
+            solver->quit_now = TRUE;
+            return;
+        }
+        solver->profile.search_failures++;
+        solver->profile.execution_failed = TRUE;
+        solver->quit_now = TRUE;
+        return;
+    }
+
+    solver_reduce_codekd_result_owner(
+        stars,
+        dimquad,
+        solver,
+        current_parity,
+        *presult,
+        search_wall_seconds,
+        NULL,
+        0U,
+        0U);
+}
+
+static void solver_index_payload_failure(
+    solver_t* solver,
+    const char* component) {
+    logerr("[solver-io] failed to decode %s payload\n",
+           component);
+    solver->profile.execution_failed = TRUE;
+    solver->quit_now = TRUE;
+}
+
+void resolve_matches_native_range(
+    kdtree_qres_t* krez,
+    const double* field_xy,
+    const int* fieldstars,
+    int dimquads,
+    int quads_tried,
+    solver_t* solver,
+    anbool current_parity,
+    int candidate_first,
+    int candidate_end,
+    solver_candidate_delivery_record_t* prepared,
+    size_t prepared_first,
+    size_t prepared_quad_count,
+    size_t prepared_star_count) {
     int jj, thisquadno;
     MatchObj mo;
-    unsigned int star[dimquads];
 
-    assert(krez);
-
-    for (jj = 0; jj < krez->nres; jj++) {
-        double starxyz[dimquads*3];
+    for (jj = candidate_first; jj < candidate_end; jj++) {
+        unsigned int star[DQMAX];
+        double starxyz[DQMAX*3];
         double scale;
         double arcsecperpix;
         tan_t wcs;
         int i;
         anbool outofbounds = FALSE;
+        anbool prepared_stars = FALSE;
+        anbool prepared_candidate = FALSE;
         double abscale;
+        solver_candidate_delivery_record_t* record = NULL;
+
+        if (solver_poll_worker_stop(solver)) {
+            return;
+        }
 
         solver->nummatches++;
         thisquadno = krez->inds[jj];
-        quadfile_get_stars(solver->index->quads, thisquadno, star);
-        for (i=0; i<dimquads; i++) {
-            startree_get(solver->index->starkd, star[i], starxyz + 3*i);
-            if (solver->use_radec)
-                if (distsq(starxyz + 3*i, solver->centerxyz, 3) > solver->r2) {
+
+        if (prepared && (size_t)jj >= prepared_first &&
+            (size_t)jj - prepared_first < prepared_quad_count &&
+            prepared[(size_t)jj - prepared_first].quadid ==
+                (unsigned int)thisquadno) {
+            record = &prepared[(size_t)jj - prepared_first];
+            memcpy(star, record->stars,
+                   (size_t)dimquads * sizeof(*star));
+        } else if (quadfile_get_stars(
+                       solver->index->quads,
+                       thisquadno,
+                       star)) {
+            solver_index_payload_failure(
+                solver, "QuadFile");
+            return;
+        }
+        if (record && (size_t)jj >= prepared_first &&
+            (size_t)jj - prepared_first <
+                prepared_star_count) {
+            prepared_stars = TRUE;
+            if (record->candidate_prepared &&
+                record->prepared_parity == current_parity &&
+                !memcmp(
+                    record->prepared_fieldstars,
+                    fieldstars,
+                    (size_t)dimquads *
+                        sizeof(*fieldstars)) &&
+                !memcmp(
+                    record->prepared_fieldxy,
+                    field_xy,
+                    (size_t)dimquads * 2U *
+                        sizeof(*field_xy))) {
+                prepared_candidate = TRUE;
+                memcpy(
+                    starxyz,
+                    record->starxyz,
+                    (size_t)dimquads * 3U *
+                        sizeof(*starxyz));
+            }
+        }
+        if (record && !prepared_candidate) {
+            solver_codekd_record_clear_verification_speculation(
+                record);
+        }
+
+
+        if (solver->use_radec) {
+            /*
+             * Preserve the original all-star loading and rejection order
+             * when the sky-position constraint depends on every quad star.
+             */
+            for (i = 0; i < dimquads; i++) {
+                if (prepared_stars) {
+                    memcpy(starxyz + 3 * i,
+                           record->starxyz + 3 * i,
+                           3U * sizeof(*starxyz));
+                } else if (startree_get(
+                        solver->index->starkd,
+                        star[i],
+                        starxyz + 3 * i)) {
+                    solver_index_payload_failure(
+                        solver, "StarKD");
+                    return;
+                }
+
+                if (distsq(starxyz + 3 * i,
+                           solver->centerxyz,
+                           3) > solver->r2) {
                     outofbounds = TRUE;
                     break;
                 }
-        }
-        if (outofbounds) {
-            debug("Quad match is out of bounds.\n");
-            solver->num_radec_skipped++;
-            continue;
+            }
+            if (outofbounds) {
+                debug("Quad match is out of bounds.\n");
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_RADEC_SKIP,
+                    thisquadno,
+                    krez->sdists[jj]);
+                solver->num_radec_skipped++;
+                continue;
+            }
+        } else {
+            /*
+             * The quick scale gate uses only A and B. Consume C/D/E only
+             * after the candidate has passed that gate.
+             */
+            if (prepared_stars) {
+                memcpy(starxyz, record->starxyz,
+                       6U * sizeof(*starxyz));
+            } else if (startree_get(
+                    solver->index->starkd,
+                    star[0],
+                    starxyz) ||
+                startree_get(
+                    solver->index->starkd,
+                    star[1],
+                    starxyz + 3)) {
+                solver_index_payload_failure(
+                    solver, "StarKD");
+                return;
+            }
         }
 
         debug("        stars [");
@@ -1315,31 +2581,138 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
             debug("%s%i", (i?" ":""), star[i]);
         debug("]\n");
 
-        // Quick-n-dirty scale estimate based on two stars.
-        // in (rad per pix)**2
-        abscale = square(distsq2rad(distsq(starxyz, starxyz+3, 3))) / 
-            distsq(field_xy, field_xy+2, 2);
-        if (abscale > solver->abscale_high ||
-            abscale < solver->abscale_low) {
-            solver->num_abscale_skipped++;
-            continue;
-        }
+        if (prepared_candidate) {
+            switch (record->plan_action) {
+            case SOLVER_AB_CANDIDATE_RADEC_SKIP:
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_RADEC_SKIP,
+                    thisquadno,
+                    krez->sdists[jj]);
+                solver->num_radec_skipped++;
+                solver->profile.candidate_math_reused++;
+                continue;
 
-        // compute TAN projection from the matching quad alone.
-        if (fit_tan_wcs(starxyz, field_xy, dimquads, &wcs, &scale)) {
-            // bad quad.
-            logverb("bad quad at %s:%i\n", __FILE__, __LINE__);
-            continue;
-        }
-        arcsecperpix = scale * 3600.0;
+            case SOLVER_AB_CANDIDATE_ABSCALE_SKIP:
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_ABSCALE_SKIP,
+                    thisquadno,
+                    krez->sdists[jj]);
+                solver->num_abscale_skipped++;
+                solver->profile.candidate_math_reused++;
+                continue;
 
-        // FIXME - should there be scale fudge here?
-        if (arcsecperpix > solver->funits_upper ||
-            arcsecperpix < solver->funits_lower) {
-            debug("          bad scale (%g arcsec/pix, range %g %g)\n",
-                  arcsecperpix, solver->funits_lower, solver->funits_upper);
-            continue;
+            case SOLVER_AB_CANDIDATE_BAD_QUAD:
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_BAD_QUAD,
+                    thisquadno,
+                    krez->sdists[jj]);
+                solver->profile.candidate_math_reused++;
+                logverb("bad quad at %s:%i\n", __FILE__, __LINE__);
+                continue;
+
+            case SOLVER_AB_CANDIDATE_SCALE_SKIP:
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_SCALE_SKIP,
+                    thisquadno,
+                    krez->sdists[jj]);
+                solver->profile.candidate_math_reused++;
+                debug("          bad scale (%g arcsec/pix, range %g %g)\n",
+                      record->prepared_scale,
+                      solver->funits_lower,
+                      solver->funits_upper);
+                continue;
+
+            case SOLVER_AB_CANDIDATE_VERIFY:
+                memcpy(&wcs, &record->prepared_wcs, sizeof(wcs));
+                arcsecperpix = record->prepared_scale;
+                solver->profile.candidate_math_reused++;
+                break;
+
+            default:
+                prepared_candidate = FALSE;
+                break;
+            }
         }
+        if (record && !prepared_candidate) {
+            solver_codekd_record_clear_verification_speculation(
+                record);
+        }
+        if (!prepared_candidate) {
+            // Quick-n-dirty scale estimate based on two stars.
+            // in (rad per pix)**2
+            abscale = square(distsq2rad(distsq(
+                starxyz, starxyz + 3, 3))) /
+                distsq(field_xy, field_xy + 2, 2);
+            if (abscale > solver->abscale_high ||
+                abscale < solver->abscale_low) {
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_ABSCALE_SKIP,
+                    thisquadno,
+                    krez->sdists[jj]);
+                solver->num_abscale_skipped++;
+                continue;
+            }
+
+            if (!solver->use_radec) {
+                for (i = 2; i < dimquads; i++) {
+                    if (prepared_stars) {
+                        memcpy(starxyz + 3 * i,
+                               record->starxyz + 3 * i,
+                               3U * sizeof(*starxyz));
+                    } else if (startree_get(
+                                   solver->index->starkd,
+                                   star[i],
+                                   starxyz + 3 * i)) {
+                        solver_index_payload_failure(
+                            solver, "StarKD");
+                        return;
+                    }
+                }
+            }
+
+            // compute TAN projection from the matching quad alone.
+            if (fit_tan_wcs(
+                    starxyz,
+                    field_xy,
+                    dimquads,
+                    &wcs,
+                    &scale)) {
+                // bad quad.
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_BAD_QUAD,
+                    thisquadno,
+                    krez->sdists[jj]);
+                logverb("bad quad at %s:%i\n", __FILE__, __LINE__);
+                continue;
+            }
+            arcsecperpix = scale * 3600.0;
+
+            // FIXME - should there be scale fudge here?
+            if (arcsecperpix > solver->funits_upper ||
+                arcsecperpix < solver->funits_lower) {
+                solver_record_candidate_order(
+                    solver,
+                    SOLVER_AB_CANDIDATE_SCALE_SKIP,
+                    thisquadno,
+                    krez->sdists[jj]);
+                debug("          bad scale (%g arcsec/pix, range %g %g)\n",
+                      arcsecperpix,
+                      solver->funits_lower,
+                      solver->funits_upper);
+                continue;
+            }
+        }
+        solver_record_candidate_order(
+            solver,
+            SOLVER_AB_CANDIDATE_VERIFY,
+            thisquadno,
+            krez->sdists[jj]);
         solver->numscaleok++;
 
         set_matchobj_template(solver, &mo);
@@ -1348,7 +2721,7 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
         mo.code_err = krez->sdists[jj];
         mo.scale = arcsecperpix;
         mo.parity = current_parity;
-        mo.quads_tried = solver->numtries;
+        mo.quads_tried = quads_tried;
         mo.quads_matched = solver->nummatches;
         mo.quads_scaleok = solver->numscaleok;
         mo.quad_npeers = krez->nres;
@@ -1366,11 +2739,126 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
 
         set_center_and_radius(solver, &mo, &(mo.wcstan), NULL);
 
-        if (solver_handle_hit(solver, &mo, NULL, FALSE))
+        if (record && record->verify_query &&
+            (!prepared_candidate ||
+             record->plan_action !=
+                 SOLVER_AB_CANDIDATE_VERIFY)) {
+            verify_destroy_index_query(record->verify_query);
+            record->verify_query = NULL;
+        }
+        if (record && prepared_candidate &&
+            record->plan_action ==
+                SOLVER_AB_CANDIDATE_VERIFY &&
+            record->prepared_verification &&
+            record->verification_score_ready) {
+            if (solver_handle_scored_query_hit(
+                    solver,
+                    &mo,
+                    NULL,
+                    FALSE,
+                    record)) {
+                solver->quit_now = TRUE;
+            }
+        } else if (record && prepared_candidate &&
+            record->plan_action ==
+                SOLVER_AB_CANDIDATE_VERIFY &&
+            record->verify_query) {
+            if (solver_handle_query_hit(
+                    solver,
+                    &mo,
+                    NULL,
+                    FALSE,
+                    &record->verify_query)) {
+                solver->quit_now = TRUE;
+            }
+        } else if (solver_handle_hit(
+                       solver, &mo, NULL, FALSE)) {
             solver->quit_now = TRUE;
+        }
 
         if (unlikely(solver->quit_now))
             return;
+    }
+}
+
+static void resolve_matches_with_delivery(
+    kdtree_qres_t* krez,
+    const double* field_xy,
+    const int* fieldstars,
+    int dimquads,
+    int quads_tried,
+    solver_t* solver,
+    anbool current_parity,
+    solver_candidate_delivery_record_t* prepared,
+    size_t prepared_first,
+    size_t prepared_quad_count,
+    size_t prepared_star_count) {
+    size_t window_first;
+
+    /*
+     * field_xy contains [x_A, y_A, x_B, y_B, ...]. Cold payloads remain on
+     * the original owner-local path. Prepared verification is permitted only
+     * when its complete Quad/Star input is already resident.
+     */
+    assert(krez);
+    assert(dimquads > 0);
+    assert(dimquads <= DQMAX);
+
+    if (!solver_payload_candidate_data_fully_resident(solver)) {
+        resolve_matches_native_range(
+            krez,
+            field_xy,
+            fieldstars,
+            dimquads,
+            quads_tried,
+            solver,
+            current_parity,
+            0,
+            krez->nres,
+            prepared,
+            prepared_first,
+            prepared_quad_count,
+            prepared_star_count);
+        return;
+    }
+
+    window_first = 0U;
+    while (window_first < (size_t)krez->nres) {
+        size_t window_end = MIN(
+            (size_t)krez->nres,
+            window_first +
+                (size_t)SOLVER_VERIFICATION_WINDOW_CANDIDATES);
+        int handled = solver_ab_try_verification_wave(
+            krez,
+            field_xy,
+            fieldstars,
+            dimquads,
+            quads_tried,
+            solver,
+            current_parity,
+            (int)window_first,
+            (int)window_end);
+
+        if (!handled) {
+            resolve_matches_native_range(
+                krez,
+                field_xy,
+                fieldstars,
+                dimquads,
+                quads_tried,
+                solver,
+                current_parity,
+                (int)window_first,
+                (int)window_end,
+                NULL,
+                0U,
+                0U,
+                0U);
+        }
+        if (solver->quit_now || solver_poll_worker_stop(solver)) {
+            return;
+        }
+        window_first = window_end;
     }
 }
 
@@ -1378,11 +2866,13 @@ void solver_inject_match(solver_t* solver, MatchObj* mo, sip_t* sip) {
     solver_handle_hit(solver, mo, sip, TRUE);
 }
 
-static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
-                             anbool fake_match) {
-    double match_distance_in_pixels2;
-    anbool solved;
-    double logaccept;
+double solver_prepare_hit_for_verify(
+    solver_t* sp,
+    MatchObj* mo,
+    double* logaccept) {
+    assert(sp);
+    assert(mo);
+    assert(logaccept);
 
     mo->indexid = sp->index->indexid;
     mo->healpix = sp->index->healpix;
@@ -1390,11 +2880,33 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
     mo->wcstan.imagew = sp->field_maxx;
     mo->wcstan.imageh = sp->field_maxy;
     mo->dimquads = quadfile_dimquads(sp->index->quads);
-
-    match_distance_in_pixels2 = square(sp->verify_pix) +
+    *logaccept = MIN(
+        sp->logratio_tokeep,
+        sp->logratio_totune);
+    return square(sp->verify_pix) +
         square(sp->index->index_jitter / mo->scale);
+}
 
-    logaccept = MIN(sp->logratio_tokeep, sp->logratio_totune);
+int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
+                      anbool fake_match) {
+    double match_distance_in_pixels2;
+    double verify_wall_start = 0.0;
+    double logaccept;
+
+    assert(sp);
+    assert(mo);
+
+    if (solver_poll_worker_stop(sp)) {
+        return FALSE;
+    }
+
+    match_distance_in_pixels2 =
+        solver_prepare_hit_for_verify(
+            sp, mo, &logaccept);
+
+    if (sp->profile.detailed) {
+        verify_wall_start = monotonic_seconds();
+    }
 
     verify_hit(sp->index->starkd, sp->index->cutnside,
                mo, verifysip, sp->vf, match_distance_in_pixels2,
@@ -1402,6 +2914,228 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                sp->logratio_bail_threshold, logaccept,
                sp->logratio_stoplooking,
                sp->distance_from_quad_bonus, fake_match);
+    sp->profile.verify_calls++;
+
+    if (sp->profile.detailed) {
+        sp->profile.verify_wall_seconds +=
+            monotonic_seconds() - verify_wall_start;
+    }
+
+    return solver_handle_hit_after_verify(
+        sp,
+        mo,
+        verifysip,
+        fake_match,
+        match_distance_in_pixels2);
+}
+
+/*
+ * Continue one canonical owner verification from the exact native StarKD
+ * query retained by the delivery packet. Allocation or preparation failure
+ * falls back before MatchObj publication to the original verify_hit() path.
+ */
+static int solver_handle_query_hit(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* verifysip,
+    anbool fake_match,
+    verify_index_query_t** query) {
+    verify_prepared_hit_t* prepared = NULL;
+    verify_prepared_score_t score;
+    double match_distance_in_pixels2;
+    double verify_wall_start = 0.0;
+    double logaccept;
+    int status;
+
+    assert(sp);
+    assert(mo);
+
+    if (!query || !*query) {
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+    if (solver_poll_worker_stop(sp)) {
+        verify_destroy_index_query(*query);
+        *query = NULL;
+        return FALSE;
+    }
+
+    match_distance_in_pixels2 =
+        solver_prepare_hit_for_verify(
+            sp, mo, &logaccept);
+    memset(&score, 0, sizeof(score));
+    if (sp->profile.detailed) {
+        verify_wall_start = monotonic_seconds();
+    }
+    status = verify_prepare_hit_from_query(
+        sp->index->starkd,
+        query,
+        sp->index->cutnside,
+        mo,
+        verifysip,
+        sp->vf,
+        match_distance_in_pixels2,
+        sp->distractor_ratio,
+        sp->field_maxx,
+        sp->field_maxy,
+        sp->logratio_bail_threshold,
+        logaccept,
+        sp->logratio_stoplooking,
+        sp->distance_from_quad_bonus,
+        fake_match,
+        &prepared);
+    if (status ||
+        verify_score_prepared_hit(prepared, &score)) {
+        verify_destroy_prepared_score(&score);
+        verify_destroy_prepared_hit(prepared);
+        verify_destroy_index_query(*query);
+        *query = NULL;
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+    if (verify_finish_prepared_hit(
+            prepared, &score, mo)) {
+        verify_destroy_prepared_score(&score);
+        verify_destroy_prepared_hit(prepared);
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+    verify_destroy_prepared_hit(prepared);
+    sp->profile.verify_calls++;
+    if (sp->profile.detailed) {
+        sp->profile.verify_wall_seconds +=
+            monotonic_seconds() - verify_wall_start;
+    }
+    return solver_handle_hit_after_verify(
+        sp,
+        mo,
+        verifysip,
+        fake_match,
+        match_distance_in_pixels2);
+}
+
+/*
+ * Finish one already scored immutable verification context on the solver
+ * owner. Any changed live verification parameter invalidates speculation and
+ * replays the exact native path before scientific state is published.
+ */
+static int solver_handle_scored_query_hit(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* verifysip,
+    anbool fake_match,
+    solver_candidate_delivery_record_t* record) {
+    double match_distance_in_pixels2;
+    double verify_wall_start = 0.0;
+    double logaccept;
+
+    assert(sp);
+    assert(mo);
+
+    if (!record || fake_match ||
+        record->verify_query ||
+        !record->prepared_verification ||
+        !record->verification_score_ready) {
+        if (record) {
+            if (record->verification_score_ready) {
+                sp->profile.verification_score_fallback_batches++;
+            }
+            solver_codekd_record_clear_prepared_verification(record);
+        }
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+    if (solver_poll_worker_stop(sp)) {
+        solver_codekd_record_clear_prepared_verification(record);
+        return FALSE;
+    }
+
+    match_distance_in_pixels2 =
+        solver_prepare_hit_for_verify(
+            sp, mo, &logaccept);
+    if (memcmp(
+            mo->center,
+            record->verify_center,
+            sizeof(mo->center)) ||
+        memcmp(
+            &mo->radius,
+            &record->verify_radius,
+            sizeof(mo->radius)) ||
+        memcmp(
+            &match_distance_in_pixels2,
+            &record->prepared_verify_pix2,
+            sizeof(match_distance_in_pixels2)) ||
+        memcmp(
+            &logaccept,
+            &record->prepared_logaccept,
+            sizeof(logaccept)) ||
+        memcmp(
+            &sp->distractor_ratio,
+            &record->prepared_distractor_ratio,
+            sizeof(sp->distractor_ratio)) ||
+        memcmp(
+            &sp->logratio_bail_threshold,
+            &record->prepared_logratio_bail_threshold,
+            sizeof(sp->logratio_bail_threshold)) ||
+        memcmp(
+            &sp->logratio_stoplooking,
+            &record->prepared_logratio_stoplooking,
+            sizeof(sp->logratio_stoplooking)) ||
+        memcmp(
+            &sp->field_maxx,
+            &record->prepared_field_maxx,
+            sizeof(sp->field_maxx)) ||
+        memcmp(
+            &sp->field_maxy,
+            &record->prepared_field_maxy,
+            sizeof(sp->field_maxy)) ||
+        sp->distance_from_quad_bonus !=
+            record->prepared_distance_from_quad_bonus) {
+        sp->profile.verification_score_fallback_batches++;
+        solver_codekd_record_clear_prepared_verification(record);
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+
+    if (sp->profile.detailed) {
+        verify_wall_start = monotonic_seconds();
+    }
+    if (verify_finish_prepared_hit(
+            record->prepared_verification,
+            &record->prepared_score,
+            mo)) {
+        sp->profile.verification_score_fallback_batches++;
+        if (sp->profile.detailed) {
+            sp->profile.verify_wall_seconds +=
+                monotonic_seconds() - verify_wall_start;
+        }
+        solver_codekd_record_clear_prepared_verification(record);
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+    solver_codekd_record_clear_prepared_verification(record);
+    sp->profile.verify_calls++;
+    if (sp->profile.detailed) {
+        sp->profile.verify_wall_seconds +=
+            monotonic_seconds() - verify_wall_start;
+    }
+    return solver_handle_hit_after_verify(
+        sp,
+        mo,
+        verifysip,
+        fake_match,
+        match_distance_in_pixels2);
+}
+
+int solver_handle_hit_after_verify(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* verifysip,
+    anbool fake_match,
+    double match_distance_in_pixels2) {
+    double verify_wall_start = 0.0;
+    anbool solved;
+
     mo->nverified = sp->num_verified++;
 
     if (mo->logodds >= sp->best_logodds) {
@@ -1411,6 +3145,11 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
 
     if (mo->logodds >= sp->logratio_totune &&
         mo->logodds < sp->logratio_tokeep) {
+        if (solver_poll_worker_stop(sp)) {
+            solver_discard_verified_match(mo);
+            return FALSE;
+        }
+
         logverb("Trying to tune up this solution (logodds = %g; %g)...\n",
                 mo->logodds, exp(mo->logodds));
         solver_tweak2(sp, mo, 1, NULL);
@@ -1420,6 +3159,15 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
         // Since we tuned up this solution, we can't just accept the
         // resulting log-odds at face value.
         if (!fake_match) {
+            if (solver_poll_worker_stop(sp)) {
+                solver_discard_verified_match(mo);
+                return FALSE;
+            }
+
+            if (sp->profile.detailed) {
+                verify_wall_start = monotonic_seconds();
+            }
+
             verify_hit(sp->index->starkd, sp->index->cutnside,
                        mo, mo->sip, sp->vf, match_distance_in_pixels2,
                        sp->distractor_ratio,
@@ -1429,6 +3177,13 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                        sp->logratio_stoplooking,
                        sp->distance_from_quad_bonus,
                        fake_match);
+            sp->profile.verify_calls++;
+
+            if (sp->profile.detailed) {
+                sp->profile.verify_wall_seconds +=
+                    monotonic_seconds() - verify_wall_start;
+            }
+
             logverb("Checking tuned result: logodds = %g (%g)\n",
                     mo->logodds, exp(mo->logodds));
         }
@@ -1449,7 +3204,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
         mo->quadpix_orig[2*i+0] = starxy_getx(sp->fieldxy_orig, mo->field[i]);
         mo->quadpix_orig[2*i+1] = starxy_gety(sp->fieldxy_orig, mo->field[i]);
     }
-    
+
     update_timeused(sp);
     mo->timeused = sp->timeused;
 
@@ -1551,7 +3306,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                 printf("Initial SIP on distorted positions:\n");
                 sip_print(sip);
             }
-            
+
             int doshift = 1;
             fit_sip_wcs(matchxyz, matchxy, weights, Ngood, &(sip->wcstan),
                         sp->tweak_aborder, sp->tweak_abporder, doshift,
@@ -1571,7 +3326,7 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                         xx, yy, matchxy[2*i+0], matchxy[2*i+1]);
             }
             mo->sip = sip;
-            
+
         } else {
             // Take the coordinates after applying the --predistort,
             // fit a TAN to those, and include the --predistort in the output
@@ -1673,6 +3428,11 @@ solver_t* solver_new() {
 
 void solver_set_default_values(solver_t* solver) {
     memset(solver, 0, sizeof(solver_t));
+
+    fitsbin_mmap_advice_state_init(
+        &solver->index_mmap_policy,
+        fitsbin_get_configured_mmap_policy());
+
     solver->indexes = pl_new(16);
     solver->funits_upper = LARGE_VAL;
     solver->logratio_bail_threshold = log(1e-100);

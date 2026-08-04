@@ -20,28 +20,37 @@
 #include <getopt.h>
 #include <dirent.h>
 #include <assert.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "math.h"
 
-#include "mathutil.h"
-#include "ioutils.h"
-#include "fileutils.h"
-#include "bl.h"
 #include "an-bool.h"
-#include "solver.h"
-#include "fitsioutils.h"
-#include "solverutils.h"
-#include "os-features.h"
-#include "onefield.h"
-#include "log.h"
 #include "anqfits.h"
-#include "errors.h"
+#include "astrometry/index_shard.h"
+#include "astrometry/index_residency.h"
+#include "bl.h"
 #include "engine.h"
-#include "tic.h"
+#include "errors.h"
+#include "fileutils.h"
+#include "fitsioutils.h"
 #include "healpix.h"
-#include "sip-utils.h"
-#include "multiindex.h"
 #include "indexset.h"
+#include "ioutils.h"
+#include "log.h"
+#include "mathutil.h"
+#include "multiindex.h"
+#include "onefield.h"
+#include "os-features.h"
+#include "sip-utils.h"
+#include "solver.h"
+#include "solverutils.h"
+#include "tic.h"
+#include "index_shard_config.h"
+#include "engine_internal.h"
+#include "engine_private.h"
 
 void engine_add_search_path(engine_t* engine, const char* path) {
     sl_append(engine->index_paths, path);
@@ -61,7 +70,7 @@ char* engine_find_index(engine_t* engine, const char* name) {
             }
         else
             asprintf_safe(&path, "%s/%s", sl_get(engine->index_paths, j), name);
-        
+
         logverb("Trying path %s...\n", path);
         if (index_is_file_index(path))
             return path;
@@ -193,7 +202,13 @@ int engine_add_index(engine_t* engine, char* path) {
     free(base);
 
     t0 = timenow();
-    ind = index_load(path, engine->inparallel ? 0 : INDEX_ONLY_LOAD_METADATA, NULL);
+    /*
+     * Ordinary registration is always metadata-only. Legacy grouped mode
+     * still loads all selected filename-owned indexes together inside
+     * onefield; it no longer needs every configured payload resident before
+     * scale and sky selection.
+     */
+    ind = index_load(path, INDEX_ONLY_LOAD_METADATA, NULL);
     debug("index_load(\"%s\") took %g ms\n", path, 1000 * (timenow() - t0));
     if (!ind) {
         ERROR("Failed to load index from path %s", path);
@@ -206,31 +221,6 @@ int engine_add_index(engine_t* engine, char* path) {
     pl_append(engine->free_indexes, ind);
     return 0;
 }
-
-static void add_index_to_onefield(engine_t* engine, onefield_t* bp,
-                               int i) {
-    index_t* index;
-    index = pl_get(engine->indexes, i);
-    if (engine->inparallel) {
-        // The "indexset" feature means that we can get here without having
-        // actually loaded the index yet.
-        if (!index->codekd) {
-            char* ifn = index->indexfn;
-            char* iname = index->indexname;
-            logverb("Loading index %s\n", ifn);
-            if (!index_load(ifn, 0, index)) {
-                ERROR("Failed to load index %s\n", index->indexname);
-                return;
-            }
-            free(iname);
-            free(ifn);
-        }
-        onefield_add_loaded_index(bp, index);
-    } else {
-        onefield_add_index(bp, index->indexname);
-    }
-}
-
 int engine_parse_config_file(engine_t* engine, const char* fn) {
     FILE* fconf;
     int rtn;
@@ -299,6 +289,27 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
             engine->maxwidth = atof(nextword);
         } else if (is_word(line, "cpulimit ", &nextword)) {
             engine->cpulimit = atof(nextword);
+        } else if (is_word(line, "walllimit ", &nextword) ||
+                   is_word(line, "wall_limit ", &nextword)) {
+            engine->walllimit = atof(nextword);
+        } else if (is_word(line, "p_workers ", &nextword) ||
+                   is_word(line, "index_shard_workers ", &nextword)) {
+            int available_cpus = index_shard_config_available_cpus();
+            int requested_workers;
+
+            if (index_shard_config_parse_workers(nextword,
+                                                 available_cpus,
+                                                 &requested_workers)) {
+                ERROR("Invalid p_workers value \"%s\": "
+                      "expected \"auto\" or an integer from 1 through %i",
+                      nextword,
+                      available_cpus);
+                rtn = -1;
+                goto done;
+            }
+
+            engine->index_shard_workers_config = requested_workers;
+            engine->index_shard_workers_config_set = TRUE;
         } else if (is_word(line, "depths ", &nextword)) {
             if (parse_depth_string(engine->default_depths, nextword)) {
                 rtn = -1;
@@ -370,7 +381,7 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
             }
             pl_append(engine->free_indexes, indx);
             logverb("Added index %s from indexset %s\n", indx->indexfn, ind);
-            
+
             i++;
         }
         pl_free(indexes);
@@ -448,50 +459,35 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
     return rtn;
 }
 
-static job_t* job_new() {
-    job_t* job = calloc(1, sizeof(job_t));
-    if (!job) {
-        SYSERROR("Failed to allocate a new job_t.");
-        return NULL;
-    }
-    job->scales = dl_new(8);
-    job->depths = il_new(8);
-    return job;
-}
-
-void job_free(job_t* job) {
-    if (!job)
-        return;
-    dl_free(job->scales);
-    il_free(job->depths);
-    free(job);
-}
-
-static double job_imagew(job_t* job) {
-    return job->bp.solver.field_maxx;
-}
-static double job_imageh(job_t* job) {
-    return job->bp.solver.field_maxy;
-}
-
 int engine_run_job(engine_t* engine, job_t* job) {
     onefield_t* bp = &(job->bp);
     solver_t* sp = &(bp->solver);
-    
-    int i;
+
+    int rtn = 0;
     double app_min_default;
     double app_max_default;
-    anbool solved = FALSE;
+    double engine_wall_start = monotonic_seconds();
+    double pool_start_seconds = 0.0;
+    double pool_stop_seconds = 0.0;
+    anbool index_shard_pool_started = FALSE;
+    anbool legacy_grouped =
+        engine->inparallel && !job->index_shard_workers_controlled;
+    index_residency_t* residency = NULL;
+    engine_pass_cursor_t pass_cursor;
+    engine_pass_t pass;
 
     if (onefield_is_run_obsolete(bp, sp)) {
         goto finish;
     }
+    // SECTION INDEX-SHARD: engine-lifecycle
+    bp->time_total_start = monotonic_seconds();
+    bp->cpu_total_start = get_cpu_usage();
+    bp->indexes_inparallel = legacy_grouped;
 
-    app_min_default = deg2arcsec(engine->minwidth) / job_imagew(job);
-    app_max_default = deg2arcsec(engine->maxwidth) / job_imagew(job);
-
-    if (engine->inparallel)
-        bp->indexes_inparallel = TRUE;
+    app_min_default = deg2arcsec(engine->minwidth) /
+        engine_job_imagew(job);
+    app_max_default = deg2arcsec(engine->maxwidth) /
+        engine_job_imagew(job);
 
     if (job->use_radec_center) {
         logmsg("Only searching for solutions within %g degrees of RA,Dec (%g,%g)\n",
@@ -499,51 +495,81 @@ int engine_run_job(engine_t* engine, job_t* job) {
         solver_set_radec(sp, job->ra_center, job->dec_center, job->search_radius);
     }
 
-    for (i=0; i<il_size(job->depths)/2; i++) {
-        int startobj = il_get(job->depths, i*2);
-        int endobj = il_get(job->depths, i*2+1);
-        int j;
+    if (onefield_job_field_cache_begin(bp)) {
+        ERROR("Failed to initialize job field cache");
+        rtn = -1;
+        goto finish;
+    }
 
-        if (startobj || endobj) {
-            // make depth ranges be inclusive.
-            endobj++;
-            // up to this point they are 1-indexed, but with default value
-            // zero; onefield uses 0-indexed.
-            if (startobj)
-                startobj--;
-            if (endobj)
-                endobj--;
+    residency = engine_index_residency_begin(engine, bp);
+
+    if (index_shard_pthread_enabled(bp) && !legacy_grouped) {
+        double pool_wall_start = monotonic_seconds();
+
+        if (index_shard_pool_start(bp, sp)) {
+            ERROR("Failed to start parallel solver pool");
+            rtn = -1;
+            goto finish;
         }
 
-        for (j=0; j<dl_size(job->scales) / 2; j++) {
+        pool_start_seconds =
+            monotonic_seconds() - pool_wall_start;
+        index_shard_pool_started = TRUE;
+    }
+
+    engine_pass_cursor_init(&pass_cursor);
+    while (engine_pass_cursor_next(
+               job,
+               app_min_default,
+               app_max_default,
+               &pass_cursor,
+               &pass)) {
             double fmin, fmax;
             double app_max, app_min;
             int k;
             il* indexlist;
+            il* selectedlist;
+            anbool selected_loaded_index = FALSE;
+            anbool pass_limit_reached = FALSE;
+
+            /*
+             * Index selection and materialization can be expensive and fault
+             * mapped metadata.  A job budget is terminal across the whole
+             * pass sequence; never start another pass after it expires.
+             */
+            if (onefield_check_total_limits(bp)) {
+                break;
+            }
 
             // arcsec per pixel range
-            app_min = dl_get(job->scales, j * 2);
-            app_max = dl_get(job->scales, j * 2 + 1);
-            if (app_min == 0.0)
-                app_min = app_min_default;
-            if (app_max == 0.0)
-                app_max = app_max_default;
-            sp->funits_lower = app_min;
-            sp->funits_upper = app_max;
-
-            sp->startobj = startobj;
-            if (endobj)
-                sp->endobj = endobj;
+            app_min = pass.funits_lower;
+            app_max = pass.funits_upper;
+            engine_pass_apply(sp, &pass);
+            bp->engine_pass_ordinal = pass.ordinal;
+            bp->engine_depth_index = pass.depth_index;
+            bp->engine_scale_index = pass.scale_index;
+            logverb("[engine-pass] state=begin ordinal=%zu "
+                    "depth_index=%zu scale_index=%zu "
+                    "startobj=%i endobj=%i "
+                    "funits_lower=%.17g funits_upper=%.17g\n",
+                    pass.ordinal,
+                    pass.depth_index,
+                    pass.scale_index,
+                    pass.startobj,
+                    pass.endobj,
+                    pass.funits_lower,
+                    pass.funits_upper);
 
             // minimum quad size to try (in pixels)
             sp->quadsize_min = bp->quad_size_fraction_lo *
-                MIN(job_imagew(job), job_imageh(job));
+                MIN(engine_job_imagew(job), engine_job_imageh(job));
 
             // range of quad sizes that could be found in the field,
             // in arcsec.
             // the hypotenuse...
             fmax = bp->quad_size_fraction_hi *
-                hypot(job_imagew(job), job_imageh(job)) * app_max;
+                hypot(engine_job_imagew(job), engine_job_imageh(job)) *
+                app_max;
             fmin = sp->quadsize_min * app_min;
 
             // Select the indices that should be checked.
@@ -568,41 +594,111 @@ int engine_run_job(engine_t* engine, job_t* job) {
                 il_append_list(indexlist, list);
             }
 
+            selectedlist = il_new(il_size(indexlist));
             for (k=0; k<il_size(indexlist); k++) {
                 int ii = il_get(indexlist, k);
                 index_t* index = pl_get(engine->indexes, ii);
                 anbool inrange = TRUE;
-                if (job->use_radec_center)
+                if (job->use_radec_center) {
                     inrange = index_is_within_range(index, job->ra_center, job->dec_center, job->search_radius);
+                }
                 if (!inrange) {
                     logverb("Not using index %s because it's not within %g degrees of (RA,Dec) = (%g,%g)\n",
                             index->indexname, job->search_radius, job->ra_center, job->dec_center);
                     continue;
                 }
-                add_index_to_onefield(engine, bp, ii);
+                il_append(selectedlist, ii);
+                if (index->starkd && index->quads && index->codekd) {
+                    selected_loaded_index = TRUE;
+                }
             }
 
             il_free(indexlist);
+            if (onefield_check_total_limits(bp)) {
+                il_free(selectedlist);
+                logverb("[engine-pass] state=end ordinal=%zu "
+                        "reason=limit-before-materialization\n",
+                        pass.ordinal);
+                break;
+            }
+            /*
+             * onefield keeps filename and loaded handles in separate lists.
+             * If a pass contains a borrowed multiindex component, materialize
+             * every ordinary member into the loaded list so their original
+             * interleaved order is preserved exactly.
+             */
+            for (k = 0; k < il_size(selectedlist); k++) {
+                int ii = il_get(selectedlist, k);
+                index_t* index = pl_get(engine->indexes, ii);
+
+                if (!selected_loaded_index) {
+                    onefield_add_index(bp, index->indexfn);
+                } else if (index->starkd &&
+                           index->quads &&
+                           index->codekd) {
+                    onefield_add_loaded_index(bp, index);
+                } else {
+                    index_t* owned_index =
+                        index_load(index->indexfn, 0, NULL);
+
+                    if (!owned_index) {
+                        ERROR("Failed to load selected index %s",
+                              index->indexfn);
+                        il_free(selectedlist);
+                        rtn = -1;
+                        goto finish;
+                    }
+                    onefield_add_owned_index(bp, owned_index);
+                }
+
+                if (onefield_check_total_limits(bp)) {
+                    pass_limit_reached = TRUE;
+                    break;
+                }
+            }
+            il_free(selectedlist);
+            if (pass_limit_reached) {
+                onefield_clear_indexes(bp);
+                solver_clear_indexes(sp);
+                logverb("[engine-pass] state=end ordinal=%zu "
+                        "reason=limit-during-materialization\n",
+                        pass.ordinal);
+                break;
+            }
 
             logverb("Running solver:\n");
             onefield_log_run_parameters(bp);
 
             onefield_run(bp);
 
+            if (bp->solver_failed) {
+                rtn = -1;
+                goto finish;
+            }
+
             // we only want to try using the verify_wcses the first time.
             onefield_clear_verify_wcses(bp);
             onefield_clear_indexes(bp);
             onefield_clear_solutions(bp);
-            onefield_clear_indexes(bp);
             solver_clear_indexes(sp);
 
-            if (onefield_is_run_obsolete(bp, sp)) {
-                solved = TRUE;
+            logverb("[engine-pass] state=end ordinal=%zu "
+                    "solved=%i cancelled=%i "
+                    "hit_total_cpu_limit=%i "
+                    "hit_total_wall_limit=%i failed=%i\n",
+                    pass.ordinal,
+                    bp->single_field_solved ? 1 : 0,
+                    bp->cancelled ? 1 : 0,
+                    bp->hit_total_cpulimit ? 1 : 0,
+                    bp->hit_total_timelimit ? 1 : 0,
+                    bp->solver_failed ? 1 : 0);
+
+            if (onefield_check_total_limits(bp)) {
                 break;
             }
-        }
-        if (solved)
-            break;
+            if (onefield_is_run_obsolete(bp, sp)) {
+                break;
+            }
     }
 
     logverb("cx<=dx constraints: %i\n", sp->num_cxdx_skipped);
@@ -611,364 +707,61 @@ int engine_run_job(engine_t* engine, job_t* job) {
     logverb("AB scale constraints: %i\n", sp->num_abscale_skipped);
 
  finish:
-    solver_cleanup(sp);
-    onefield_cleanup(bp);
-    return 0;
+   // SECTION INDEX-SHARD: engine-lifecycle
+   if (index_shard_pool_started) {
+     double pool_wall_start = monotonic_seconds();
+
+     index_shard_pool_stop(bp);
+     pool_stop_seconds =
+         monotonic_seconds() - pool_wall_start;
+   }
+   if (residency) {
+     (void)index_residency_quiesce(residency);
+   }
+   onefield_job_field_cache_end(bp);
+   if (residency) {
+     index_unbind_residency_service(residency);
+   }
+
+   logverb("[engine-profile] pool_start=%.6f pool_stop=%.6f "
+           "engine_total=%.6f solver_failed=%i\n",
+           pool_start_seconds,
+           pool_stop_seconds,
+           monotonic_seconds() - engine_wall_start,
+           bp->solver_failed ? 1 : 0);
+
+   solver_cleanup(sp);
+   onefield_cleanup(bp);
+   if (residency) {
+     index_residency_stats_t stats;
+
+     if (!index_residency_get_stats(residency, &stats)) {
+       logverb(
+           "[index-residency] copied_files=%llu copied_bytes=%llu "
+           "hits=%llu deduplicated=%llu waits=%llu wait_ms=%.3f "
+           "source_leases=%llu source_requeues=%llu "
+           "cancellations=%llu "
+           "peak_bytes=%zu ready_bytes=%zu live_handles=%zu "
+           "failures=%llu source_changes=%llu\n",
+           (unsigned long long)stats.files_copied,
+           (unsigned long long)stats.bytes_copied,
+           (unsigned long long)stats.cache_hits,
+           (unsigned long long)stats.loading_deduplications,
+           (unsigned long long)stats.wait_count,
+           (double)stats.wait_nanoseconds / 1000000.0,
+           (unsigned long long)stats.source_leases,
+           (unsigned long long)stats.source_requeues,
+           (unsigned long long)stats.cancelled_entries,
+           stats.peak_resident_bytes,
+           stats.ready_bytes,
+           stats.live_handles,
+           (unsigned long long)stats.copy_failures,
+           (unsigned long long)stats.source_changes);
+     }
+     (void)index_residency_stop(residency);
+   }
+   return rtn;
 }
-
-static void parse_sip_coeffs(const qfits_header* hdr, const char* prefix, sip_t* wcs) {
-    char key[64];
-    int order, i, j;
-    sprintf(key, "%sSAO", prefix);
-    order = qfits_header_getint(hdr, key, -1);
-    if (order >= 2) {
-        if (order > 9)
-            order = 9;
-        wcs->a_order = order;
-        wcs->b_order = order;
-        for (i=0; i<=order; i++) {
-            for (j=0; (i+j)<=order; j++) {
-                if (i+j < 1)
-                    continue;
-                sprintf(key, "%sA%i%i", prefix, i, j);
-                wcs->a[i][j] = qfits_header_getdouble(hdr, key, 0.0);
-                sprintf(key, "%sB%i%i", prefix, i, j);
-                wcs->b[i][j] = qfits_header_getdouble(hdr, key, 0.0);
-            }
-        }
-    }
-    sprintf(key, "%sSAPO", prefix);
-    order = qfits_header_getint(hdr, key, -1);
-    if (order >= 2) {
-        if (order > 9)
-            order = 9;
-        wcs->ap_order = order;
-        wcs->bp_order = order;
-        for (i=0; i<=order; i++) {
-            for (j=0; (i+j)<=order; j++) {
-                if (i+j < 1)
-                    continue;
-                sprintf(key, "%sAP%i%i", prefix, i, j);
-                wcs->ap[i][j] = qfits_header_getdouble(hdr, key, 0.0);
-                sprintf(key, "%sBP%i%i", prefix, i, j);
-                wcs->bp[i][j] = qfits_header_getdouble(hdr, key, 0.0);
-            }
-        }
-    }
-}
-
-static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
-    onefield_t* bp = &(job->bp);
-    solver_t* sp = &(bp->solver);
-
-    double dnil = -LARGE_VAL;
-    char *pstr;
-    int n;
-    anbool run;
-
-    anbool default_tweak = TRUE;
-    int default_tweakorder = 2;
-    double default_odds_toprint = 1e6;
-    double default_odds_tokeep = 1e9;
-    double default_odds_tosolve = 1e9;
-    double default_odds_totune = 1e6;
-    //double default_image_fraction = 1.0;
-    char* fn;
-    double val;
-    char pretty[FITS_LINESZ+1];
-
-    onefield_init(bp);
-    // must be in this order because init_parameters handily zeros out sp
-    solver_set_default_values(sp);
-
-    // Here we assume that the field's pixel coordinataes go from zero to IMAGEW,H.
-    sp->field_maxx = qfits_header_getdouble(hdr, "IMAGEW", dnil);
-    sp->field_maxy = qfits_header_getdouble(hdr, "IMAGEH", dnil);
-    if ((sp->field_maxx == dnil) || (sp->field_maxy == dnil) ||
-        (sp->field_maxx <= 0.0) || (sp->field_maxy <= 0.0)) {
-        logerr("Must specify positive \"IMAGEW\" and \"IMAGEH\".\n");
-        goto bailout;
-    }
-
-    sp->verify_uniformize = qfits_header_getboolean(hdr, "ANVERUNI", sp->verify_uniformize);
-    sp->verify_dedup = qfits_header_getboolean(hdr, "ANVERDUP", sp->verify_dedup);
-
-    val = qfits_header_getdouble(hdr, "ANPOSERR", 0.0);
-    if (val > 0.0)
-        sp->verify_pix = val;
-    val = qfits_header_getdouble(hdr, "ANCTOL", 0.0);
-    if (val > 0.0)
-        sp->codetol = val;
-    val = qfits_header_getdouble(hdr, "ANDISTR", 0.0);
-    if (val > 0.0)
-        sp->distractor_ratio = val;
-
-    onefield_set_solvedout_file  (bp, fn=fits_get_long_string(hdr, "ANSOLVED"));
-    free(fn);
-    onefield_set_solvedin_file  (bp, fn=fits_get_long_string(hdr, "ANSOLVIN"));
-    free(fn);
-    onefield_set_match_file   (bp, fn=fits_get_long_string(hdr, "ANMATCH" ));
-    free(fn);
-    onefield_set_rdls_file    (bp, fn=fits_get_long_string(hdr, "ANRDLS"  ));
-    free(fn);
-    onefield_set_scamp_file   (bp, fn=fits_get_long_string(hdr, "ANSCAMP" ));
-    free(fn);
-    onefield_set_wcs_file     (bp, fn=fits_get_long_string(hdr, "ANWCS"   ));
-    free(fn);
-    onefield_set_corr_file    (bp, fn=fits_get_long_string(hdr, "ANCORR"  ));
-    free(fn);
-    onefield_set_cancel_file  (bp, fn=fits_get_long_string(hdr, "ANCANCEL"));
-    free(fn);
-
-    onefield_set_xcol(bp, fn=fits_get_dupstring(hdr, "ANXCOL"));
-    free(fn);
-    onefield_set_ycol(bp, fn=fits_get_dupstring(hdr, "ANYCOL"));
-    free(fn);
-
-    bp->timelimit = qfits_header_getint(hdr, "ANTLIM", 0);
-    bp->cpulimit = qfits_header_getdouble(hdr, "ANCLIM", 0.0);
-    bp->logratio_tosolve = log(qfits_header_getdouble(hdr, "ANODDSSL", default_odds_tosolve));
-    logverb("Set odds ratio to solve to %g (log = %g)\n", exp(bp->logratio_tosolve), bp->logratio_tosolve);
-
-
-    sp->logratio_toprint = log(qfits_header_getdouble(hdr, "ANODDSPR", default_odds_toprint));
-    sp->logratio_tokeep = log(qfits_header_getdouble(hdr, "ANODDSKP", default_odds_tokeep));
-    sp->logratio_totune = log(qfits_header_getdouble(hdr, "ANODDSTU", default_odds_totune));
-    sp->logratio_bail_threshold = log(qfits_header_getdouble(hdr, "ANODDSBL", DEFAULT_BAIL_THRESHOLD));
-    val = qfits_header_getdouble(hdr, "ANODDSST", 0.0);
-    if (val > 0.0)
-        sp->logratio_stoplooking = log(val);
-    bp->best_hit_only = TRUE;
-
-    // gotta keep it to solve it!
-    sp->logratio_tokeep = MIN(sp->logratio_tokeep, bp->logratio_tosolve);
-    // gotta print it to keep it (so what if that doesn't make sense)!
-    sp->logratio_toprint = MIN(sp->logratio_toprint, sp->logratio_tokeep);
-
-    // job->image_fraction = qfits_header_getdouble(hdr, "ANIMFRAC", job->image_fraction);
-    job->include_default_scales = qfits_header_getboolean(hdr, "ANAPPDEF", 0);
-
-    sp->parity = PARITY_BOTH;
-    pstr = qfits_pretty_string_r(qfits_header_getstr(hdr, "ANPARITY"), pretty);
-    if (pstr && streq(pstr, "NEG"))
-        sp->parity = PARITY_FLIP;
-    else if (pstr && streq(pstr, "POS"))
-        sp->parity = PARITY_NORMAL;
-
-    sp->set_crpix_center = qfits_header_getboolean(hdr, "ANCRPIXC", FALSE);
-    sp->crpix[0] = qfits_header_getdouble(hdr, "ANCRPIX1", sp->crpix[0]);
-    sp->crpix[1] = qfits_header_getdouble(hdr, "ANCRPIX2", sp->crpix[1]);
-    sp->set_crpix = (sp->set_crpix_center || 
-                     // were the values set?
-                     qfits_header_getstr(hdr, "ANCRPIX1") ||
-                     qfits_header_getstr(hdr, "ANCRPIX2"));
-
-    if (qfits_header_getboolean(hdr, "ANTWEAK", default_tweak)) {
-        int order = qfits_header_getint(hdr, "ANTWEAKO", default_tweakorder);
-        //bp->do_tweak = TRUE;
-        sp->do_tweak = TRUE;
-        sp->tweak_aborder = order;
-        sp->tweak_abporder = order;
-    }
-
-    if (!sp->do_tweak) {
-        // No tweak: set tweak order to linear, because the tweak alg
-        // can still be invoked via tune-up.
-        sp->tweak_aborder = sp->tweak_abporder = 1;
-    }
-
-    val = qfits_header_getdouble(hdr, "ANQSFMIN", 0.0);
-    if (val > 0.0)
-        bp->quad_size_fraction_lo = val;
-    val = qfits_header_getdouble(hdr, "ANQSFMAX", 0.0);
-    if (val > 0.0)
-        bp->quad_size_fraction_hi = val;
-
-    job->ra_center = qfits_header_getdouble(hdr, "ANERA", dnil);
-    job->dec_center = qfits_header_getdouble(hdr, "ANEDEC", dnil);
-    job->search_radius = qfits_header_getdouble(hdr, "ANERAD", dnil);
-    job->use_radec_center = ((job->ra_center     != dnil) &&
-                             (job->dec_center    != dnil) &&
-                             (job->search_radius != dnil));
-
-    // tag-along columns
-    bp->rdls_tagalong_all = qfits_header_getboolean(hdr, "ANTAGALL", FALSE);
-    if (!bp->rdls_tagalong_all) {
-        n = 1;
-        while (1) {
-            char key[64];
-            char* val;
-            sprintf(key, "ANTAG%i", n);
-            val = fits_get_dupstring(hdr, key);
-            if (!val)
-                break;
-            if (!bp->rdls_tagalong)
-                bp->rdls_tagalong = sl_new(16);
-            sl_append_nocopy(bp->rdls_tagalong, val);
-            n++;
-        }
-    }
-
-    // sort RDLS column
-    bp->sort_rdls = fits_get_dupstring(hdr, "ANRDSORT");
-
-    n = 1;
-    while (1) {
-        char key[64];
-        double lo, hi;
-        sprintf(key, "ANAPPL%i", n);
-        lo = qfits_header_getdouble(hdr, key, 0.);
-        sprintf(key, "ANAPPU%i", n);
-        hi = qfits_header_getdouble(hdr, key, 0.);
-        if ((hi == 0.) && (lo == 0.))
-            break;
-        if ((lo != 0.) && (hi != 0.)) {
-            if ((lo < 0) || (lo > hi)) {
-                logerr("Scale range %g to %g is invalid: min must be >= 0, max must be >= min.\n", lo, hi);
-                goto bailout;
-            }
-        }
-        dl_append(job->scales, lo);
-        dl_append(job->scales, hi);
-        n++;
-    }
-
-    n = 1;
-    while (1) {
-        char key[64];
-        int dlo, dhi;
-        sprintf(key, "ANDPL%i", n);
-        dlo = qfits_header_getint(hdr, key, 0);
-        sprintf(key, "ANDPU%i", n);
-        dhi = qfits_header_getint(hdr, key, 0);
-        if (dlo == 0 && dhi == 0)
-            break;
-        if ((dlo < 1) || (dlo > dhi)) {
-            logerr("Depth range %i to %i is invalid: min must be >= 1, max must be >= min.\n", dlo, dhi);
-            goto bailout;
-        }
-        il_append(job->depths, dlo);
-        il_append(job->depths, dhi);
-        n++;
-    }
-
-    n = 1;
-    while (1) {
-        char lokey[64];
-        char hikey[64];
-        int lo, hi;
-        sprintf(lokey, "ANFDL%i", n);
-        lo = qfits_header_getint(hdr, lokey, -1);
-        if (lo == -1)
-            break;
-        sprintf(hikey, "ANFDU%i", n);
-        hi = qfits_header_getint(hdr, hikey, -1);
-        if (hi == -1)
-            break;
-        if ((lo <= 0) || (lo > hi)) {
-            char pretty1[FITS_LINESZ+1];
-            char pretty2[FITS_LINESZ+1];
-            logerr("Field range %i to %i is invalid: min must be >= 1, max must be >= min.\n", lo, hi);
-            qfits_pretty_string_r(qfits_header_getstr(hdr, lokey), pretty1);
-            qfits_pretty_string_r(qfits_header_getstr(hdr, hikey), pretty2);
-            logmsg("  (FITS headers: \"%s = %s\", \"%s = %s\")\n",
-                   lokey, pretty1, hikey, pretty2);
-            goto bailout;
-        }
-
-        onefield_add_field_range(bp, lo, hi);
-        n++;
-    }
-
-    n = 1;
-    while (1) {
-        char key[64];
-        int fld;
-        sprintf(key, "ANFD%i", n);
-        fld = qfits_header_getint(hdr, key, -1);
-        if (fld == -1)
-            break;
-        if (fld <= 0) {
-            qfits_pretty_string_r(qfits_header_getstr(hdr, key), pretty);
-            logerr("Field %i is invalid: must be >= 1.  (FITS header: \"%s = %s\")\n", fld, key, pretty);
-            goto bailout;
-        }
-
-        onefield_add_field(bp, fld);
-        n++;
-    }
-
-    n = 1;
-    while (1) {
-        char key[64];
-        sip_t wcs;
-        char* keys[] = { "ANW%iPIX1", "ANW%iPIX2", "ANW%iVAL1", "ANW%iVAL2",
-                         "ANW%iCD11", "ANW%iCD12", "ANW%iCD21", "ANW%iCD22" };
-        double* vals[] = { &(wcs.wcstan. crval[0]), &(wcs.wcstan.crval[1]),
-                           &(wcs.wcstan.crpix[0]), &(wcs.wcstan.crpix[1]),
-                           &(wcs.wcstan.cd[0][0]), &(wcs.wcstan.cd[0][1]),
-                           &(wcs.wcstan.cd[1][0]), &(wcs.wcstan.cd[1][1]) };
-        int j;
-        int bail = 0;
-        memset(&wcs, 0, sizeof(wcs));
-        for (j = 0; j < 8; j++) {
-            sprintf(key, keys[j], n);
-            *(vals[j]) = qfits_header_getdouble(hdr, key, dnil);
-            if (*(vals[j]) == dnil) {
-                bail = 1;
-                break;
-            }
-        }
-        if (bail)
-            break;
-
-        // SIP terms
-        sprintf(key, "ANW%i", n);
-        parse_sip_coeffs(hdr, key, &wcs);
-
-        sip_ensure_inverse_polynomials(&wcs);
-
-        onefield_add_verify_wcs(bp, &wcs);
-        n++;
-    }
-
-    // Distortion to apply before matching...
-    do {
-        sip_t dsip;
-        double p0, p1;
-        memset(&dsip, 0, sizeof(sip_t));
-        p0 = qfits_header_getdouble(hdr, "ANDPIX0", dnil);
-        if (p0 == dnil)
-            break;
-        p1 = qfits_header_getdouble(hdr, "ANDPIX1", dnil);
-        if (p1 == dnil)
-            break;
-        dsip.wcstan.crpix[0] = p0;
-        dsip.wcstan.crpix[1] = p1;
-        parse_sip_coeffs(hdr, "AND", &dsip);
-        if ((dsip.a_order > 1 && dsip.b_order > 1) ||
-            (dsip.ap_order > 1 && dsip.bp_order > 1)) {
-            sp->predistort = malloc(sizeof(sip_t));
-            memcpy(sp->predistort, &dsip, sizeof(sip_t));
-        }
-    } while (0);
-
-    sp->pixel_xscale = qfits_header_getdouble(hdr, "ANPXSCAL", 0.);
-    
-    run = qfits_header_getboolean(hdr, "ANRUN", FALSE);
-
-    // Default: solve first field.
-    if (run && !il_size(bp->fieldlist)) {
-        onefield_add_field(bp, 1);
-    }
-
-    return TRUE;
-
- bailout:
-    return FALSE;
-}
-
-
 
 engine_t* engine_new() {
     engine_t* engine = calloc(1, sizeof(engine_t));
@@ -985,7 +778,9 @@ engine_t* engine_new() {
     // Default scale estimate: field width, in degrees:
     engine->minwidth = 0.1;
     engine->maxwidth = 180.0;
-    engine->cpulimit = 600.0;
+    engine->walllimit = 300.0;
+    engine->cpulimit = 0.0;
+    engine->index_shard_workers_config = INDEX_SHARD_WORKERS_AUTO;
     return engine;
 }
 
@@ -1018,140 +813,3 @@ void engine_free(engine_t* engine) {
         sl_free2(engine->index_paths);
     free(engine);
 }
-
-job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
-    qfits_header* hdr;
-    job_t* job;
-    onefield_t* bp;
-
-    // Read primary header.
-    hdr = anqfits_get_header2(jobfn, 0);
-    if (!hdr) {
-        ERROR("Failed to parse FITS header from file \"%s\"", jobfn);
-        return NULL;
-    }
-    job = job_new();
-    if (!parse_job_from_qfits_header(hdr, job)) {
-        job_free(job);
-        qfits_header_destroy(hdr);
-        return NULL;
-    }
-    qfits_header_destroy(hdr);
-
-    bp = &(job->bp);
-
-    onefield_set_field_file(bp, jobfn);
-
-    // If the job has no scale estimate, search everything provided
-    // by the engine
-    if (!dl_size(job->scales) || job->include_default_scales) {
-        double arcsecperpix;
-        arcsecperpix = deg2arcsec(engine->minwidth) / job_imagew(job);
-        dl_append(job->scales, arcsecperpix);
-        arcsecperpix = deg2arcsec(engine->maxwidth) / job_imagew(job);
-        dl_append(job->scales, arcsecperpix);
-    }
-
-    // The job can only decrease the CPU limit.
-    if ((bp->cpulimit == 0.0) || bp->cpulimit > engine->cpulimit) {
-        logverb("Decreasing CPU time limit to the engine's limit of %g seconds\n",
-                engine->cpulimit);
-        bp->cpulimit = engine->cpulimit;
-    }
-    // If not running inparallel, set total limits = limits.
-    if (!engine->inparallel) {
-        bp->total_timelimit = bp->timelimit;
-        bp->total_cpulimit  = bp->cpulimit ;
-    }
-
-    // If the job didn't specify depths, set defaults.
-    if (il_size(job->depths) == 0) {
-        if (engine->inparallel) {
-            // no limit.
-            il_append(job->depths, 0);
-            il_append(job->depths, 0);
-        } else
-            il_append_list(job->depths, engine->default_depths);
-    }
-
-    if (engine->cancelfn)
-        onefield_set_cancel_file(bp, engine->cancelfn);
-    if (engine->solvedfn)
-        onefield_set_solved_file(bp, engine->solvedfn);
-
-    return job;
-}
-
-void job_set_cancel_file(job_t* job, const char* fn) {
-    onefield_set_cancel_file(&(job->bp), fn);
-}
-
-void job_set_solved_file(job_t* job, const char* fn) {
-    onefield_set_solved_file(&(job->bp), fn);
-}
-
-// Modify all filenames to be relative to "dir".
-int job_set_base_dir(job_t* job, const char* dir) {
-    return job_set_output_base_dir(job, dir) ||
-        job_set_input_base_dir(job, dir);
-}
-
-int job_set_input_base_dir(job_t* job, const char* dir) {
-    char* path;
-    onefield_t* bp = &(job->bp);
-    logverb("Changing input file base dir to %s\n", dir);
-    if (bp->fieldfname) {
-        path = resolve_path(bp->fieldfname, dir);
-        logverb("Changing %s to %s\n", bp->fieldfname, path);
-        onefield_set_field_file(bp, path);
-    }
-    return 0;
-}
-
-int job_set_output_base_dir(job_t* job, const char* dir) {
-    char* path;
-    onefield_t* bp = &(job->bp);
-    logverb("Changing output file base dir to %s\n", dir);
-    if (bp->cancelfname) {
-        path = resolve_path(bp->cancelfname, dir);
-        logverb("Cancel file was %s, changing to %s.\n", bp->cancelfname, path);
-        onefield_set_cancel_file(bp, path);
-    }
-    if (bp->solved_in) {
-        path = resolve_path(bp->solved_in, dir);
-        logverb("Changing %s to %s\n", bp->solved_in, path);
-        onefield_set_solvedin_file(bp, path);
-    }
-    if (bp->solved_out) {
-        path = resolve_path(bp->solved_out, dir);
-        logverb("Changing %s to %s\n", bp->solved_out, path);
-        onefield_set_solvedout_file(bp, path);
-    }
-    if (bp->matchfname) {
-        path = resolve_path(bp->matchfname, dir);
-        logverb("Changing %s to %s\n", bp->matchfname, path);
-        onefield_set_match_file(bp, path);
-    }
-    if (bp->indexrdlsfname) {
-        path = resolve_path(bp->indexrdlsfname, dir);
-        logverb("Changing %s to %s\n", bp->indexrdlsfname, path);
-        onefield_set_rdls_file(bp, path);
-    }
-    if (bp->scamp_fname) {
-        path = resolve_path(bp->scamp_fname, dir);
-        logverb("Changing %s to %s\n", bp->scamp_fname, path);
-        onefield_set_scamp_file(bp, path);
-    }
-    if (bp->corr_fname) {
-        path = resolve_path(bp->corr_fname, dir);
-        logverb("Changing %s to %s\n", bp->corr_fname, path);
-        onefield_set_corr_file(bp, path);
-    }
-    if (bp->wcs_template) {
-        path = resolve_path(bp->wcs_template, dir);
-        logverb("Changing %s to %s\n", bp->wcs_template, path);
-        onefield_set_wcs_file(bp, path);
-    }
-    return 0;
-}
-

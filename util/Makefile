@@ -45,20 +45,21 @@ ANUTILS_OBJ :=  sip-utils.o fit-wcs.o sip.o \
 
 # Things that it depends on but that aren't linked in
 ANFILES_DEPS :=
-ANFILES_OBJ := 
+ANFILES_OBJ :=
 
 # Things that it depends on but that aren't linked in
 ANUTILS_DEPS :=
 
 ifndef NO_QFITS
-ANFILES_OBJ += multiindex.o index.o indexset.o \
-	codekd.o starkd.o rdlist.o xylist.o \
+ANFILES_OBJ += multiindex.o index.o index_residency.o indexset.o \
+	codekd.o starkd.o starkd_payload.o rdlist.o xylist.o \
 	starxy.o qidxfile.o quadfile.o scamp.o scamp-catalog.o \
 	tabsort.o wcs-xy2rd.o wcs-rd2xy.o matchfile.o
 ANFILES_DEPS += $(QFITS_LIB)
 
-ANUTILS_OBJ += fitsioutils.o sip_qfits.o fitstable.o fitsbin.o fitsfile.o \
-	tic.o
+ANUTILS_OBJ += fitsioutils.o sip_qfits.o fitstable.o fitsbin.o \
+	fitsbin_mmap.o fitsbin_payload_source.o fitsbin_payload_plan.o \
+	fitsbin_payload_service.o fitsfile.o tic.o
 ANUTILS_DEPS += $(QFITS_LIB)
 endif
 
@@ -127,7 +128,8 @@ ANUTILS_H := an-bool.h an-endian.h an-opts.h an-thread-pthreads.h \
 	bl-sort.h  bt.h cairoutils.h \
 	codekd.h errors.h fitsbin.h fitsfile.h fitsioutils.h \
 	fitstable.h os-features-config.h os-features.h gslutils.h \
-	healpix-utils.h healpix.h index.h intmap.h ioutils.h fileutils.h \
+	healpix-utils.h healpix.h index.h index_residency.h intmap.h ioutils.h \
+	fileutils.h \
 	keywords.h log.h \
 	mathutil.h permutedsort.h qidxfile.h quadfile.h rdlist.h scamp-catalog.h \
 	fit-wcs.h sip-utils.h sip.h sip_qfits.h starkd.h starutil.h starutil.inc \
@@ -145,12 +147,12 @@ ALL_OBJ := $(ANBASE_OBJ) $(ANUTILS_OBJ) $(ANFILES_OBJ) $(MISC_OBJ)
 DEP_OBJ := $(ANUTILS_OBJ) $(ANFILES_OBJ) $(MISC_OBJ)
 DEP_PREREQS :=
 
-$(ANBASE_LIB_FILE): $(ANBASE_OBJ) $(ANBASE_DEPS) 
+$(ANBASE_LIB_FILE): $(ANBASE_OBJ) $(ANBASE_DEPS)
 	-rm -f $@
 	$(AR) rc $@ $(ANBASE_OBJ)
 	$(RANLIB) $@
 
-$(ANUTILS_LIB_FILE): $(ANUTILS_OBJ) $(ANUTILS_DEPS) 
+$(ANUTILS_LIB_FILE): $(ANUTILS_OBJ) $(ANUTILS_DEPS)
 	-rm -f $@
 	$(AR) rc $@ $(ANUTILS_OBJ)
 	$(RANLIB) $@
@@ -170,11 +172,11 @@ an-pnmtofits: an-pnmtofits.o $(ANUTILS_SLIB)
 	$(CC) -o $@ $(LDFLAGS) $^ $(NETPBM_LIB) $(LDLIBS)
 ALL_OBJ += an-pnmtofits.o
 
-_util$(PYTHON_SO_EXT): util.i lanczos.i $(ANFILES_SLIB)
+_util$(PYTHON_SO_EXT): util.i lanczos.i setup.py $(ANFILES_SLIB)
 	LDFLAGS="$(LDFLAGS)" LDLIBS="$(LDLIBS)" SLIB="$(ANFILES_SLIB)" \
 	INC="$(ANFILES_INC)" CFLAGS="$(CFLAGS)" \
 	$(PYTHON) setup.py build_ext -v --inplace --build-temp .
-util.py: util.i lanczos.i
+util.py: util.i lanczos.i setup.py
 	LDFLAGS="$(LDFLAGS)" LDLIBS="$(LDLIBS)" SLIB="$(ANFILES_SLIB)" \
 	INC="$(ANFILES_INC)" CFLAGS="$(CFLAGS)" \
 	$(PYTHON) setup.py build_ext -v --inplace --build-temp .
@@ -347,22 +349,33 @@ endif
 ### TESTS
 
 ALL_TEST_FILES = test_bl test_bt test_endian test_fitstable test_xylist \
-	test_rdlist test_healpix test_fitsioutils test_fitsbin test_log \
+	test_rdlist test_healpix test_fitsioutils test_fitsbin \
+	test_fitsbin_payload_io test_log \
 	test_scamp_catalog test_starutil test_svd test_ioutils \
 	test_anwcs test_sip-utils test_errors test_multiindex \
 	test_convolve_image test_qsort_r test_wcs test_big_tables \
 	test_dfind test_ctmf test_dsmooth test_dcen3x3 test_simplexy \
-	test_fit_wcs test_matchfile
+	test_fit_wcs test_matchfile test_index_metadata test_index_residency
 
 # test_quadfile -- takes a long time!
 
-ALL_TEST_EXTRA_OBJS = 
+FITSBIN_PAYLOAD_TEST_OBJS := test_fitsbin_payload_common.o \
+	test_fitsbin_payload_sync.o test_fitsbin_payload_async.o \
+	test_fitsbin_payload_mapped.o test_fitsbin_payload_ticket.o
+ALL_TEST_EXTRA_OBJS = $(FITSBIN_PAYLOAD_TEST_OBJS)
+ALL_OBJ += $(FITSBIN_PAYLOAD_TEST_OBJS)
 ALL_TEST_LIBS = $(ANFILES_SLIB)
-ALL_TEST_EXTRA_LDFLAGS = 
+ALL_TEST_EXTRA_LDFLAGS = -Wl,--wrap=pread64 -Wl,--wrap=readahead
 
 include $(COMMON)/makefile.tests
 
-DEP_OBJ += $(ALL_TEST_FILES_O)
+test_fitsbin_payload_io: test_fitsbin_payload_io-main.o \
+	test_fitsbin_payload_io.o $(FITSBIN_PAYLOAD_TEST_OBJS) \
+	$(COMMON)/cutest.o $(ALL_TEST_LIBS)
+	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) \
+		-Wl,--wrap=pread64 -Wl,--wrap=readahead $^ $(LDLIBS)
+
+DEP_OBJ += $(ALL_TEST_FILES_O) $(FITSBIN_PAYLOAD_TEST_OBJS)
 
 tests: $(ALL_TEST_FILES)
 .PHONY: tests
@@ -390,7 +403,8 @@ NORMAL_TESTS := test_big_tables test_qsort_r \
 	test_anwcs test_wcs test_fitstable test_fitsbin \
 	test_fitsioutils test_xylist test_rdlist test_bl test_bt test_endian \
 	test_healpix test_log test_ioutils test_scamp_catalog test_starutil \
-	test_svd test_fit_wcs test_quadfile
+	test_svd test_fit_wcs test_quadfile test_index_metadata \
+	test_index_residency
 
 $(NORMAL_TESTS): $(ANFILES_SLIB)
 

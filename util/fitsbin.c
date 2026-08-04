@@ -2,16 +2,26 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-
+#include <errno.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <string.h>
+#include <strings.h>
 #include <assert.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "keywords.h"
 #include "fitsbin.h"
+#include "fitsbin_internal.h"
 #include "fitsioutils.h"
 #include "ioutils.h"
 #include "fitsfile.h"
@@ -56,6 +66,45 @@ FILE* fitsbin_get_fid(fitsbin_t* fb) {
     return fb->fid;
 }
 
+int fitsbin_get_open_file_stat(
+    const fitsbin_t* fb,
+    struct stat* file_stat) {
+    if (!fb || !file_stat ||
+        !fb->open_file_stat_valid) {
+        errno = ENOENT;
+        return -1;
+    }
+    *file_stat = fb->open_file_stat;
+    return 0;
+}
+
+void fitsbin_stat_times(
+    const struct stat* file_stat,
+    time_t* mtime_seconds,
+    long* mtime_nanoseconds,
+    time_t* ctime_seconds,
+    long* ctime_nanoseconds) {
+    if (!file_stat || !mtime_seconds ||
+        !mtime_nanoseconds || !ctime_seconds ||
+        !ctime_nanoseconds) {
+        return;
+    }
+    *mtime_seconds = file_stat->st_mtime;
+    *ctime_seconds = file_stat->st_ctime;
+#if defined(__APPLE__)
+    *mtime_nanoseconds =
+        file_stat->st_mtimespec.tv_nsec;
+    *ctime_nanoseconds =
+        file_stat->st_ctimespec.tv_nsec;
+#elif defined(__linux__) || defined(__FreeBSD__)
+    *mtime_nanoseconds = file_stat->st_mtim.tv_nsec;
+    *ctime_nanoseconds = file_stat->st_ctim.tv_nsec;
+#else
+    *mtime_nanoseconds = 0L;
+    *ctime_nanoseconds = 0L;
+#endif
+}
+
 static int nchunks(fitsbin_t* fb) {
     return bl_size(fb->chunks);
 }
@@ -70,7 +119,7 @@ static fitsbin_chunk_t* get_chunk(fitsbin_t* fb, int i) {
         ERROR("Attempt to get fitsbin chunk %i", i);
         return NULL;
     }
-    return bl_access(fb->chunks, i);
+    return bl_access_const(fb->chunks, i);
 }
 
 static fitsbin_t* new_fitsbin(const char* fn) {
@@ -78,6 +127,8 @@ static fitsbin_t* new_fitsbin(const char* fn) {
     fb = calloc(1, sizeof(fitsbin_t));
     if (!fb)
         return NULL;
+    fb->payload_fd = -1;
+    fb->payload_fd_initialized = TRUE;
     fb->chunks = bl_new(4, sizeof(fitsbin_chunk_t));
     if (!fn)
         // Can't make it NULL or qfits freaks out.
@@ -86,7 +137,6 @@ static fitsbin_t* new_fitsbin(const char* fn) {
         fb->filename = strdup(fn);
     return fb;
 }
-
 static anbool in_memory(fitsbin_t* fb) {
     return fb->inmemory;
 }
@@ -95,6 +145,8 @@ static anbool in_memory(fitsbin_t* fb) {
 static void free_chunk(fitsbin_chunk_t* chunk) {
     if (!chunk) return;
     free(chunk->tablename_copy);
+    free(chunk->payload_page_sequences);
+    chunk->payload_page_sequences = NULL;
     if (chunk->header)
         qfits_header_destroy(chunk->header);
     if (chunk->map) {
@@ -139,11 +191,17 @@ off_t fitsbin_get_data_start(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
 int fitsbin_close_fd(fitsbin_t* fb) {
     if (!fb) return 0;
     if (fb->fid) {
-        if (fclose(fb->fid)) {
+        FILE* fid = fb->fid;
+
+        /*
+         * Clear first: fclose() invalidates the stream even when it reports
+         * a delayed write/close error. Never leave a dangling FILE* behind.
+         */
+        fb->fid = NULL;
+        if (fclose(fid)) {
             SYSERROR("Error closing fitsbin file");
             return -1;
         }
-        fb->fid = NULL;
     }
     return 0;
 }
@@ -152,7 +210,12 @@ int fitsbin_close(fitsbin_t* fb) {
     int i;
     int rtn = 0;
     if (!fb) return rtn;
-    rtn = fitsbin_close_fd(fb);
+    if (fitsbin_close_payload_fd(fb)) {
+        rtn = -1;
+    }
+    if (fitsbin_close_fd(fb)) {
+        rtn = -1;
+    }
     if (fb->primheader)
         qfits_header_destroy(fb->primheader);
     for (i=0; i<nchunks(fb); i++) {
@@ -183,6 +246,11 @@ int fitsbin_close(fitsbin_t* fb) {
             qfits_table_close(fb->tables[i]);
         }
         free(fb->tables);
+    }
+
+    if (fb->owns_fits && fb->fits) {
+        anqfits_close(fb->fits);
+        fb->fits = NULL;
     }
 
     free(fb);
@@ -410,7 +478,8 @@ static int find_table_column(fitsbin_t* fb, const char* colname, off_t* pstart, 
     return -1;
 }
 
-static int read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
+static int read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk,
+                      anbool read_payload) {
     off_t tabstart=0, tabsize=0;
     int ext;
     size_t expected = 0;
@@ -485,7 +554,43 @@ static int read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
         return -1;
     }
 
-    expected = (size_t)chunk->itemsize * (size_t)chunk->nrows;
+    if (chunk->itemsize < 0 ||
+        chunk->nrows < 0 ||
+        (chunk->nrows &&
+         (size_t)chunk->itemsize >
+             SIZE_MAX / (size_t)chunk->nrows)) {
+        ERROR("Table %s in file %s has an invalid or overflowing "
+              "payload size: itemsize=%i nrows=%i",
+              chunk->tablename
+                  ? chunk->tablename
+                  : "(unnamed)",
+              fb->filename
+                  ? fb->filename
+                  : "(memory)",
+              chunk->itemsize,
+              chunk->nrows);
+        return -1;
+    }
+    expected =
+        (size_t)chunk->itemsize *
+        (size_t)chunk->nrows;
+    if (!in_memory(fb) && fits_bytes_needed(expected) != tabsize) {
+        ERROR("Expected table size (%zu => %i FITS blocks) is not equal to "
+              "size of table \"%s\" (%zu => %i FITS blocks).",
+              expected, fits_blocks_needed(expected),
+              chunk->tablename, (size_t)tabsize,
+              (int)(tabsize / (off_t)FITS_BLOCK_SIZE));
+        return -1;
+    }
+    if (!read_payload) {
+        return 0;
+    }
+
+    if (!in_memory(fb)) {
+        chunk->data_file_offset = tabstart;
+        chunk->data_file_size = expected;
+    }
+
     if (in_memory(fb)) {
         int i;
         chunk->data = malloc(expected);
@@ -497,14 +602,6 @@ static int read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
 
     } else {
 
-        if (fits_bytes_needed(expected) != tabsize) {
-            ERROR("Expected table size (%zu => %i FITS blocks) is not equal to "
-                  "size of table \"%s\" (%zu => %i FITS blocks).",
-                  expected, fits_blocks_needed(expected),
-                  chunk->tablename, (size_t)tabsize,
-                  (int)(tabsize / (off_t)FITS_BLOCK_SIZE));
-            return -1;
-        }
         get_mmap_size(tabstart, tabsize, &mapstart, &(chunk->mapsize), &mapoffset);
         mode = PROT_READ;
         flags = MAP_SHARED;
@@ -514,16 +611,22 @@ static int read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
             chunk->map = NULL;
             return -1;
         }
+        fitsbin_apply_mmap_advice(fb, chunk);
         chunk->data = chunk->map + mapoffset;
     }
     return 0;
 }
 
 int fitsbin_read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
-    if (read_chunk(fb, chunk))
+    if (read_chunk(fb, chunk, TRUE)) {
         return -1;
+    }
     fitsbin_add_chunk(fb, chunk);
     return 0;
+}
+
+int fitsbin_read_chunk_header(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
+    return read_chunk(fb, chunk, FALSE);
 }
 
 int fitsbin_read(fitsbin_t* fb) {
@@ -531,7 +634,7 @@ int fitsbin_read(fitsbin_t* fb) {
 
     for (i=0; i<nchunks(fb); i++) {
         fitsbin_chunk_t* chunk = get_chunk(fb, i);
-        if (read_chunk(fb, chunk)) {
+        if (read_chunk(fb, chunk, TRUE)) {
             if (chunk->required)
                 goto bailout;
         }
@@ -556,6 +659,15 @@ fitsbin_t* fitsbin_open_fits(anqfits_t* fits) {
         SYSERROR("Failed to open file \"%s\"", fits->filename);
         goto bailout;
     }
+    if (fstat(
+            fileno(fb->fid),
+            &fb->open_file_stat)) {
+        SYSERROR(
+            "Failed to identify file \"%s\"",
+            fits->filename);
+        goto bailout;
+    }
+    fb->open_file_stat_valid = TRUE;
     fb->Next = anqfits_n_ext(fits);
     debug("N ext: %i\n", fb->Next);
     fb->fits = fits;
@@ -572,12 +684,20 @@ fitsbin_t* fitsbin_open_fits(anqfits_t* fits) {
 
 fitsbin_t* fitsbin_open(const char* fn) {
     anqfits_t* fits;
+    fitsbin_t* fb;
+
     fits = anqfits_open(fn);
     if (!fits) {
         ERROR("Failed to open file \"%s\"", fn);
         return NULL;
     }
-    return fitsbin_open_fits(fits);
+    fb = fitsbin_open_fits(fits);
+    if (!fb) {
+        anqfits_close(fits);
+        return NULL;
+    }
+    fb->owns_fits = TRUE;
+    return fb;
 }
 
 fitsbin_t* fitsbin_open_in_memory() {
@@ -619,4 +739,3 @@ fitsbin_t* fitsbin_open_for_writing(const char* fn) {
     }
     return fb;
 }
-
