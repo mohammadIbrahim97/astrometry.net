@@ -166,9 +166,6 @@ bright_unrecognized() {
 mydir="$(dirname "$0")"
 cleanscript="$mydir/clean.sh"
 
-solved=0
-notsolved=0
-timetaken=0
 shopt -s lastpipe
 
 printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n  \"cpulimit\": %s,\n  \"objs\": %s,\n  \"repeats\": %s"\
