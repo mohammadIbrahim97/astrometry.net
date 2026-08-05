@@ -30,6 +30,11 @@ printhelp() {
   exit 1
 }
 
+if ! eval "solve-field 1>/dev/null"; then
+  echo "Trying to execute solve-field returned an error - does the executable exist?"
+  exit
+fi
+
 intreg="^[0-9]+$"
 numreg="^([0-9]+(\.[0-9]+)?|\.[0-9]+)$"
 
@@ -168,7 +173,20 @@ cleanscript="$mydir/clean.sh"
 
 shopt -s lastpipe
 
-printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n  \"cpulimit\": %s,\n  \"objs\": %s,\n  \"repeats\": %s"\
+# Find out whether a parallelized build is being used
+if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
+  echo "Notice: solve-field recognized --wall-limit. Using parallel build."
+else
+  if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
+    echo "Notice: solve-field did not recognize the option --wall-limit. Assuming serial build."
+  else
+    echo "solve-field recognized neither --wall-limit nor --cpulimit."
+    echo "Is your executable broken?"
+    exit
+  fi
+fi
+
+printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n  \"realtime-limit\": %s,\n  \"objs\": %s,\n  \"repeats\": %s"\
   "$downsample" "$scalelow" "$scalehigh" "$cpulimit" "$objs" "$repeats" >> "$outfile"
 printf ",\n  \"images\": [" >> "$outfile"
 
@@ -202,8 +220,8 @@ for runind in $(seq "$repeats"); do
     fi
 
     t0=$( echo $EPOCHREALTIME | tr -dc "0-9")
-    output="$(solve-field --overwrite --no-plots -z "$downsample"\
-    -u app -L "$scalelow" -H "$scalehigh" -l "$cpulimit" --objs "$objs" "$file" 2>/dev/null)"
+    eval "solve-field --overwrite --no-plots -z \"$downsample\" -u app -L \"$scalelow\" -H \"$scalehigh\" "\
+    "-l \"$cpulimit\" --objs \"$objs\" \"$file\" 2>/dev/null"
     t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
     td=$((t1-t0))
 
