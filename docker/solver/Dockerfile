@@ -1,8 +1,8 @@
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get -y update && apt-get install -y apt-utils && \
-    apt-get install -y --no-install-recommends \
+RUN apt -y update && apt install -y apt-utils && \
+    apt install -y --no-install-recommends \
     build-essential \
     make \
     gcc \
@@ -44,13 +44,9 @@ RUN apt-get -y update && apt-get install -y apt-utils && \
 #    scipy \
 #    matplotlib \
 # Pip installs
-# Pin astropy<7: astropy 8.x demands numpy>=2 and packaging>=25, which pip cannot
-# install over the dpkg-managed distro numpy/packaging (no RECORD file) and which
-# would break the apt-built scipy/matplotlib ABI. astropy 6.x is satisfied by the
-# distro numpy 1.26 / packaging 24, so pip upgrades nothing.
 RUN for x in \
     fitsio \
-    'astropy<7' \
+    astropy \
     ; do pip3 install --no-cache --break-system-packages $x; done
 
 # to help astrometry.net find netpbm (yuck)
@@ -66,9 +62,14 @@ WORKDIR /src
 
 RUN git config --global --add safe.directory /src/astrometry
 
-RUN mkdir /usr/local/data && cd /usr/local/data \
-    && for i in $(seq -w 7 19); do \
-    wget -nv https://data.astrometry.net/4100/index-41$i.fits; done
+# Build flag - don't optimize for the build computer's CPU
+ENV ARCH_FLAGS=-march=x86-64-v3
 
-# dev.dockerfile, release.dockerfile or test.dockerfile will be appended
-# during the build process using the shell script.
+RUN git clone http://github.com/dstndstn/astrometry.net.git astrometry \
+  && cd astrometry \
+  && make -j \
+  && make py -j \
+  && make extra -j \
+  && make install INSTALL_DIR=/usr/local
+
+RUN cd /usr/local/data && wget -nv https://data.astrometry.net/4100/index-4119.fits
