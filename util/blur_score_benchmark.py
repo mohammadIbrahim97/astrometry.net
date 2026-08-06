@@ -1,3 +1,5 @@
+#! /usr/bin/env python3
+
 """Benchmark blur_score over a directory or list of astronomical images.
 
 Outputs CSV: backend,image,elapsed_s,status,fwhm,ellipticity,n_sources,score,error.

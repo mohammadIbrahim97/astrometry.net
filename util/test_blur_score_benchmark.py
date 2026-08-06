@@ -1,3 +1,5 @@
+#! /usr/bin/env python3
+
 """Runnable check: `python3 -m astrometry.util.test_blur_score_benchmark`.
 
 Verifies _run_all pools every (backend x image) task together and runs

@@ -1,3 +1,5 @@
+#! /usr/bin/env python3
+
 """Blur score for astronomical images via stellar PSF measurement.
 
 Runs source-extractor to detect stars, takes the median FWHM and
