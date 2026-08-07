@@ -240,8 +240,20 @@ inotifywait -m "$input_dir" -e create -e moved_to | while read -r _ _ file; do
   if [ $verbose ]; then
     echo "New file '$file' appeared."
   fi
-  bs="$($blur_score_path "$file")"
-  if (( $(echo "$bs < $blur_threshold" | bc -l) )); then
+  solve_file=
+  if [ -z "$blur_score_path" ]; then
+    solve_file=1
+  else
+    bs="$($blur_score_path "$file")"
+    if (( $(echo "$bs < $blur_threshold" | bc ) )); then
+      solve_file=1
+    elif [ $verbose ]; then
+      echo "Skipping $file because of blur score: Calculated $bs, threshold is $blur_threshold"
+    fi
+  fi
+
+  if [ $solve_file ]; then
+    echo "Calculating..."
     output="$(eval "$whole_command $input_dir/$file 2>/dev/null")"
     noext="${file%.*}"
     if [ -f "$tmp_dir/$noext.solved" ]; then
@@ -252,7 +264,5 @@ inotifywait -m "$input_dir" -e create -e moved_to | while read -r _ _ file; do
       echo "Could not solve $file."
     fi
     clean "$tmp_dir" "$noext"
-  elif [ $verbose ]; then
-    echo "Skipping $file because of blur score: Calculated $bs, threshold is $blur_threshold"
   fi
 done
