@@ -274,7 +274,9 @@ while true; do
       echo "$output" | tail -n +$distline
     else
       echo "Could not solve $latest."
-      echo "$output"
+      if [ $verbose ]; then
+        echo "$output"
+      fi
     fi
     clean "$tmp_dir" "$(basename "$noext")"
   fi
