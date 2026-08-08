@@ -58,7 +58,6 @@ rounded_index_scale() {
   echo "$rounded"
 }
 
-# Usage example: Clean "demo/" "apod*"
 clean() {
   find "$1" -mindepth 1 -maxdepth 1 \( -name "$2.axy" -o -name "$2.corr" -o -name "$2.match"\
       -o -name "$2.new" -o -name "$2.rdls" -o -name "$2.wcs" -o -name "$2.solved"\
@@ -236,18 +235,29 @@ fi
 
 # -----------------------------------------------------------------------------
 
-inotifywait -m "$input_dir" -e create -e moved_to | while read -r _ _ file; do
-  if [ $verbose ]; then
-    echo "New file '$file' appeared."
+last=""
+while true; do
+  latest="$(find "$input_dir" -type f -exec ls -t {} + 2>/dev/null | head -1)"
+  if [ "$last" == "$latest" ]; then
+    if [ $verbose ]; then
+      echo "Waiting for new files..."
+    fi
+    while read -r _ _ file; do
+      if [ $verbose ]; then
+        echo "New file appeared: '$file'"
+      fi
+      latest="$input_dir/$file"
+    done < <(inotifywait "$input_dir" -e create -e moved_to)
   fi
+
   solve_file=
   if [ -z "$blur_score_path" ]; then
     solve_file=1
   else
-    bs="$($blur_score_path "$input_dir/$file")"
+    bs="$($blur_score_path "$latest")"
     if (( $(echo "$bs > $blur_threshold" | bc ) )); then
       if [ $verbose ]; then
-        echo "Skipping $file because of blur score: Calculated $bs, threshold is $blur_threshold"
+        echo "Skipping $latest because of blur score: Calculated $bs, threshold is $blur_threshold"
       fi
     else
       solve_file=1
@@ -256,15 +266,17 @@ inotifywait -m "$input_dir" -e create -e moved_to | while read -r _ _ file; do
 
   if [ $solve_file ]; then
     echo "Calculating..."
-    output="$(eval "$whole_command $input_dir/$file 2>/dev/null")"
-    noext="${file%.*}"
-    if [ -f "$tmp_dir/$noext.solved" ]; then
+    output="$(eval "$whole_command $latest 2>/dev/null")"
+    noext="${latest%.*}"
+    if [ -f "$noext.solved" ]; then
       echo "$output" | grep "Field center: (RA,Dec) ="
       distline="$(echo "$output" | grep -n -m 1 "brightest distractors are" | cut -d: -f1)"
       echo "$output" | tail -n +$distline
     else
-      echo "Could not solve $file."
+      echo "Could not solve $latest."
+      echo "$output"
     fi
-    clean "$tmp_dir" "$noext"
+    clean "$tmp_dir" "$(basename "$noext")"
   fi
+  last="$latest"
 done
