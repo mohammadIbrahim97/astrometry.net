@@ -66,6 +66,11 @@ but I've found that they work well:
     images, you might want to decrease these values.
 - Change `DETECT_MINAREA` to `1` (especially if using a large filter).
 
+By default, all file paths in `se.conf` are relative to the current
+working directory (not the parent directory of `se.conf`).
+To avoid confusion when calling the program from multiple places,
+consider using absolulte file paths.
+
 ### Index Files
 The utility automatically chooses a set of index files based on the lower and
 upper scale limits of your images.
