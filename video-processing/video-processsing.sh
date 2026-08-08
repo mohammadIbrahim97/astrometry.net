@@ -244,7 +244,7 @@ inotifywait -m "$input_dir" -e create -e moved_to | while read -r _ _ file; do
   if [ -z "$blur_score_path" ]; then
     solve_file=1
   else
-    bs="$($blur_score_path "$file")"
+    bs="$($blur_score_path "$input_dir/$file")"
     if (( $(echo "$bs > $blur_threshold" | bc ) )); then
       if [ $verbose ]; then
         echo "Skipping $file because of blur score: Calculated $bs, threshold is $blur_threshold"
