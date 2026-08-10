@@ -277,6 +277,9 @@ while true; do
     done < <(inotifywait "$input_dir" -e create -e moved_to --include "$regex")
   fi
 
+  latest_base="$(basename "$latest")"
+  noext_base="${latest_base%.*}"
+
   solve_file=
   if [ -z "$blur_score_path" ]; then
     solve_file=1
@@ -284,7 +287,7 @@ while true; do
     bs="$($blur_score_path "$latest")"
     if (( $(echo "$bs > $blur_threshold" | bc ) )); then
       if [ $verbose ]; then
-        echo "Skipping $latest because of blur score: Calculated $bs, threshold is $blur_threshold"
+        echo "Skipping $latest_base because of blur score: Calculated $bs, threshold is $blur_threshold"
       fi
     else
       solve_file=1
@@ -294,8 +297,7 @@ while true; do
   if [ $solve_file ]; then
     echo "Calculating..."
     output="$(eval "$whole_command $latest 2>/dev/null")"
-    noext="${latest%.*}"
-    if [ -f "$noext.solved" ]; then
+    if [ -f "$tmp_dir/$noext_base.solved" ]; then
       echo "$output" | grep "Field center: (RA,Dec) ="
       distline="$(echo "$output" | grep -n -m 1 "brightest distractors are" | cut -d: -f1)"
       echo "$output" | tail -n +$distline
@@ -306,7 +308,7 @@ while true; do
         echo "$output"
       fi
     fi
-    clean "$tmp_dir" "$(basename "$noext")"
+    clean "$tmp_dir" "$noext_base"
   fi
   last="$latest"
 done
