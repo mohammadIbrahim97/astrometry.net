@@ -182,7 +182,25 @@ if [[ -n $scale_low ]] && [[ -n $scale_high ]]; then
   fi
 fi
 
-whole_command="solve-field -p --wall-limit $time_limit"
+
+whole_command="solve-field -p"
+
+# Find out whether a parallelized build is being used
+if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
+  if [ $verbose ]; then
+    echo "solve-field recognized --wall-limit, which means this version supports parallelization."
+  fi
+  whole_command="$whole_command --wall-limit $time_limit"
+else
+  if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
+    echo "WARNING: Using versison of solve-field without parallelization."
+    whole_command="$whole_command --cpulimit $time_limit"
+  else
+    echo "ERROR: solve-field recognized neither --wall-limit nor --cpulimit."
+    echo "  Is your executable broken?"
+    exit 255
+  fi
+fi
 
 min_index_scale=0
 max_index_scale=19
