@@ -95,6 +95,8 @@ video-processing/video-processsing.sh -i copy_to_here/ \
 ```
 For a description of what each option does, run the script with `-h`.
 
+If you encounter any errors, add the `-v` flag to get more information.
+
 You might get errors like the following when using `source-extractor`:
 ```
 fitstable.c:972:read_array_into: Failed to read column from FITS file

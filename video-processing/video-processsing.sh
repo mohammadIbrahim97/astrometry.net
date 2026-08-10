@@ -2,6 +2,7 @@
 
 DEFAULT_TIME_LIMIT=5
 DEFAULT_BLUR_THRESHOLD="0.8"
+DEFAULT_REGEX=".*"
 
 usage() {
   echo "USAGE: $0 <options>"
@@ -41,6 +42,10 @@ usage() {
   echo "    Any file with a blur score above this number will be excluded."
   echo "    Will have no effect unless --blur-score-path is also present."
   echo "    Default: $DEFAULT_BLUR_THRESHOLD."
+  echo "  --filter <regex>"
+  echo "    Only files that appear in the input directory and match the given"
+  echo "    regex pattern will be handled."
+  echo "    For example, to only handle incoming .fits files, pass '.*.fits'."
   echo "  --verbose | -v"
   echo "    Print additional information."
 }
@@ -67,7 +72,7 @@ clean() {
 
 # This requires GNU getopt. On Mac OS X and FreeBSD, you have to install this separately.
 args=$(getopt -o hi:v --long help:,input-directory:,input-dir:,index-dir:,index-directory:,index-base-name:,\
-source-extractor-config:,time-limit:,scale-low:,scale-high:,blur-score-path:,blur-threshold:,verbose \
+source-extractor-config:,time-limit:,scale-low:,scale-high:,blur-score-path:,blur-threshold:,regex:,verbose \
 -n "$0" -- "$@")
 
 if [ $? != 0 ] ; then usage; exit 255; fi
@@ -85,6 +90,7 @@ scale_low=
 scale_high=
 blur_score_path=
 blur_threshold=$DEFAULT_BLUR_THRESHOLD
+regex=$DEFAULT_REGEX
 verbose=
 
 while true; do
@@ -153,6 +159,9 @@ while true; do
         usage; exit 255
       fi
       blur_threshold=$2
+      shift 2 ;;
+    --regex )
+      regex="$2"
       shift 2 ;;
     --verbose | -v )
       verbose="set"
@@ -255,7 +264,7 @@ fi
 
 last=""
 while true; do
-  latest="$(find "$input_dir" -type f -exec ls -t {} + 2>/dev/null | head -1)"
+  latest="$(find "$input_dir" -type f -regex "$input_dir/$regex" -exec ls -t {} + 2>/dev/null | head -1)"
   if [ "$last" == "$latest" ]; then
     if [ $verbose ]; then
       echo "Waiting for new files..."
@@ -265,7 +274,7 @@ while true; do
         echo "New file appeared: '$file'"
       fi
       latest="$input_dir/$file"
-    done < <(inotifywait "$input_dir" -e create -e moved_to)
+    done < <(inotifywait "$input_dir" -e create -e moved_to --include "$regex")
   fi
 
   solve_file=
@@ -293,6 +302,7 @@ while true; do
     else
       echo "Could not solve $latest."
       if [ $verbose ]; then
+        echo "Output from solve-field:"
         echo "$output"
       fi
     fi
