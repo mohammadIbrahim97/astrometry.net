@@ -173,12 +173,15 @@ cleanscript="$mydir/clean.sh"
 
 shopt -s lastpipe
 
+parallel=
 # Find out whether a parallelized build is being used
 if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
   echo "Notice: solve-field recognized --wall-limit. Using parallel build."
+  parallel=1
 else
   if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
     echo "Notice: solve-field did not recognize the option --wall-limit. Assuming serial build."
+    parallel=
   else
     echo "solve-field recognized neither --wall-limit nor --cpulimit."
     echo "Is your executable broken?"
@@ -219,9 +222,15 @@ for runind in $(seq "$repeats"); do
       done
     fi
 
+    if [ $parallel ]; then
+      cmd="solve-field --overwrite --no-plots -z \"$downsample\" -u app -L \"$scalelow\" -H \"$scalehigh\" "\
+"--wall-limit \"$cpulimit\" --objs \"$objs\" \"$file\" 2>/dev/null"
+    else
+      cmd="solve-field --overwrite --no-plots -z \"$downsample\" -u app -L \"$scalelow\" -H \"$scalehigh\" "\
+"-l \"$cpulimit\" --objs \"$objs\" \"$file\" 2>/dev/null"
+    fi
     t0=$( echo $EPOCHREALTIME | tr -dc "0-9")
-    eval "solve-field --overwrite --no-plots -z \"$downsample\" -u app -L \"$scalelow\" -H \"$scalehigh\" "\
-    "-l \"$cpulimit\" --objs \"$objs\" \"$file\" 2>/dev/null"
+    eval "$cmd"
     t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
     td=$((t1-t0))
 
