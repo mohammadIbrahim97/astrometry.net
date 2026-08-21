@@ -7,7 +7,6 @@
 
 #if PY_MAJOR_VERSION >= 3
 #define IS_PY3K
-#define PyLong_FromLong PyLong_FromLong
 #endif
 
 #include <stdio.h>
