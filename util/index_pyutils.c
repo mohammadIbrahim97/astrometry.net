@@ -70,7 +70,7 @@ static PyObject* qidxfile_get_quad_list(PyObject* self, PyObject* args) {
 static PyObject* pyval_int(void* v, int index) {
     PyObject* pyval;
     int* i = (int*)v;
-    pyval = PyInt_FromLong((long)i[index]);
+    pyval = PyLong_FromLong((long)i[index]);
     assert(pyval);
     return pyval;
 }
