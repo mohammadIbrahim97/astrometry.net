@@ -15,6 +15,8 @@ printhelp() {
   echo "  -c <cpulimit> [default: 300]"
   echo "  -d <downsample> [default: 0]"
   echo "  -b <object-limit>: Corresponds to --objs parameter in solve-field [default: 999999]"
+  echo "  -s <source-extractor-config-path>: Path to the configuration file for SourceExtractor."
+  ehco "    If present, SourceExtractor will be used instead of image2xy."
   echo "  -r <number-of-runs> [default: 1]"
   echo "  -e <command-string>: Allows to call external tools and add their data to the generated file."
   echo "    <command-string> must consist of two parts separated by a colon (:)."
@@ -40,7 +42,7 @@ numreg="^([0-9]+(\.[0-9]+)?|\.[0-9]+)$"
 
 execind=0
 
-while getopts "i:n:o:l:h:c:d:b:r:e:" opt; do
+while getopts "i:n:o:l:h:c:d:b:s:r:e:" opt; do
   case $opt in
     i)
       if ! [ -d "$OPTARG" ]; then
@@ -86,6 +88,13 @@ while getopts "i:n:o:l:h:c:d:b:r:e:" opt; do
         echo "ERROR: Object limit (-b) needs to be an integer."; printhelp
       fi
       objs="$OPTARG"
+      ;;
+    s)
+      if ! [ -f "$OPTARG" ]; then
+        echo "ERROR: SourceExtractor configuration file \"$OPTARG\" doesn't exist."
+        printhelp
+      fi
+      source_extractor_config="$OPTARG"
       ;;
     r)
       if ! [[ "$OPTARG" =~ $intreg ]] ; then
@@ -171,24 +180,33 @@ bright_unrecognized() {
 mydir="$(dirname "$0")"
 cleanscript="$mydir/clean.sh"
 
-shopt -s lastpipe
+cmd="solve-field --overwrite --no-plots -z \"$downsample\" -u app -L \"$scalelow\" -H \"$scalehigh\" --objs \"$objs\""
+
+if [ "$source_extractor_config" ]; then
+  cmd="$cmd --use-source-extractor --source-extractor-config $source_extractor_config"
+  cmd="$cmd --x-column X_IMAGE --y-column Y_IMAGE --sort-column MAG_AUTO --sort-ascending"
+fi
 
 # Find out whether a parallelized build is being used
 if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
   echo "Notice: solve-field recognized --wall-limit. Using parallel build."
+  cmd="$cmd --wall-limit \"$cpulimit\""
 else
   if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
     echo "Notice: solve-field did not recognize the option --wall-limit. Assuming serial build."
+    cmd="$cmd -l \"$cpulimit\""
   else
     echo "solve-field recognized neither --wall-limit nor --cpulimit."
     echo "Is your executable broken?"
-    exit
+    exit 255
   fi
 fi
 
 printf "{\n  \"downsample\": %s,\n  \"scale-low\": %s,\n  \"scale-high\": %s,\n  \"realtime-limit\": %s,\n  \"objs\": %s,\n  \"repeats\": %s"\
   "$downsample" "$scalelow" "$scalehigh" "$cpulimit" "$objs" "$repeats" >> "$outfile"
 printf ",\n  \"images\": [" >> "$outfile"
+
+shopt -s lastpipe
 
 inputfiles=$(find "$indir" -mindepth 1 -maxdepth 1 -type f -name "$namescheme" | sort)
 
@@ -220,8 +238,7 @@ for runind in $(seq "$repeats"); do
     fi
 
     t0=$( echo $EPOCHREALTIME | tr -dc "0-9")
-    eval "solve-field --overwrite --no-plots -z \"$downsample\" -u app -L \"$scalelow\" -H \"$scalehigh\" "\
-    "-l \"$cpulimit\" --objs \"$objs\" \"$file\" 2>/dev/null"
+    eval "$cmd \"$file\" 2>/dev/null"
     t1=$( echo $EPOCHREALTIME | tr -dc "0-9")
     td=$((t1-t0))
 
