@@ -37,6 +37,7 @@
 #include "sip_qfits.h"
 #include "sip-utils.h"
 #include "wcs-rd2xy.h"
+#include "anwcs.h"
 #include "new-wcs.h"
 #include "scamp.h"
 
@@ -654,52 +655,99 @@ static void after_solved(augment_xylist_t* axy,
         }
     }
 
-    if (sf->scampfn && file_exists(axy->wcsfn)) {
-        //char* hdrfile = NULL;
-        qfits_header* imageheader = NULL;
+    if (file_exists(axy->wcsfn) && (file_exists(axy->corrfn) || sf->scampfn)) {
         starxy_t* xy;
         xylist_t* xyls;
 
         xyls = xylist_open(axy->axyfn);
         if (!xyls) {
-            ERROR("Failed to read xylist to write SCAMP catalog");
+            ERROR("Failed to read xylist, so SCAMP catalog can't be written and distractors can't be detected");
             exit(-1);
         }
         if (axy->xcol)
             xylist_set_xname(xyls, axy->xcol);
         if (axy->ycol)
             xylist_set_yname(xyls, axy->ycol);
-        //xylist_set_include_flux(xyls, FALSE);
+        xylist_set_include_flux(xyls, FALSE);
         xylist_set_include_background(xyls, FALSE);
         xy = xylist_read_field(xyls, NULL);
         xylist_close(xyls);
 
-        if (axy->fitsimgfn) {
-            //hdrfile = axy->fitsimgfn;
-            imageheader = anqfits_get_header2(axy->fitsimgfn, 0);
-        }
-        if (axy->xylsfn) {
-            char val[32];
-            //hdrfile = axy->xylsfn;
-            imageheader = anqfits_get_header2(axy->xylsfn, 0);
-            // Set NAXIS=2, NAXIS1=IMAGEW, NAXIS2=IMAGEH
-            fits_header_mod_int(imageheader, "NAXIS", 2, NULL);
-            sprintf(val, "%i", axy->W);
-            qfits_header_add_after(imageheader, "NAXIS",  "NAXIS1", val, "image width", NULL);
-            sprintf(val, "%i", axy->H);
-            qfits_header_add_after(imageheader, "NAXIS1", "NAXIS2", val, "image height", NULL);
-            //fits_header_add_int(imageheader, "NAXIS1", axy->W, NULL);
-            //fits_header_add_int(imageheader, "NAXIS2", axy->H, NULL);
-            logverb("Using NAXIS 1,2 = %i,%i\n", axy->W, axy->H);
+        if (sf->scampfn) {
+            //char* hdrfile = NULL;
+            qfits_header* imageheader = NULL;
+
+            if (axy->fitsimgfn) {
+                //hdrfile = axy->fitsimgfn;
+                imageheader = anqfits_get_header2(axy->fitsimgfn, 0);
+            }
+            if (axy->xylsfn) {
+                char val[32];
+                //hdrfile = axy->xylsfn;
+                imageheader = anqfits_get_header2(axy->xylsfn, 0);
+                // Set NAXIS=2, NAXIS1=IMAGEW, NAXIS2=IMAGEH
+                fits_header_mod_int(imageheader, "NAXIS", 2, NULL);
+                sprintf(val, "%i", axy->W);
+                qfits_header_add_after(imageheader, "NAXIS",  "NAXIS1", val, "image width", NULL);
+                sprintf(val, "%i", axy->H);
+                qfits_header_add_after(imageheader, "NAXIS1", "NAXIS2", val, "image height", NULL);
+                //fits_header_add_int(imageheader, "NAXIS1", axy->W, NULL);
+                //fits_header_add_int(imageheader, "NAXIS2", axy->H, NULL);
+                logverb("Using NAXIS 1,2 = %i,%i\n", axy->W, axy->H);
+            }
+
+            if (scamp_write_field(imageheader, &wcs, xy, sf->scampfn)) {
+                ERROR("Failed to write SCAMP catalog");
+                exit(-1);
+            }
+            if (imageheader)
+                qfits_header_destroy(imageheader);
         }
 
-        if (scamp_write_field(imageheader, &wcs, xy, sf->scampfn)) {
-            ERROR("Failed to write SCAMP catalog");
-            exit(-1);
+        if (file_exists(axy->corrfn)) {
+            const int MAX_DISTRACTORS_TO_MENTION = 5;
+
+            fitstable_t *const corrtab = fitstable_open(axy->corrfn);
+            const int corrnrows = fitstable_nrows(corrtab);
+            const int *const corrfieldids = fitstable_read_column(corrtab, "field_id", TFITS_BIN_TYPE_J);
+            fitstable_close(corrtab);
+
+            anwcs_t *const anwcs = anwcs_open(axy->wcsfn, 0);
+
+            printf("The brightest distractors are ");
+            // Using doubles is fine here despite them being variably sized,
+            // since starxy_t itself uses doubles
+            double xycoords[2];
+            double rdcoords[2*MAX_DISTRACTORS_TO_MENTION];
+            int distractorsFound = 0;
+            for (int xyrow=0, corrindex=0;
+                distractorsFound<MAX_DISTRACTORS_TO_MENTION && corrindex<corrnrows;
+                xyrow++
+            ) {
+                if (corrfieldids[corrindex] == xyrow) {
+                    corrindex++;
+                    continue;
+                }
+                starxy_get(xy, xyrow, xycoords);
+                anwcs_pixelxy2radec(anwcs, xycoords[0], xycoords[1],
+                    &rdcoords[2*distractorsFound], &rdcoords[2*distractorsFound+1]);
+                distractorsFound++;
+                if (distractorsFound>=MAX_DISTRACTORS_TO_MENTION) {
+                    printf("(capped at %d) ", MAX_DISTRACTORS_TO_MENTION);
+                    break;
+                } if (corrindex>=corrnrows) {
+                    printf("(only found %d) ", distractorsFound);
+                    break;
+                }
+            }
+            anwcs_free(anwcs);
+            printf("(RA, DEC):\n");
+            for (int i=0; i<distractorsFound; i++) {
+                printf("  %f, %f\n", rdcoords[2*i], rdcoords[2*i+1]);
+            }
         }
+
         starxy_free(xy);
-        if (imageheader)
-            qfits_header_destroy(imageheader);
     }
 
     if (sf->scampconfigfn) {
