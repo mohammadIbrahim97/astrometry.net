@@ -1415,7 +1415,6 @@ void onefield_internal_solved_field(onefield_t* bp, int fieldnum) {
  */
 static int publish_solved_fields(onefield_t* bp) {
     int i;
-    int failed = FALSE;
 
     if (!bp || !bp->solved_out || !bp->solved_fields_pending) {
         return 0;
@@ -1427,14 +1426,14 @@ static int publish_solved_fields(onefield_t* bp) {
         logmsg("Field %i solved: writing to file %s to indicate this.\n",
                fieldnum,
                bp->solved_out);
-
-        if (solvedfile_set(bp->solved_out, fieldnum)) {
-            logerr("Failed to write solvedfile %s.\n", bp->solved_out);
-            failed = TRUE;
-        }
     }
-
-    return failed ? -1 : 0;
+    if (solvedfile_set_list_atomic(
+            bp->solved_out, bp->solved_fields_pending)) {
+        logerr("Failed to atomically publish solvedfile %s.\n",
+               bp->solved_out);
+        return -1;
+    }
+    return 0;
 }
 
 void onefield_matchobj_deep_copy(const MatchObj* mo, MatchObj* dest) {
