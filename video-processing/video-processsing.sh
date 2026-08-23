@@ -14,14 +14,14 @@ usage() {
   echo "    Path to the directory containing the indices for the solver."
   echo "  --index-base-name <index-base-name>"
   echo "    Common part of the names of the index files inside <index-dir>."
-  echo "    For example, if you have several index file that are named index_05.fits,"
+  echo "    For example, if you have several index files named index_05.fits,"
   echo "    index_06.fits, index_07.fits, etc, this option's argument should be \"index_\"."
   echo "    These numbers must have two digits, and the file extension is assumed to be .fits."
   echo ""
   echo "Optional options:"
   echo "  --source-extractor-config <path>"
   echo "    Path to the configuration file for source-extractor."
-  echo "    If this option is given, astromtry will use source-extractor;"
+  echo "    If this option is given, astrometry will use source-extractor;"
   echo "    otherwise, it will use image2xy."
   echo "  --time-limit <seconds>"
   echo "    Total time limit for the solver. Does not include source extraction."
@@ -42,7 +42,7 @@ usage() {
   echo "    Any file with a blur score above this number will be excluded."
   echo "    Will have no effect unless --blur-score-path is also present."
   echo "    Default: $DEFAULT_BLUR_THRESHOLD."
-  echo "  --filter <regex>"
+  echo "  --regex <regex>"
   echo "    Only files that appear in the input directory and match the given"
   echo "    regex pattern will be handled."
   echo "    For example, to only handle incoming .fits files, pass '.*.fits'."
@@ -56,7 +56,7 @@ rounded_index_scale() {
   # (subsection: Index scale)
   exact=$(echo "2*l(8*$1)/l(2)" | bc -l)
 
-  # This is not exact rounding (+0.5), but instead aplies a slight bias
+  # This is not exact rounding (+0.5), but instead applies a slight bias
   # towards lower index scales, as those, while having a larger file size,
   # seem to be checked more quickly by the solver
   rounded=$(echo "($exact+0.4)/1" | bc)
@@ -71,7 +71,7 @@ clean() {
 }
 
 # This requires GNU getopt. On Mac OS X and FreeBSD, you have to install this separately.
-args=$(getopt -o hi:v --long help:,input-directory:,input-dir:,index-dir:,index-directory:,index-base-name:,\
+args=$(getopt -o hi:v --long help,input-directory:,input-dir:,index-dir:,index-directory:,index-base-name:,\
 source-extractor-config:,time-limit:,scale-low:,scale-high:,blur-score-path:,blur-threshold:,regex:,verbose \
 -n "$0" -- "$@")
 
@@ -132,7 +132,7 @@ while true; do
       time_limit=$2
       shift 2 ;;
     --scale-low )
-      # Again, sanity checks are done ltaer
+      # Again, sanity checks are done later
       if ! [[ "$2" =~ $NUMREG ]] ; then
         echo "ERROR: Lower scale bound (--scale-low) needs to be a number."
         usage; exit 255
@@ -149,7 +149,7 @@ while true; do
     --blur-score-path )
       blur_score_path="$(realpath -m "$2")"
       if ! [ -f "$blur_score_path" ]; then
-        echo "ERROR: Blur score executable at \"$blur_score_path doesn't exist."
+        echo "ERROR: Blur score executable at \"$blur_score_path\" doesn't exist."
         usage; exit 255
       fi
       shift 2 ;;
@@ -202,7 +202,7 @@ if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
   whole_command="$whole_command --wall-limit $time_limit"
 else
   if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
-    echo "WARNING: Using versison of solve-field without parallelization."
+    echo "WARNING: Using version of solve-field without parallelization."
     whole_command="$whole_command --cpulimit $time_limit"
   else
     echo "ERROR: solve-field recognized neither --wall-limit nor --cpulimit."
@@ -224,7 +224,7 @@ if [[ -n $scale_high ]]; then
   max_index_scale=$(("$(rounded_index_scale $scale_high)"+1))
 fi
 if [ $verbose ]; then
-  echo "Index scales form $min_index_scale to $max_index_scale will be used."
+  echo "Index scales from $min_index_scale to $max_index_scale will be used."
 fi
 
 indices_found=0
