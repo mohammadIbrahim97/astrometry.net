@@ -48,7 +48,8 @@ build_tests() {
     }
     make -C "$solver_dir" -j2 \
         test-solver test-solver-2 test-index-shard-config \
-        test-index-shard-staged test-engine-passes \
+        test-index-shard-staged test-index-shard-pool-lifecycle \
+        test-engine-passes \
         test-solver-parallel-integration \
         test-solver-streaming-integration \
         test-solver-allocation-failure \
@@ -231,13 +232,46 @@ run_unit solver "$solver_dir/test-solver"
 run_unit solver-permutations "$solver_dir/test-solver-2"
 run_unit shard-config "$solver_dir/test-index-shard-config"
 run_unit shard-lifecycle "$solver_dir/test-index-shard-staged"
+run_unit shard-pool-lifecycle "$solver_dir/test-index-shard-pool-lifecycle"
 run_unit engine-passes "$solver_dir/test-engine-passes"
 run_unit verify-theta-tail "$solver_dir/test-verify-theta-tail"
 
 run_unit canonical-order \
     "$solver_dir/test-solver-parallel-integration" --canonical-index-order
 
+# Exercise the production onefield hook with enough distinct names to span
+# many string-list blocks. Every worker lookup must use the pass snapshot;
+# the mutable master list is never traversed after generation publication.
+snapshot_indexes=()
+for snapshot_order in $(seq 0 348); do
+    snapshot_path="$work_dir/index-snapshot-$(printf '%03d' "$snapshot_order").fits"
+    ln -s "$winner_index" "$snapshot_path" ||
+        die "cannot create immutable-index snapshot fixture"
+    snapshot_indexes+=("$snapshot_path")
+done
+run_case immutable-index-names test-solver-parallel-integration \
+    4 1 1 probe "${snapshot_indexes[@]}"
+assert_log "immutable index-name candidate count" \
+    'candidates=349 ' "$work_dir/immutable-index-names.log"
+for snapshot_order in $(seq 0 348); do
+    snapshot_path="$work_dir/index-snapshot-$(printf '%03d' "$snapshot_order").fits"
+    assert_log "immutable index-name order $snapshot_order" \
+        "load index_order=$snapshot_order index=$snapshot_path" \
+        "$work_dir/immutable-index-names.log"
+done
+
 compare_pair exhaustive 1 20 exhaustive "$winner_index"
+SOLVER_TEST_RDLS_TAGALONG_GUARD=1 \
+run_case tagalong-guard_w1 test-solver-parallel-integration \
+    1 1 20 exhaustive "$winner_index"
+SOLVER_TEST_RDLS_TAGALONG_GUARD=1 \
+run_case tagalong-guard_w4 test-solver-parallel-integration \
+    4 1 20 exhaustive "$winner_index"
+assert_same "tag-along serial guard science" \
+    "$(science_key "$work_dir/tagalong-guard_w1.log")" \
+    "$(science_key "$work_dir/tagalong-guard_w4.log")"
+assert_log "tag-along serial guard" \
+    'mode=serial-rdls-tagalong ' "$work_dir/tagalong-guard_w4.log"
 run_case later-winner_w1 test-solver-parallel-integration \
     1 1 20 winner "$nonwinner_index" "$winner_index"
 run_case later-winner_w4 test-solver-parallel-integration \
