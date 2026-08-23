@@ -33,7 +33,7 @@ static index_shard_hook_result_t index_shard_worker_get_index(
   }
 
   hook_result = shared->hooks->get_index(
-      shared->bp, index_order, index_out);
+      shared->worker_view, index_order, index_out);
   if (hook_result.outcome ==
           INDEX_SHARD_HOOK_COMPLETED_UNSOLVED &&
       !*index_out) {

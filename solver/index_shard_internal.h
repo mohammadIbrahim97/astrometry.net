@@ -73,7 +73,7 @@ typedef struct index_shard_hook_result {
 
 typedef struct index_shard_hooks {
   index_shard_hook_result_t (*get_index)(
-      onefield_t *bp,
+      const void *worker_view,
       size_t index_order,
       index_t **index_out);
 
@@ -95,10 +95,10 @@ typedef struct index_shard_hooks {
    * Worker-local context lifecycle.
    *
    * create_worker_view() freezes one pass-owned immutable view before the
-   * generation is published. prepare_local_context() receives only that view,
-   * never the reducer-owned onefield_t or its mutable solver. Narrow index
-   * acquisition and terminal-limit services remain separate synchronized
-   * pass boundaries.
+   * generation is published. get_index() and prepare_local_context() receive
+   * only that view, never the reducer-owned onefield_t or its mutable solver.
+   * Narrow index release and terminal-limit services remain separate
+   * synchronized pass boundaries.
    *
    * prepare_local_context() runs once per worker per submitted pass.
    * reset_local_context_for_task() runs before every one-index solve.

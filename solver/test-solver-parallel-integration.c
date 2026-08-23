@@ -374,12 +374,11 @@ static index_shard_hook_result_t canonical_index_order_hook_result(
 }
 
 static index_shard_hook_result_t canonical_index_order_get_index(
-    onefield_t* bp,
+    const void* worker_view,
     size_t index_order,
     index_t** index_out) {
-    (void)bp;
-
-    if (!index_out || index_order >= 2U) {
+    if (worker_view != &canonical_index_order_test ||
+        !index_out || index_order >= 2U) {
         return canonical_index_order_hook_result(
             INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
             -1);
@@ -433,7 +432,7 @@ static int canonical_index_order_create_worker_view(
     if (!master_bp || !base_sp || !worker_view_out) {
         return -1;
     }
-    *worker_view_out = master_bp;
+    *worker_view_out = &canonical_index_order_test;
     return 0;
 }
 
@@ -911,6 +910,26 @@ int main(int argc, char** argv) {
         goto cleanup;
     }
     onefield_set_match_file(&bp, match_path);
+    if (getenv("SOLVER_TEST_RDLS_TAGALONG_GUARD")) {
+        int tagalong_order;
+
+        bp.rdls_tagalong = sl_new(4);
+        if (!bp.rdls_tagalong) {
+            fprintf(stderr, "failed to allocate tag-along guard list\n");
+            result = 1;
+            goto cleanup;
+        }
+        for (tagalong_order = 0; tagalong_order < 128; tagalong_order++) {
+            if (!sl_appendf(
+                    bp.rdls_tagalong,
+                    "TEST_TAGALONG_%03i",
+                    tagalong_order)) {
+                fprintf(stderr, "failed to build tag-along guard list\n");
+                result = 1;
+                goto cleanup;
+            }
+        }
+    }
     if (cancel_file) {
         onefield_set_cancel_file(&bp, cancel_file);
     }

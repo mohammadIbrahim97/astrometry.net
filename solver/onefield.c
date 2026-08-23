@@ -507,6 +507,7 @@ void onefield_run(onefield_t* bp) {
         bp->nsolves <= 1 &&
         sp->maxquads == 0 &&
         sp->maxmatches == 0 &&
+        !bp->rdls_tagalong &&
         !bp->rdls_tagalong_all &&
         !verification_datalog;
     if (shard_candidate && !job_field_prepared) {
@@ -620,10 +621,10 @@ void onefield_run(onefield_t* bp) {
         bp->nsolves <= 1 &&
         sp->maxquads == 0 &&
         sp->maxmatches == 0 &&
-        bp->rdls_tagalong_all) {
-        logverb("[index-shard] automatic RDLS tag-along discovery uses exact "
-                "serial path until its column list is worker-private\n");
-        profile_mode = "serial-rdls-tagalong-all";
+        (bp->rdls_tagalong || bp->rdls_tagalong_all)) {
+        logverb("[index-shard] RDLS tag-along columns use the exact serial "
+                "path until their list is worker-private\n");
+        profile_mode = "serial-rdls-tagalong";
     }
 
     if (index_shard_pthread_enabled(bp) &&

@@ -27,6 +27,33 @@
 #include "tic.h"
 #include "verify.h"
 
+typedef struct onefield_index_shard_worker_view {
+  solver_t solver;
+  struct stat source_identity;
+  void *index_snapshot_storage;
+  const char **index_names;
+  char *index_name_arena;
+  index_t **loaded_indexes;
+  size_t index_name_count;
+  size_t loaded_index_count;
+  int index_options;
+  /* Borrowed from the master until every worker has quiesced. */
+  char *fieldfname;
+  char *indexrdlsfname;
+  char *corr_fname;
+  char *scamp_fname;
+  char *solved_in;
+  char *xcolname;
+  char *ycolname;
+  char *fieldid_key;
+  char *sort_rdls;
+  char *cancelfname;
+  double logratio_tosolve;
+  int nsolves;
+  int fieldnum;
+  int fieldid;
+} onefield_index_shard_worker_view_t;
+
 static index_shard_hook_result_t onefield_index_shard_hook_result(
     index_shard_hook_outcome_t outcome,
     int error_code) {
@@ -36,24 +63,25 @@ static index_shard_hook_result_t onefield_index_shard_hook_result(
 }
 
 static index_shard_hook_result_t onefield_index_shard_get_index(
-    onefield_t *bp,
+    const void *opaque,
     size_t index_order,
     index_t **index_out) {
+  const onefield_index_shard_worker_view_t *view = opaque;
   index_t *index;
 
   if (index_out) {
     *index_out = NULL;
   }
-  if (!bp || !index_out) {
+  if (!view || !index_out) {
     return onefield_index_shard_hook_result(
         INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
         -1);
   }
 
-  if (index_order < (size_t)sl_size(bp->indexnames)) {
-    const char *index_name = sl_get(bp->indexnames, index_order);
+  if (index_order < view->index_name_count) {
+    const char *index_name = view->index_names[index_order];
 
-    index = index_load(index_name, bp->index_options, NULL);
+    index = index_load(index_name, view->index_options, NULL);
     if (!index) {
       ERROR("Failed to load index %s", index_name);
       return onefield_index_shard_hook_result(
@@ -67,15 +95,15 @@ static index_shard_hook_result_t onefield_index_shard_get_index(
         0);
   }
 
-  index_order -= (size_t)sl_size(bp->indexnames);
-  if (index_order >= (size_t)pl_size(bp->indexes)) {
+  index_order -= view->index_name_count;
+  if (index_order >= view->loaded_index_count) {
     ERROR("Index order %zu is outside the loaded index list", index_order);
     return onefield_index_shard_hook_result(
         INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
         -1);
   }
 
-  index = pl_get(bp->indexes, index_order);
+  index = view->loaded_indexes[index_order];
   if (!index) {
     return onefield_index_shard_hook_result(
         INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
@@ -182,26 +210,128 @@ int onefield_index_shard_prepare_job_field_for_run(
   return 0;
 }
 
-typedef struct onefield_index_shard_worker_view {
-  solver_t solver;
-  struct stat source_identity;
-  /* Borrowed from the master until every worker has quiesced. */
-  char *fieldfname;
-  char *indexrdlsfname;
-  char *corr_fname;
-  char *scamp_fname;
-  char *solved_in;
-  char *xcolname;
-  char *ycolname;
-  char *fieldid_key;
-  char *sort_rdls;
-  char *cancelfname;
-  const sl *rdls_tagalong;
-  double logratio_tosolve;
-  int nsolves;
-  int fieldnum;
-  int fieldid;
-} onefield_index_shard_worker_view_t;
+static void onefield_index_shard_destroy_worker_view(void *opaque) {
+  onefield_index_shard_worker_view_t *view = opaque;
+
+  if (!view) {
+    return;
+  }
+  free(view->index_snapshot_storage);
+  free(view);
+}
+
+/*
+ * Freeze index lookup into contiguous pass-owned storage. The master block
+ * lists have mutable last-access shortcuts, so no worker may traverse either
+ * list, including through a nominally const accessor.
+ */
+static int onefield_index_shard_snapshot_indexes(
+    onefield_index_shard_worker_view_t *view,
+    onefield_t *master) {
+  size_t index_name_table_bytes;
+  size_t loaded_index_table_bytes;
+  size_t snapshot_bytes;
+  size_t arena_bytes = 0U;
+  size_t arena_offset = 0U;
+  size_t i;
+
+  if (!view || !master) {
+    return -1;
+  }
+
+  view->index_name_count = (size_t)sl_size(master->indexnames);
+  view->loaded_index_count = (size_t)pl_size(master->indexes);
+  view->index_options = master->index_options;
+
+  if (view->index_name_count >
+      SIZE_MAX / sizeof(*view->index_names)) {
+    return -1;
+  }
+  if (view->loaded_index_count >
+      SIZE_MAX / sizeof(*view->loaded_indexes)) {
+    return -1;
+  }
+  index_name_table_bytes =
+      view->index_name_count * sizeof(*view->index_names);
+  loaded_index_table_bytes =
+      view->loaded_index_count * sizeof(*view->loaded_indexes);
+
+  for (i = 0U; i < view->index_name_count; i++) {
+    const char *name = sl_get(master->indexnames, i);
+    size_t name_bytes;
+
+    if (!name) {
+      return -1;
+    }
+    name_bytes = strlen(name);
+    if (name_bytes == SIZE_MAX ||
+        arena_bytes > SIZE_MAX - name_bytes - 1U) {
+      return -1;
+    }
+    arena_bytes += name_bytes + 1U;
+  }
+
+  if (index_name_table_bytes >
+      SIZE_MAX - loaded_index_table_bytes) {
+    return -1;
+  }
+  snapshot_bytes =
+      index_name_table_bytes + loaded_index_table_bytes;
+  if (snapshot_bytes > SIZE_MAX - arena_bytes) {
+    return -1;
+  }
+  snapshot_bytes += arena_bytes;
+
+  if (snapshot_bytes) {
+    char *storage = malloc(snapshot_bytes);
+
+    if (!storage) {
+      return -1;
+    }
+    view->index_snapshot_storage = storage;
+    view->index_names = (const char **)storage;
+    view->loaded_indexes = (index_t **)(
+        storage + index_name_table_bytes);
+    view->index_name_arena =
+        storage + index_name_table_bytes + loaded_index_table_bytes;
+  }
+
+  for (i = 0U; i < view->index_name_count; i++) {
+    const char *name = sl_get(master->indexnames, i);
+    size_t name_bytes;
+
+    if (!name) {
+      return -1;
+    }
+    name_bytes = strlen(name) + 1U;
+    if (arena_offset > arena_bytes ||
+        name_bytes > arena_bytes - arena_offset) {
+      return -1;
+    }
+
+    memcpy(
+        view->index_name_arena + arena_offset,
+        name,
+        name_bytes);
+    view->index_names[i] =
+        view->index_name_arena + arena_offset;
+    arena_offset += name_bytes;
+  }
+  if (arena_offset != arena_bytes) {
+    return -1;
+  }
+
+  for (i = 0U; i < view->loaded_index_count; i++) {
+    index_t *index = pl_get(master->indexes, i);
+
+    if (!index) {
+      return -1;
+    }
+    view->loaded_indexes[i] = index;
+  }
+
+  return 0;
+}
 
 /*
  * Initialize one worker from an allowlist of immutable configuration and
@@ -285,6 +415,7 @@ static int onefield_index_shard_create_worker_view(
       !base_solver->fieldxy_orig ||
       !base_solver->fieldxy ||
       !base_solver->vf ||
+      master->rdls_tagalong ||
       master->rdls_tagalong_all ||
       master->xyls_tagalong ||
       !master->xyls_tagalong_all ||
@@ -302,10 +433,13 @@ static int onefield_index_shard_create_worker_view(
   if (!view) {
     return -1;
   }
+  if (onefield_index_shard_snapshot_indexes(view, master)) {
+    onefield_index_shard_destroy_worker_view(view);
+    return -1;
+  }
   onefield_index_shard_initialize_local_solver(
       &view->solver, base_solver);
   view->source_identity = source_identity;
-  view->rdls_tagalong = master->rdls_tagalong;
   view->logratio_tosolve = master->logratio_tosolve;
   view->nsolves = master->nsolves;
   view->fieldnum = fieldnum;
@@ -344,7 +478,7 @@ static void onefield_index_shard_initialize_local_params(
   local->xcolname = view->xcolname;
   local->ycolname = view->ycolname;
   local->fieldid_key = view->fieldid_key;
-  local->rdls_tagalong = (sl*)view->rdls_tagalong;
+  local->rdls_tagalong = NULL;
   local->rdls_tagalong_all = FALSE;
   local->sort_rdls = view->sort_rdls;
   local->xyls_tagalong = NULL;
@@ -807,7 +941,8 @@ static const index_shard_hooks_t onefield_index_shard_hooks = {
 
     .create_worker_view =
         onefield_index_shard_create_worker_view,
-    .destroy_worker_view = free,
+    .destroy_worker_view =
+        onefield_index_shard_destroy_worker_view,
     .prepare_local_context =
         onefield_index_shard_prepare_local_context,
     .reset_local_context_for_task =
