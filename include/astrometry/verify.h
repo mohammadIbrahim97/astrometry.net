@@ -6,6 +6,8 @@
 #ifndef VERIFY_H
 #define VERIFY_H
 
+#include <stddef.h>
+
 #include "astrometry/kdtree.h"
 #include "astrometry/matchobj.h"
 #include "astrometry/bl.h"
@@ -104,6 +106,13 @@ void verify_hit(const startree_t* skdt,
                 double logratio_tostoplooking,
                 anbool distance_from_quad_bonus,
                 anbool fake_match);
+
+/*
+ * Verification datalog records are process-global and ordered.  Callers that
+ * would otherwise verify independent MatchObj instances concurrently must
+ * retain serial execution while this stream is enabled.
+ */
+anbool verify_datalog_enabled(void);
 
 // Distractor
 #define THETA_DISTRACTOR -1

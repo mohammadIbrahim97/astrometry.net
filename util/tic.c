@@ -28,6 +28,20 @@ double timenow() {
     return (double)(tv.tv_sec - 3600*24*365*30) + tv.tv_usec * 1e-6;
 }
 
+double monotonic_seconds() {
+#ifdef CLOCK_MONOTONIC
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) {
+        SYSERROR("Failed to read monotonic clock");
+        return -1.0;
+    }
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#else
+    /* Best available fallback on platforms without CLOCK_MONOTONIC. */
+    return timenow();
+#endif
+}
+
 double millis_between(struct timeval* tv1, struct timeval* tv2) {
     return
         (tv2->tv_usec - tv1->tv_usec)*1e-3 +

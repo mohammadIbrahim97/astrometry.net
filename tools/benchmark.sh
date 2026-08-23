@@ -16,7 +16,7 @@ printhelp() {
   echo "  -d <downsample> [default: 0]"
   echo "  -b <object-limit>: Corresponds to --objs parameter in solve-field [default: 999999]"
   echo "  -s <source-extractor-config-path>: Path to the configuration file for SourceExtractor."
-  ehco "    If present, SourceExtractor will be used instead of image2xy."
+  echo "    If present, SourceExtractor will be used instead of image2xy."
   echo "  -r <number-of-runs> [default: 1]"
   echo "  -e <command-string>: Allows to call external tools and add their data to the generated file."
   echo "    <command-string> must consist of two parts separated by a colon (:)."
@@ -190,7 +190,7 @@ fi
 # Find out whether a parallelized build is being used
 if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
   echo "Notice: solve-field recognized --wall-limit. Using parallel build."
-  cmd="$cmd --wall-limit \"$cpulimit\""
+  cmd="$cmd --wall-limit \"$cpulimit\" --p-workers 4"
 else
   if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
     echo "Notice: solve-field did not recognize the option --wall-limit. Assuming serial build."

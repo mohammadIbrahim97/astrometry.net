@@ -3,12 +3,14 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
 #include <assert.h>
 
 #include "quadfile.h"
+#include "fitsbin_internal.h"
 #include "qfits_header.h"
 #include "fitsioutils.h"
 #include "starutil.h"
@@ -17,6 +19,14 @@
 #include "an-endian.h"
 
 #define CHUNK_QUADS 0
+#define QUAD_PREFETCH_RANGE_LIMIT 256U
+
+typedef struct quadfile_star_plan {
+    fitsbin_prefetch_range_t* ranges;
+    size_t capacity;
+    size_t count;
+    size_t byte_budget;
+} quadfile_star_plan_t;
 
 static fitsbin_chunk_t* quads_chunk(quadfile_t* qf) {
     return fitsbin_get_chunk(qf->fb, CHUNK_QUADS);
@@ -78,6 +88,11 @@ static quadfile_t* new_quadfile(const char* fn, anqfits_t* fits, anbool writing)
         return NULL;
     }
 
+    // Quad data bypasses kdtree FITS I/O, so apply the same index policy here.
+    if (!writing) {
+        fitsbin_configure_index_mmap(qf->fb);
+    }
+
     fitsbin_chunk_init(&chunk);
     chunk.tablename = "quads";
     chunk.required = 1;
@@ -85,7 +100,7 @@ static quadfile_t* new_quadfile(const char* fn, anqfits_t* fits, anbool writing)
     chunk.userdata = qf;
     fitsbin_add_chunk(qf->fb, &chunk);
     fitsbin_chunk_clean(&chunk);
-    
+
     return qf;
 }
 
@@ -123,19 +138,28 @@ qfits_header* quadfile_get_header(const quadfile_t* qf) {
     return fitsbin_get_primary_header(qf->fb);
 }
 
-static quadfile_t* my_open(const char* fn, anqfits_t* fits) {
+static quadfile_t* my_open(const char* fn, anqfits_t* fits,
+                           anbool metadata_only) {
     quadfile_t* qf = NULL;
     fitsbin_chunk_t* chunk;
 
     qf = new_quadfile(fn, fits, FALSE);
-    if (!qf)
-        goto bailout;
-    if (fitsbin_read(qf->fb)) {
-        ERROR("Failed to open quads file");
+    if (!qf) {
         goto bailout;
     }
     chunk = quads_chunk(qf);
-    qf->quadarray = chunk->data;
+    if (metadata_only) {
+        if (fitsbin_read_chunk_header(qf->fb, chunk)) {
+            ERROR("Failed to read quads metadata");
+            goto bailout;
+        }
+    } else {
+        if (fitsbin_read(qf->fb)) {
+            ERROR("Failed to open quads file");
+            goto bailout;
+        }
+        qf->quadarray = chunk->data;
+    }
 
     // close fd.
     if (qf->fb->fid) {
@@ -159,11 +183,15 @@ char* quadfile_get_filename(const quadfile_t* qf) {
 }
 
 quadfile_t* quadfile_open_fits(anqfits_t* fits) {
-    return my_open(NULL, fits);
+    return my_open(NULL, fits, FALSE);
+}
+
+quadfile_t* quadfile_open_fits_metadata(anqfits_t* fits) {
+    return my_open(NULL, fits, TRUE);
 }
 
 quadfile_t* quadfile_open(const char* fn) {
-    return my_open(fn, NULL);
+    return my_open(fn, NULL, FALSE);
 }
 
 int quadfile_close(quadfile_t* qf) {
@@ -349,5 +377,80 @@ int quadfile_get_stars(const quadfile_t* qf, unsigned int quadid, unsigned int* 
     return 0;
 }
 
+static int quadfile_plan_stars(
+    const quadfile_t* qf,
+    const unsigned int* quadids,
+    int nquads,
+    quadfile_star_plan_t* plan) {
+    size_t row_size;
+    int i;
 
+    if (!plan || !plan->ranges || !plan->capacity) {
+        errno = EINVAL;
+        return -1;
+    }
+    plan->count = 0U;
+    plan->byte_budget = 0U;
+    if (!qf || !quadids || nquads <= 0 || !qf->fb ||
+        !qf->quadarray || qf->dimquads <= 0 ||
+        (size_t)qf->dimquads > SIZE_MAX / sizeof(uint32_t)) {
+        return 0;
+    }
+    if ((size_t)nquads > plan->capacity) {
+        errno = E2BIG;
+        return -1;
+    }
+    row_size = (size_t)qf->dimquads * sizeof(uint32_t);
+    if (fitsbin_prefetch_row_budget(
+            qf->fb,
+            row_size,
+            (size_t)nquads,
+            &plan->byte_budget)) {
+        return -1;
+    }
 
+    for (i = 0; i < nquads; i++) {
+        const uint32_t* row;
+
+        if (quadids[i] >= qf->numquads) {
+            errno = EINVAL;
+            return -1;
+        }
+        row = qf->quadarray +
+            (size_t)quadids[i] * (size_t)qf->dimquads;
+        plan->ranges[i].data = row;
+        plan->ranges[i].size = row_size;
+    }
+    plan->count = (size_t)nquads;
+    return 1;
+}
+
+int quadfile_prefetch_stars_submit(
+    const quadfile_t* qf,
+    const unsigned int* quadids,
+    int nquads,
+    fitsbin_payload_io_ticket_t** ticket) {
+    fitsbin_prefetch_range_t ranges[QUAD_PREFETCH_RANGE_LIMIT];
+    quadfile_star_plan_t plan = {
+        .ranges = ranges,
+        .capacity = sizeof(ranges) / sizeof(ranges[0]),
+    };
+    int status;
+
+    if (!ticket) {
+        errno = EINVAL;
+        return -1;
+    }
+    *ticket = NULL;
+    status = quadfile_plan_stars(
+        qf, quadids, nquads, &plan);
+    if (status <= 0) {
+        return status;
+    }
+    return fitsbin_prefetch_ranges_submit(
+        qf->fb,
+        plan.ranges,
+        plan.count,
+        plan.byte_budget,
+        ticket);
+}

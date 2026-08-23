@@ -6,12 +6,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "solver.h"
 #include "index.h"
-#include "pquad.h"
-#include "permutedsort.h"
+#include "bl-sort.h"
 #include "log.h"
+#include "test_solver_private.h"
 
 static int compare_n(const void* v1, const void* v2, int N) {
     const int* u1 = v1;
@@ -30,82 +31,15 @@ static int compare_tri(const void* v1, const void* v2) {
 static int compare_quad(const void* v1, const void* v2) {
     return compare_n(v1, v2, 4);
 }
-static int compare_quint(const void* v1, const void* v2) {
-    return compare_n(v1, v2, 5);
-}
 
 
-
-
-bl* quadlist;
-
-void test_try_all_codes(pquad* pq,
-                        unsigned int* fieldstars, int dimquad,
-                        solver_t* solver, double tol2) {
-    int sorted[dimquad];
-    int i;
-    fflush(NULL);
-    printf("test_try_all_codes: [");
-    for (i=0; i<dimquad; i++) {
-        printf("%s%i", (i?" ":""), fieldstars[i]);
-    }
-    printf("]");
-
-    // sort AB and C[DE]...
-    memcpy(sorted, fieldstars, dimquad * sizeof(int));
-    qsort(sorted, 2, sizeof(int), compare_ints_asc);
-    qsort(sorted+2, dimquad-2, sizeof(int), compare_ints_asc);
-
-    printf(" -> [");
-    for (i=0; i<dimquad; i++) {
-        printf("%s%i", (i?" ":""), sorted[i]);
-    }
-    printf("]\n");
-    fflush(NULL);
-
-    bl_append(quadlist, sorted);
-}
-
-static starxy_t* field1() {
-    starxy_t* starxy;
-    double field[14];
-    int i=0, N;
-    // star0 A: (0,0)
-    field[i++] = 0.0;
-    field[i++] = 0.0;
-    // star1 B: (2,2)
-    field[i++] = 2.0;
-    field[i++] = 2.0;
-    // star2
-    field[i++] = -1.0;
-    field[i++] = 3.0;
-    // star3
-    field[i++] = 0.5;
-    field[i++] = 1.5;
-    // star4
-    field[i++] = 1.0;
-    field[i++] = 1.0;
-    // star5
-    field[i++] = 1.5;
-    field[i++] = 0.5;
-    // star6
-    field[i++] = 3.0;
-    field[i++] = -1.0;
-
-    N = i/2;
-    starxy = starxy_new(N, FALSE, FALSE);
-    for (i=0; i<N; i++) {
-        starxy_setx(starxy, i, field[i*2+0]);
-        starxy_sety(starxy, i, field[i*2+1]);
-    }
-    return starxy;
-}
 
 void test1() {
     int i;
     solver_t* solver;
     index_t index;
     starxy_t* starxy;
+    bl* quadlist;
     int wanted[][4] = { { 0,1,3,4 },
                         { 0,2,3,4 },
                         { 1,2,3,4 },
@@ -137,9 +71,10 @@ void test1() {
                         { 3,6,4,5 },
     };
 
-    starxy = field1();
+    starxy = test_solver_geometry_field();
 
     quadlist = bl_new(16, 4*sizeof(uint));
+    test_solver_geometry_use_quadlist(quadlist);
 
     solver = solver_new();
 
@@ -167,6 +102,7 @@ void test1() {
     }
 
     bl_free(quadlist);
+    test_solver_geometry_use_quadlist(NULL);
 }
 
 void test2() {
@@ -174,6 +110,7 @@ void test2() {
     solver_t* solver;
     index_t index;
     starxy_t* starxy;
+    bl* quadlist;
     int wanted[][3] = { { 0, 1, 3 },
                         { 0, 1, 4 },
                         { 0, 1, 5 },
@@ -207,8 +144,9 @@ void test2() {
                         { 4, 6, 5 },
     };
 
-    starxy = field1();
+    starxy = test_solver_geometry_field();
     quadlist = bl_new(16, 3*sizeof(uint));
+    test_solver_geometry_use_quadlist(quadlist);
     solver = solver_new();
     memset(&index, 0, sizeof(index_t));
     index.index_scale_lower = 1;
@@ -234,6 +172,7 @@ void test2() {
         assert(compare_tri(bl_access(quadlist, i), wanted[i]) == 0);
     }
     bl_free(quadlist);
+    test_solver_geometry_use_quadlist(NULL);
 }
 
 
@@ -251,6 +190,11 @@ int main(int argc, char** args) {
 
     test1();
     test2();
+    test_solver_geometry_cache_exact();
+    test_solver_geometry_cache_deep_admission();
+    test_solver_ab_counter_boundaries();
+    test_solver_ab_descriptor_partition_count();
+    test_solver_zero_initialized_payload_fd_is_unowned();
+    test_solver_index_close_fds_failure_state();
     return 0;
 }
-

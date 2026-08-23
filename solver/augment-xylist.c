@@ -21,6 +21,7 @@
 #include <getopt.h>
 #include <math.h>
 #include <assert.h>
+#include <errno.h>
 
 #include "os-features.h"
 #include "ioutils.h"
@@ -42,6 +43,7 @@
 #include "log.h"
 #include "anqfits.h"
 #include "mathutil.h"
+#include "index_shard_config.h"
 
 static void delete_existing_an_headers(qfits_header* hdr);
 
@@ -159,7 +161,11 @@ static an_option_t options[] = {
     {'|', "objs",           required_argument, "int",
      "cut the source list to have this many items (after sorting, if applicable)."},
     {'l', "cpulimit",       required_argument, "seconds",
-     "give up solving after the specified number of seconds of CPU time"},
+     "optional aggregate user+system CPU budget across all engine threads"},
+    {'\x98', "wall-limit",    required_argument, "seconds",
+     "elapsed astrometry-engine deadline; may reduce but not exceed the backend wall limit"},
+    {'\x99', "p-workers", required_argument, "auto|count",
+     "parallel solver workers; auto uses available CPUs, 1 is serial"},
     {'r', "resort",         no_argument, NULL,
      "sort the star brightnesses by background-subtracted flux; the default is to sort using a"
      "compromise between background-subtracted and non-background-subtracted flux"},
@@ -243,7 +249,7 @@ static an_option_t options[] = {
     {'F', "fields",         required_argument, NULL, NULL},
     {'w', "width",                 required_argument, "pixels",
      "specify the field width"},
-    {'e', "height",                required_argument, "pixels", 
+    {'e', "height",                required_argument, "pixels",
      "specify the field height"},
     {'X', "x-column",       required_argument, "column-name",
      "the FITS column containing the X coordinate of the sources"},
@@ -269,6 +275,25 @@ void augment_xylist_add_options(bl* opts) {
 }
 
 static int parse_fields_string(il* fields, const char* str);
+
+static int parse_nonnegative_seconds(const char* text, double* value) {
+    char* end;
+    double parsed;
+
+    if (!text || !value) {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtod(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' ||
+        !isfinite(parsed) || parsed < 0.0) {
+        return -1;
+    }
+
+    *value = parsed;
+    return 0;
+}
 
 int augment_xylist_parse_option(char argchar, char* optarg,
                                 augment_xylist_t* axy) {
@@ -297,6 +322,32 @@ int augment_xylist_parse_option(char argchar, char* optarg,
         break;
     case '\x94':
         axy->pixel_xscale = atof(optarg);
+        break;
+    case '\x98':
+        if (parse_nonnegative_seconds(optarg, &axy->wall_limit)) {
+            ERROR("wall limit must be a finite, non-negative number of seconds: \"%s\"",
+                  optarg ? optarg : "(null)");
+            return -1;
+        }
+        break;
+    case '\x99':
+        {
+            int available_cpus = index_shard_config_available_cpus();
+            int requested_workers;
+
+            if (index_shard_config_parse_workers(optarg,
+                                                 available_cpus,
+                                                 &requested_workers)) {
+                ERROR("Invalid --p-workers value \"%s\": "
+                      "expected \"auto\" or an integer from 1 through %i",
+                      optarg ? optarg : "(null)",
+                      available_cpus);
+                return -1;
+            }
+
+            axy->index_shard_workers = requested_workers;
+            axy->index_shard_workers_set = TRUE;
+        }
         break;
     case ';':
         axy->invert_image = TRUE;
@@ -435,7 +486,7 @@ int augment_xylist_parse_option(char argchar, char* optarg,
         break;
     case 'V':
         sl_append(axy->verifywcs, optarg);
-        il_append(axy->verifywcs_ext, 
+        il_append(axy->verifywcs_ext,
                   (verify_extension >= 0 ? verify_extension : axy->extension));
         break;
     case 'I':
@@ -817,7 +868,7 @@ int augment_xylist(augment_xylist_t* axy,
         } else {
             fitsimgfn = create_temp_file("fits", axy->tempdir);
             sl_append_nocopy(tempfiles, fitsimgfn);
-            
+
             if (pnmtype == 'P') {
                 logverb("Converting PPM image to FITS...\n");
 
@@ -1183,8 +1234,18 @@ int augment_xylist(augment_xylist_t* axy,
     }
     qfits_header_add(hdr, "ANRUN", "T", "Solve this field!", NULL);
 
-    if (axy->cpulimit > 0)
-        fits_header_add_double(hdr, "ANCLIM", axy->cpulimit, "CPU time limit (seconds)");
+    if (axy->cpulimit > 0) {
+        fits_header_add_double(hdr, "ANCLIM", axy->cpulimit,
+                               "Aggregate CPU time limit (seconds)");
+    }
+    if (axy->wall_limit > 0.0) {
+        fits_header_add_double(hdr, "ANTLIM", axy->wall_limit,
+                               "Elapsed solving-stage limit (seconds)");
+    }
+    if (axy->index_shard_workers_set) {
+        fits_header_add_int(hdr, "ANSHWRK", axy->index_shard_workers,
+                            "Parallel workers; 0 means automatic");
+    }
 
     if (axy->xcol)
         qfits_header_add(hdr, "ANXCOL", axy->xcol, "Name of column containing X coords", NULL);
@@ -1465,6 +1526,8 @@ static void delete_existing_an_headers(qfits_header* hdr) {
     char key[64];
     qfits_header_del(hdr, "ANRUN");
     qfits_header_del(hdr, "ANCLIM");
+    qfits_header_del(hdr, "ANTLIM");
+    qfits_header_del(hdr, "ANSHWRK");
     qfits_header_del(hdr, "ANXCOL");
     qfits_header_del(hdr, "ANYCOL");
     qfits_header_del(hdr, "ANTAGALL");
@@ -1602,4 +1665,3 @@ static int parse_fields_string(il* fields, const char* str) {
     }
     return 0;
 }
-

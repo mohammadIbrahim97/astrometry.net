@@ -35,6 +35,7 @@ typedef struct {
 
 quadfile_t* quadfile_open(const char* fname);
 quadfile_t* quadfile_open_fits(anqfits_t* fits);
+quadfile_t* quadfile_open_fits_metadata(anqfits_t* fits);
 
 char* quadfile_get_filename(const quadfile_t* qf);
 

@@ -19,4 +19,7 @@ double millis_between(struct timeval* tv1, struct timeval* tv2);
 // You probably only want to look at differences in the values returned by this function.
 double timenow();
 
+// Returns elapsed seconds from a monotonic clock suitable for deadlines.
+double monotonic_seconds();
+
 #endif

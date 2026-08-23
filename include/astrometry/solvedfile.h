@@ -35,6 +35,13 @@ il* solvedfile_getall_solved(char* fn, int firstfield, int lastfield, int maxfie
 int solvedfile_set(char* fn, int fieldnum);
 
 /*
+ * Atomically merge all 1-indexed fields into one solved marker file.  The
+ * existing bytes are preserved and the destination name changes only after
+ * the complete replacement has been written and synchronized.
+ */
+int solvedfile_set_list_atomic(char* fn, il* fields);
+
+/*
  Set an array of fields.  Note that the "vals" array is 0-indexed;
  vals[0] corresponds to field 1.
  This *only sets* elements, it does *not* reset (clear) values in

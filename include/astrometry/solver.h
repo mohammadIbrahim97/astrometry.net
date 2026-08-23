@@ -6,6 +6,8 @@
 #ifndef SOLVER_H
 #define SOLVER_H
 
+#include <stddef.h>
+
 #include <time.h>
 
 #include "astrometry/starutil.h"
@@ -20,6 +22,7 @@
 #include "astrometry/verify.h"
 #include "astrometry/sip.h"
 #include "astrometry/an-bool.h"
+#include "astrometry/fitsbin.h"
 
 enum {
     PARITY_NORMAL,
@@ -36,11 +39,33 @@ enum {
 #define DEFAULT_BAIL_THRESHOLD 1e-100
 
 struct verify_field_t;
+struct solver_field_geometry;
+typedef struct solver_field_geometry solver_field_geometry_t;
+
+/* Compact traversal evidence for correctness and helper-path tests. */
+typedef struct solver_profile {
+    anbool detailed;
+    anbool execution_failed;
+
+    unsigned long long codekd_calls;
+    unsigned long long codekd_hits;
+    unsigned long long resolve_calls;
+    unsigned long long verify_calls;
+    unsigned long long allocation_failures;
+    unsigned long long ab_helper_tasks;
+    unsigned long long candidate_delivery_windows;
+    unsigned long long hypothesis_order_hash;
+    unsigned long long kd_result_order_hash;
+    unsigned long long candidate_order_hash;
+
+    size_t max_parallel_ranges;
+} solver_profile_t;
+
 struct solver_t {
 
     // FIELDS REQUIRED FROM THE CALLER BEFORE CALLING SOLVER_RUN
     // =========================================================
-	
+
     // The set of indexes.  Caller must add with solver_add_index()
     pl* indexes;
 
@@ -113,7 +138,7 @@ struct solver_t {
     anbool use_radec;
     double centerxyz[3];
     double r2;
-	
+
     // During verification, if the log-odds ratio drops to this level, we bail out and
     // assume it's not a match.  Default log(1e-100).
     double logratio_bail_threshold;
@@ -162,7 +187,7 @@ struct solver_t {
     int num_meanx_skipped;
     // number of matches skipped due to RA,Dec bounds constraints.
     int num_radec_skipped;
-    // 
+    //
     int num_abscale_skipped;
     // The number of times we ran verification on a quad.
     int num_verified;
@@ -209,6 +234,17 @@ struct solver_t {
 
     // Cached data about this field, for verify_hit().
     verify_field_t* vf;
+
+    /*
+     * Optional immutable AB-pair geometry prepared once for an index-shard
+     * pass. Worker solvers borrow this object; the pass-owner solver releases
+     * it with the rest of the field state.
+     */
+    solver_field_geometry_t* field_geometry;
+    anbool field_geometry_owned;
+
+    /* Output from the most recent solver_run() invocation. */
+    solver_profile_t profile;
 };
 typedef struct solver_t solver_t;
 
@@ -379,7 +415,8 @@ index_t* solver_get_index(const solver_t* solver, int i);
 
 void solver_verify_sip_wcs(solver_t* solver, sip_t* sip); //, MatchObj* mo);
 
-void solver_run(solver_t* solver);
+/* Returns zero for a complete search and nonzero for an execution failure. */
+int solver_run(solver_t* solver);
 
 #define SOLVER_TWEAK2_AVAILABLE 1
 void solver_tweak2(solver_t* solver, MatchObj* mo, int order, sip_t* verifysip);
@@ -389,6 +426,7 @@ void solver_cleanup(solver_t* solver);
 // Call this before solver_inject_match(), solver_verify_sip_wcs() or solver_run().
 // (or it will get called automatically)
 void solver_preprocess_field(solver_t* sp);
+
 // Call this after solver_inject_match() or solver_run().
 // (or it will get called when you solver_free())
 void solver_free_field(solver_t* sp);

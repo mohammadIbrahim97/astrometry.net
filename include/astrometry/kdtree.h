@@ -7,7 +7,9 @@
 #define KDTREE_H
 
 #include <stdio.h>
+#include <stddef.h>
 #include <stdint.h>
+
 
 #define KDTREE_MAX_LEVELS 1000
 
@@ -17,6 +19,7 @@
 
 enum kd_rangesearch_options {
     KD_OPTIONS_COMPUTE_DISTS    = 0x1,
+    /* Materialize matching point coordinates in kdtree_qres_t.results. */
     KD_OPTIONS_RETURN_POINTS    = 0x2,
     KD_OPTIONS_SORT_DISTS       = 0x4,
     KD_OPTIONS_SMALL_RADIUS     = 0x8,
@@ -59,7 +62,7 @@ enum kd_build_options {
     KD_BUILD_LINEAR_LR     = 0x10,
     // DEBUG
     KD_BUILD_FORCE_SORT    = 0x20,
-    
+
 };
 
 typedef uint64_t u64;
@@ -185,7 +188,7 @@ struct kdtree {
     int32_t* lr;            /* Points owned by leaf nodes, stored and manipulated
                              in a way that's too complicated to explain in this comment.
                              (nbottom) */
-               
+
     u32* perm;           /* Permutation index / hairstyle from the 80s
                           (ndata) */
 
@@ -257,6 +260,7 @@ struct kdtree {
     char* name;
 
     void* io;
+    int io_is_fitsbin;
 
     struct kdtree_funcs fun;
 };
@@ -549,14 +553,14 @@ void kdtree_output_dot(FILE* fid, kdtree_t* kd);
 kdtree_t* KDFUNC(kdtree_build)
      (kdtree_t* kd, void *data, int N, int D, int Nleaf,
       int treetype, unsigned int options);
-     
+
 kdtree_t* KDFUNC(kdtree_build_2)
      (kdtree_t* kd, void *data, int N, int D, int Nleaf,
       int treetype, unsigned int options,
       double* minval, double* maxval);
 
 /* Range seach for a single point.
- 
+
  kdtree_rangesearch()
 
  kd: kd-tree object.
@@ -586,7 +590,9 @@ kdtree_qres_t* KDFUNC(kdtree_rangesearch_nosort)(const kdtree_t *kd, const void 
 
 /*
  Like kdtree_rangesearch, but you get to call the shots; see
- kd_rangesearch_options for what the "options" are.
+ kd_rangesearch_options for what the "options" are.  Point coordinates
+ are returned only when KD_OPTIONS_RETURN_POINTS is set; indices and any
+ requested squared distances remain available independently.
  */
 kdtree_qres_t* KDFUNC(kdtree_rangesearch_options)(const kdtree_t *kd, const void *pt, double maxd2, int options);
 
@@ -596,9 +602,9 @@ kdtree_qres_t* KDFUNC(kdtree_rangesearch_options)(const kdtree_t *kd, const void
  */
 kdtree_qres_t* KDFUNC(kdtree_rangesearch_options_reuse)(const kdtree_t *kd, kdtree_qres_t* res, const void *pt, double maxd2, int options);
 
+
 #if !defined(KD_DIM)
 #undef KD_DIM_GENERIC
 #endif
 
 #endif
-

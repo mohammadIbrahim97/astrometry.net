@@ -249,36 +249,115 @@ void* kdtree_get_data(const kdtree_t* kd, int i) {
     }
 }
 
-void kdtree_copy_data_double(const kdtree_t* kd, int start, int N, double* dest) {
+void kdtree_copy_data_double(const kdtree_t* kd, int start, int N,
+                             double* dest) {
     int i;
     int d, D;
+
     D = kd->ndim;
+
+    /*
+     * Specialized hot path for retrieving one three-dimensional point.
+     *
+     * startree_get() uses kdtree_copy_data_double() to retrieve individual
+     * XYZ unit-sphere positions.  The generic implementation below supports
+     * arbitrary point counts and dimensions, but the solver's resolve-match
+     * path repeatedly requests exactly one three-dimensional point.
+     *
+     * Preserve the original conversion semantics for every supported data
+     * representation:
+     *
+     *   DOUBLE -> bitwise copy through memcpy()
+     *   FLOAT  -> ordinary C conversion to double
+     *   U64    -> ordinary C conversion to double
+     *   U32    -> original POINT_INVSCALE() conversion
+     *   U16    -> original POINT_INVSCALE() conversion
+     *
+     * Unsupported data types fall through to the original generic switch,
+     * which preserves its existing error handling.
+     */
+    if (N == 1 && D == 3) {
+        const int base = start * 3;
+
+        switch (kdtree_datatype(kd)) {
+        case KDT_DATA_DOUBLE:
+            memcpy(dest,
+                   kd->data.d + base,
+                   3 * sizeof(double));
+            return;
+
+        case KDT_DATA_FLOAT:
+            dest[0] = kd->data.f[base];
+            dest[1] = kd->data.f[base + 1];
+            dest[2] = kd->data.f[base + 2];
+            return;
+
+        case KDT_DATA_U64:
+            dest[0] = kd->data.l[base];
+            dest[1] = kd->data.l[base + 1];
+            dest[2] = kd->data.l[base + 2];
+            return;
+
+        case KDT_DATA_U32:
+            dest[0] = POINT_INVSCALE(kd, 0, kd->data.u[base]);
+            dest[1] = POINT_INVSCALE(kd, 1, kd->data.u[base + 1]);
+            dest[2] = POINT_INVSCALE(kd, 2, kd->data.u[base + 2]);
+            return;
+
+        case KDT_DATA_U16:
+            dest[0] = POINT_INVSCALE(kd, 0, kd->data.s[base]);
+            dest[1] = POINT_INVSCALE(kd, 1, kd->data.s[base + 1]);
+            dest[2] = POINT_INVSCALE(kd, 2, kd->data.s[base + 2]);
+            return;
+
+        default:
+            break;
+        }
+    }
+
     switch (kdtree_datatype(kd)) {
     case KDT_DATA_DOUBLE:
-        memcpy(dest, kd->data.d + start*D,
+        memcpy(dest, kd->data.d + start * D,
                (size_t)N * (size_t)D * sizeof(double));
         break;
+
     case KDT_DATA_FLOAT:
-        for (i=0; i<(N * D); i++)
-            dest[i] = kd->data.f[start*D + i];
+        for (i = 0; i < (N * D); i++) {
+            dest[i] = kd->data.f[start * D + i];
+        }
         break;
+
     case KDT_DATA_U64:
-        for (i=0; i<(N*D); i++)
-            // ??
-            dest[i] = kd->data.l[start*D + i];
+        for (i = 0; i < (N * D); i++) {
+            dest[i] = kd->data.l[start * D + i];
+        }
         break;
+
     case KDT_DATA_U32:
-        for (i=0; i<N; i++)
-            for (d=0; d<D; d++)
-                dest[i*D + d] = POINT_INVSCALE(kd, d, kd->data.u[(start + i)*D + d]);
+        for (i = 0; i < N; i++) {
+            for (d = 0; d < D; d++) {
+                dest[i * D + d] =
+                    POINT_INVSCALE(kd,
+                                   d,
+                                   kd->data.u[(start + i) * D + d]);
+            }
+        }
         break;
+
     case KDT_DATA_U16:
-        for (i=0; i<N; i++)
-            for (d=0; d<D; d++)
-                dest[i*D + d] = POINT_INVSCALE(kd, d, kd->data.s[(start + i)*D + d]);
+        for (i = 0; i < N; i++) {
+            for (d = 0; d < D; d++) {
+                dest[i * D + d] =
+                    POINT_INVSCALE(kd,
+                                   d,
+                                   kd->data.s[(start + i) * D + d]);
+            }
+        }
         break;
+
     default:
-        ERROR("kdtree_copy_data_double: invalid data type %i", kdtree_datatype(kd));
+        ERROR("kdtree_copy_data_double: invalid data type %i",
+              kdtree_datatype(kd));
         return;
     }
 }

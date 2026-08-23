@@ -7,6 +7,7 @@
 #define FITSBIN_H
 
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include "astrometry/anqfits.h"
 #include "astrometry/bl.h"
@@ -79,6 +80,23 @@
  */
 
 struct fitsbin_t;
+// mmap access policy for solver index tables.
+typedef enum fitsbin_mmap_advice {
+    FITSBIN_MMAP_ADVICE_NORMAL = 0,
+    FITSBIN_MMAP_ADVICE_RANDOM = 1
+} fitsbin_mmap_advice_t;
+
+/*
+ * Region metadata distinguishes topology and payload for page planning and
+ * telemetry. Payload remains the default so zero-initialized third-party
+ * chunks preserve compatibility. Topology uses NORMAL; payload follows the
+ * file/pass policy.
+ */
+typedef enum fitsbin_mmap_region {
+    FITSBIN_MMAP_REGION_PAYLOAD = 0,
+    FITSBIN_MMAP_REGION_TOPOLOGY = 1
+} fitsbin_mmap_region_t;
+
 
 struct fitsbin_chunk_t {
     char* tablename;
@@ -116,6 +134,18 @@ struct fitsbin_chunk_t {
     char* map;
     // The mmap'ed size.
     size_t mapsize;
+
+    // Access-pattern class used when applying mmap advice.
+    fitsbin_mmap_region_t mmap_region;
+
+    /*
+     * Exact file interval occupied by the table payload.  Unlike map/mapsize,
+     * this excludes mmap alignment and FITS padding. The payload provider uses
+     * it to translate proven mapped addresses into bounded page intervals and
+     * test reads.
+     */
+    off_t data_file_offset;
+    size_t data_file_size;
 };
 typedef struct fitsbin_chunk_t fitsbin_chunk_t;
 
@@ -124,6 +154,7 @@ struct fitsbin_t {
     char* filename;
 
     anqfits_t* fits;
+    anbool owns_fits;
 
     bl* chunks;
 
@@ -147,6 +178,35 @@ struct fitsbin_t {
 
     // for use by callback_read_header().
     void* userdata;
+     // mmap policy applied to chunks read after opening this FITS file.
+    fitsbin_mmap_advice_t mmap_advice;
+
+    // Prevent repeated attempts after the kernel rejects an advice request.
+    anbool mmap_advice_failed;
+
+    // Cached system page size for bounded mmap prefetch requests.
+    size_t mmap_page_size;
+
+    // Enables bounded, caller-directed population of mapped payload pages.
+    anbool mmap_prefetch_enabled;
+    anbool mmap_prefetch_failed;
+
+    /*
+     * A separately opened buffered-I/O description for exact payload reads.
+     * It receives POSIX_FADV_RANDOM but never backs a compute mapping, so its
+     * file-description advice cannot change the mmap VMA policy.
+     */
+    int payload_fd;
+    anbool payload_fd_initialized;
+    anbool payload_fd_failed;
+
+    /*
+     * Immutable identity captured from the descriptor that backs read-time
+     * mappings. It remains valid after fitsbin_close_fd() so mapped data can
+     * be identified without reopening a pathname or touching a closed FILE*.
+     */
+    anbool open_file_stat_valid;
+    struct stat open_file_stat;
 };
 typedef struct fitsbin_t fitsbin_t;
 

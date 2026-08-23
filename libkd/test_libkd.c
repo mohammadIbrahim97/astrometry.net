@@ -258,6 +258,137 @@ void test_nlevels(CuTest* ct) {
     CuAssertIntEquals(ct, 10, kdtree_nnodes_to_nlevels(1023));
 }
 
+static void assert_query_indices_and_distances_equal(
+    CuTest* ct,
+    const kdtree_qres_t* expected,
+    const kdtree_qres_t* actual) {
+    unsigned int i;
+
+    CuAssertPtrNotNull(ct, expected);
+    CuAssertPtrNotNull(ct, actual);
+    CuAssertIntEquals(ct, (int)expected->nres, (int)actual->nres);
+
+    for (i = 0; i < expected->nres; i++) {
+        CuAssertIntEquals(
+            ct,
+            (int)expected->inds[i],
+            (int)actual->inds[i]);
+
+        CuAssert(
+            ct,
+            "range-search squared distance differs",
+            expected->sdists[i] == actual->sdists[i]);
+    }
+}
+
+void test_rangesearch_index_distance_only(CuTest* ct) {
+    const int N = 257;
+    const int D = 4;
+    const int Nleaf = 8;
+    const int base_options =
+        KD_OPTIONS_SMALL_RADIUS |
+        KD_OPTIONS_COMPUTE_DISTS |
+        KD_OPTIONS_SORT_DISTS |
+        KD_OPTIONS_USE_SPLIT;
+    double query[4] = {0.47, 0.51, 0.39, 0.62};
+    double* data;
+    kdtree_t* kd;
+    kdtree_qres_t* with_points;
+    kdtree_qres_t* without_points;
+    kdtree_qres_t* reuse;
+    kdtree_qres_t* defaults;
+    int i;
+    int d;
+
+    data = malloc((size_t)N * (size_t)D * sizeof(double));
+    CuAssertPtrNotNull(ct, data);
+
+    for (i = 0; i < N; i++) {
+        for (d = 0; d < D; d++) {
+            unsigned int value =
+                (unsigned int)(i * 37 + d * 53 + i * d * 11);
+
+            data[(size_t)i * (size_t)D + (size_t)d] =
+                (double)(value % 997U) / 996.0;
+        }
+    }
+
+    kd = kdtree_build(
+        NULL,
+        data,
+        N,
+        D,
+        Nleaf,
+        KDTT_DSS,
+        KD_BUILD_SPLIT | KD_BUILD_SPLITDIM);
+
+    CuAssertPtrNotNull(ct, kd);
+    free(data);
+
+    with_points = kdtree_rangesearch_options_reuse(
+        kd,
+        NULL,
+        query,
+        0.08,
+        base_options | KD_OPTIONS_RETURN_POINTS);
+
+    CuAssertPtrNotNull(ct, with_points);
+    CuAssertPtrNotNull(ct, with_points->results.any);
+    CuAssert(ct, "expected non-empty query result", with_points->nres > 0);
+
+    without_points = kdtree_rangesearch_options_reuse(
+        kd,
+        NULL,
+        query,
+        0.08,
+        base_options);
+
+    CuAssertPtrNotNull(ct, without_points);
+    CuAssert(
+        ct,
+        "point storage must remain absent when not requested",
+        without_points->results.any == NULL);
+    CuAssertPtrNotNull(ct, without_points->inds);
+    CuAssertPtrNotNull(ct, without_points->sdists);
+    assert_query_indices_and_distances_equal(
+        ct,
+        with_points,
+        without_points);
+
+    reuse = kdtree_rangesearch_options_reuse(
+        kd,
+        with_points,
+        query,
+        0.08,
+        base_options);
+
+    CuAssert(
+        ct,
+        "reuse query must preserve the result container",
+        reuse == with_points);
+    CuAssert(
+        ct,
+        "reuse query must release stale point storage",
+        reuse->results.any == NULL);
+    assert_query_indices_and_distances_equal(
+        ct,
+        without_points,
+        reuse);
+
+    defaults = kdtree_rangesearch(kd, query, 0.08);
+    CuAssertPtrNotNull(ct, defaults);
+    CuAssertPtrNotNull(ct, defaults->results.any);
+    assert_query_indices_and_distances_equal(
+        ct,
+        without_points,
+        defaults);
+
+    kdtree_free_query(defaults);
+    kdtree_free_query(reuse);
+    kdtree_free_query(without_points);
+    kdtree_free(kd);
+}
+
 static void run_test_nn(CuTest* tc, int treetype, int treeopts,
                         double eps) {
     int N = 1000;
@@ -535,4 +666,3 @@ void test_no_lr_with_ints(CuTest* tc) {
 
     errors_free();
 }
-

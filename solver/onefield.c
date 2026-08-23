@@ -12,50 +12,49 @@
 
 #include <sys/types.h>
 #include <sys/time.h>
-#include <sys/resource.h>
 #include <libgen.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <time.h>
 
-#include "os-features.h"
-#include "onefield.h"
-#include "tweak.h"
-#include "tweak2.h"
-#include "sip_qfits.h"
-#include "starutil.h"
-#include "mathutil.h"
-#include "quadfile.h"
-#include "solvedfile.h"
-#include "starkd.h"
-#include "codekd.h"
+#include "anqfits.h"
+#include "index_shard_config.h"
+#include "index_shard_internal.h"
+#include "bl-sort.h"
 #include "boilerplate.h"
+#include "codekd.h"
+#include "errors.h"
+#include "fitsbin.h"
 #include "fitsioutils.h"
-#include "verify.h"
 #include "index.h"
 #include "log.h"
-#include "tic.h"
-#include "anqfits.h"
-#include "errors.h"
-#include "scamp-catalog.h"
+#include "mathutil.h"
+#include "onefield.h"
+#include "solver_profile_internal.h"
+#include "onefield_internal.h"
+#include "os-features.h"
 #include "permutedsort.h"
-#include "bl-sort.h"
+#include "quadfile.h"
+#include "scamp-catalog.h"
+#include "sip_qfits.h"
+#include "solvedfile.h"
+#include "starkd.h"
+#include "starutil.h"
+#include "tic.h"
+#include "tweak.h"
+#include "tweak2.h"
+#include "verify.h"
 
-static anbool record_match_callback(MatchObj* mo, void* userdata);
-static time_t timer_callback(void* user_data);
 static void add_onefield_params(onefield_t* bp, qfits_header* hdr);
 static void load_and_parse_wcsfiles(onefield_t* bp);
 static void solve_fields(onefield_t* bp, sip_t* verify_wcs);
-static void remove_invalid_fields(il* fieldlist, int maxfield);
 static anbool is_field_solved(onefield_t* bp, int fieldnum);
 static int write_solutions(onefield_t* bp);
-static void solved_field(onefield_t* bp, int fieldnum);
-static int compare_matchobjs(const void* v1, const void* v2);
+static int publish_solved_fields(onefield_t* bp);
 static void remove_duplicate_solutions(onefield_t* bp);
-
 // A tag-along column for index rdls / correspondence file.
 struct tagalong {
     tfits_type type;
@@ -156,59 +155,28 @@ static anbool grab_field_tagalong_data(MatchObj* mo, xylist_t* xy, int N) {
 }
 
 
-/** Index handling for in_parallel and not.
-
- Currently it supposedly could handle both "indexnames" and "indexes",
- but we should probably just assert that only one of these can be used.
- **/
-static index_t* get_index(onefield_t* bp, size_t i) {
-    if (i < sl_size(bp->indexnames)) {
-        char* fn = sl_get(bp->indexnames, i);
-        index_t* ind = index_load(fn, bp->index_options, NULL);
-        if (!ind) {
-            ERROR("Failed to load index %s", fn);
-            exit( -1);
-        }
-        return ind;
-    }
-    i -= sl_size(bp->indexnames);
-    return pl_get(bp->indexes, i);
-}
-static char* get_index_name(onefield_t* bp, size_t i) {
-    index_t* index;
-    if (i < sl_size(bp->indexnames)) {
-        char* fn = sl_get(bp->indexnames, i);
-        return fn;
-    }
-    i -= sl_size(bp->indexnames);
-    index = pl_get(bp->indexes, i);
-    return index->indexname;
-}
-static void done_with_index(onefield_t* bp, size_t i, index_t* ind) {
-    if (i < sl_size(bp->indexnames)) {
-        index_close(ind);
-    }
-}
-static size_t n_indexes(onefield_t* bp) {
-    return sl_size(bp->indexnames) + pl_size(bp->indexes);
-}
-
-
-
 void onefield_clear_verify_wcses(onefield_t* bp) {
     bl_remove_all(bp->verify_wcs_list);
 }
 
 void onefield_clear_solutions(onefield_t* bp) {
     bl_remove_all(bp->solutions);
+    il_remove_all(bp->solved_fields_pending);
 }
 
 void onefield_clear_indexes(onefield_t* bp) {
+    int i;
+
+    for (i = 0; i < pl_size(bp->owned_indexes); i++) {
+        index_free(pl_get(bp->owned_indexes, i));
+    }
+    pl_remove_all(bp->owned_indexes);
     sl_remove_all(bp->indexnames);
     pl_remove_all(bp->indexes);
 }
 
 void onefield_set_field_file(onefield_t* bp, const char* fn) {
+    onefield_job_field_cache_invalidate(bp);
     free(bp->fieldfname);
     bp->fieldfname = strdup_safe(fn);
 }
@@ -259,6 +227,7 @@ void onefield_set_wcs_file(onefield_t* bp, const char* fn) {
 }
 
 void onefield_set_xcol(onefield_t* bp, const char* x) {
+    onefield_job_field_cache_invalidate(bp);
     free(bp->xcolname);
     if (!x)
         x = "X";
@@ -266,6 +235,7 @@ void onefield_set_xcol(onefield_t* bp, const char* x) {
 }
 
 void onefield_set_ycol(onefield_t* bp, const char* y) {
+    onefield_job_field_cache_invalidate(bp);
     free(bp->ycolname);
     if (!y)
         y = "Y";
@@ -280,83 +250,139 @@ void onefield_add_loaded_index(onefield_t* bp, index_t* ind) {
     pl_append(bp->indexes, ind);
 }
 
+void onefield_add_owned_index(onefield_t* bp, index_t* ind) {
+    pl_append(bp->indexes, ind);
+    pl_append(bp->owned_indexes, ind);
+}
+
 void onefield_add_verify_wcs(onefield_t* bp, sip_t* wcs) {
     bl_append(bp->verify_wcs_list, wcs);
 }
 
 void onefield_add_field(onefield_t* bp, int field) {
+    onefield_job_field_cache_invalidate(bp);
     il_insert_unique_ascending(bp->fieldlist, field);
 }
 
 void onefield_add_field_range(onefield_t* bp, int lo, int hi) {
     int i;
+    onefield_job_field_cache_invalidate(bp);
     for (i=lo; i<=hi; i++) {
         il_insert_unique_ascending(bp->fieldlist, i);
     }
 }
 
-static void check_time_limits(onefield_t* bp) {
-    if (bp->total_timelimit || bp->timelimit) {
-        double now = timenow();
-        if (bp->total_timelimit && (now - bp->time_total_start > bp->total_timelimit)) {
+anbool onefield_check_total_limits(onefield_t* bp) {
+    if (!bp) {
+        return TRUE;
+    }
+
+    if (bp->total_timelimit > 0.0 && !bp->hit_total_timelimit) {
+        double now = monotonic_seconds();
+        if (now >= 0.0 &&
+            now - bp->time_total_start >= bp->total_timelimit) {
             logmsg("Total wall-clock time limit reached!\n");
             bp->hit_total_timelimit = TRUE;
         }
-        if (bp->timelimit && (now - bp->time_start > bp->timelimit)) {
+    }
+
+    if (bp->total_cpulimit > 0.0 && !bp->hit_total_cpulimit) {
+        float now = get_cpu_usage();
+        if (now - bp->cpu_total_start >= bp->total_cpulimit) {
+            logmsg("Total CPU time limit reached!\n");
+            bp->hit_total_cpulimit = TRUE;
+        }
+    }
+
+    if (bp->hit_total_timelimit || bp->hit_total_cpulimit) {
+        bp->solver.quit_now = TRUE;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void check_time_limits(onefield_t* bp) {
+    onefield_check_total_limits(bp);
+
+    if (bp->timelimit > 0.0 && !bp->hit_timelimit) {
+        double now = monotonic_seconds();
+        if (now >= 0.0 && now - bp->time_start >= bp->timelimit) {
             logmsg("Wall-clock time limit reached!\n");
             bp->hit_timelimit = TRUE;
         }
     }
-    if (bp->total_cpulimit || bp->cpulimit) {
+
+    if (bp->cpulimit > 0.0 && !bp->hit_cpulimit) {
         float now = get_cpu_usage();
-        if ((bp->total_cpulimit > 0.0) &&
-            (now - bp->cpu_total_start > bp->total_cpulimit)) {
-            logmsg("Total CPU time limit reached!\n");
-            bp->hit_total_cpulimit = TRUE;
-        }
-        if ((bp->cpulimit > 0.0) &&
-            (now - bp->cpu_start > bp->cpulimit)) {
+        if (now - bp->cpu_start > bp->cpulimit) {
             logmsg("CPU time limit reached!\n");
             bp->hit_cpulimit = TRUE;
         }
     }
+
     if (bp->hit_total_timelimit ||
         bp->hit_total_cpulimit ||
         bp->hit_timelimit ||
-        bp->hit_cpulimit)
+        bp->hit_cpulimit) {
         bp->solver.quit_now = TRUE;
+    }
 }
-
 void onefield_run(onefield_t* bp) {
     solver_t* sp = &(bp->solver);
     size_t i, I;
-    size_t Nindexes;
+    size_t Nindexes = 0U;
+    size_t loaded_indexes = 0U;
+    const char* profile_mode = "serial";
+    anbool verification_datalog;
+    anbool job_field_prepared = FALSE;
+    anbool shard_candidate;
 
-    // Record current time for total wall-clock time limit.
-    bp->time_total_start = timenow();
-
-    // Record current CPU usage for total cpu-usage limit.
-    bp->cpu_total_start = get_cpu_usage();
+    /*
+     * engine_run_job() initializes total-job limits once. Direct onefield
+     * callers arrive with zeroed start values and initialize them here.
+     */
+    if (bp->time_total_start <= 0.0) {
+        bp->time_total_start = monotonic_seconds();
+    }
+    if (bp->cpu_total_start <= 0.0) {
+        bp->cpu_total_start = get_cpu_usage();
+    }
+    if (onefield_check_total_limits(bp)) {
+        goto cleanup;
+    }
 
     // Parse WCS files submitted for verification.
     load_and_parse_wcsfiles(bp);
 
-    // Read .xyls file...
-    logverb("Reading fields file %s...", bp->fieldfname);
-    bp->xyls = xylist_open(bp->fieldfname);
-    if (!bp->xyls) {
-        ERROR("Failed to read xylist.\n");
-        exit( -1);
+    /*
+     * A single-field cached job validates field existence inside the stable
+     * identity acquisition. Opening here would create an unguarded metadata
+     * epoch before that acquisition and could remove a field based on a
+     * pathname that is replaced immediately afterward. Multi-field and
+     * uncached jobs retain the original up-front enumeration.
+     */
+    if (bp->job_field_cache &&
+        il_size(bp->fieldlist) == 1) {
+        if (onefield_internal_validate_single_field_list(bp)) {
+            bp->solver_failed = TRUE;
+            goto cleanup;
+        }
+    } else {
+        if (onefield_internal_open_master_xyls(bp)) {
+            bp->solver_failed = TRUE;
+            goto cleanup;
+        }
+        onefield_internal_remove_invalid_fields(
+            bp->fieldlist,
+            xylist_n_fields(bp->xyls));
     }
-    xylist_set_xname(bp->xyls, bp->xcolname);
-    xylist_set_yname(bp->xyls, bp->ycolname);
-    xylist_set_include_flux(bp->xyls, FALSE);
-    xylist_set_include_background(bp->xyls, FALSE);
-    logverb("found %u fields.\n", xylist_n_fields(bp->xyls));
 
-    remove_invalid_fields(bp->fieldlist, xylist_n_fields(bp->xyls));
-
-    Nindexes = n_indexes(bp);
+    Nindexes = onefield_internal_index_count(bp);
+    verification_datalog = verify_datalog_enabled();
+    if (onefield_check_total_limits(bp)) {
+        goto cleanup;
+    }
 
     // Verify any WCS estimates we have.
     if (bl_size(bp->verify_wcs_list)) {
@@ -399,9 +425,13 @@ void onefield_run(onefield_t* bp) {
                    arcsec2arcmin(quadlo), arcsec2arcmin(quadhi));
 
             for (I=0; I<Nindexes; I++) {
-                index_t* index = get_index(bp, I);
+                index_t* index = onefield_internal_get_index(bp, I);
+                if (!index) {
+                    bp->solver_failed = TRUE;
+                    break;
+                }
                 if (!index_overlaps_scale_range(index, quadlo, quadhi)) {
-                    done_with_index(bp, I, index);
+                    onefield_internal_done_with_index(bp, I, index);
                     continue;
                 }
                 solver_add_index(sp, index);
@@ -410,12 +440,24 @@ void onefield_run(onefield_t* bp) {
                 // Do it!
                 solve_fields(bp, wcs);
                 // Clean up this index...
-                done_with_index(bp, I, index);
+                onefield_internal_done_with_index(bp, I, index);
                 solver_clear_indexes(sp);
+
+                if (bp->solver_failed) {
+                    break;
+                }
+            }
+
+            if (bp->solver_failed) {
+                break;
             }
         }
 
         bp->logratio_tosolve = oldodds;
+
+        if (bp->solver_failed) {
+            goto cleanup;
+        }
 
         logmsg("Got %zu solutions.\n", bl_size(bp->solutions));
 
@@ -425,34 +467,221 @@ void onefield_run(onefield_t* bp) {
         for (i=0; i<bl_size(bp->solutions); i++) {
             MatchObj* mo = bl_access(bp->solutions, i);
             if (mo->logodds >= bp->logratio_tosolve)
-                solved_field(bp, mo->fieldnum);
+                onefield_internal_solved_field(bp, mo->fieldnum);
         }
     }
 
     if (bp->single_field_solved)
         goto cleanup;
 
+    /*
+     * A nonzero lower bound reconstructs the same field prefix for every
+     * selected index. Prepare that immutable geometry once whenever there is
+     * cross-index reuse, independent of whether this run uses one worker or
+     * the pthread pool. Scheduler topology only determines who borrows it.
+     */
+    if (sp->startobj > 0 &&
+        Nindexes > 1U &&
+        il_size(bp->fieldlist) == 1) {
+      int prepare_status =
+          onefield_index_shard_prepare_job_field_for_run(bp);
+
+      if (prepare_status < 0) {
+        bp->solver_failed = TRUE;
+        goto cleanup;
+      }
+      job_field_prepared = (prepare_status == 0);
+      if (onefield_check_total_limits(bp)) {
+        goto cleanup;
+      }
+    }
+
+    /*
+     * The outer reducer currently commits the first valid field and stops the
+     * pass. That is exact for the production single-field, first-solution
+     * workload, but not for multi-extension XYLS input where other fields
+     * must continue or for nsolves > 1 when hits can span indexes. Keep those
+     * runs on the native serial path until the reducer tracks the missing
+     * completion state authoritatively.
+     */
+    shard_candidate =
+        index_shard_pthread_enabled(bp) &&
+        index_shard_pool_active(bp) &&
+        Nindexes > 0 &&
+        pl_size(bp->indexes) == 0 &&
+        il_size(bp->fieldlist) == 1 &&
+        bp->nsolves <= 1 &&
+        sp->maxquads == 0 &&
+        sp->maxmatches == 0 &&
+        !bp->rdls_tagalong &&
+        !bp->rdls_tagalong_all &&
+        !verification_datalog;
+    if (shard_candidate && !job_field_prepared) {
+      int prepare_status =
+          onefield_index_shard_prepare_job_field_for_run(bp);
+
+      if (prepare_status < 0) {
+        bp->solver_failed = TRUE;
+        goto cleanup;
+      }
+      if (prepare_status > 0) {
+        logmsg("[index-shard] pthread path unavailable without "
+               "a stable shared-field identity; using original "
+               "serial path\n");
+        profile_mode = "serial-unavailable-field-identity";
+        shard_candidate = FALSE;
+      } else {
+        job_field_prepared = TRUE;
+      }
+    }
+    if (shard_candidate) {
+      index_shard_solve_status_t shard_status;
+      if (onefield_check_total_limits(bp)) {
+        goto cleanup;
+      }
+
+      profile_mode = "pthread-data-ready";
+      shard_status =
+          onefield_index_shard_solve(
+              bp,
+              sp,
+              Nindexes);
+
+      switch (shard_status) {
+      case INDEX_SHARD_SOLVE_HANDLED:
+        goto cleanup;
+
+      case INDEX_SHARD_SOLVE_UNAVAILABLE:
+        logmsg("[index-shard] pthread path unavailable; using original "
+               "serial path\n");
+        profile_mode = "serial-unavailable";
+        break;
+
+      case INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE:
+        logmsg("[index-shard] pthread solve failed before master commit; "
+               "using original serial path\n");
+        profile_mode = "serial-precommit-retry";
+        break;
+
+      case INDEX_SHARD_SOLVE_TERMINAL_FAILURE:
+        logerr("[index-shard] pthread solve hit a global-integrity or "
+               "post-commit failure; serial fallback suppressed\n");
+        bp->solver_failed = TRUE;
+        goto cleanup;
+
+      case INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT:
+        logerr("[index-shard] pthread lifecycle conflict; "
+               "serial fallback suppressed\n");
+        bp->solver_failed = TRUE;
+        goto cleanup;
+
+      default:
+        logerr("[index-shard] unexpected solve status %i; "
+               "serial fallback suppressed\n",
+               (int)shard_status);
+        bp->solver_failed = TRUE;
+        goto cleanup;
+      }
+    }
+
+    if (index_shard_pthread_enabled(bp) &&
+        pl_size(bp->indexes) != 0) {
+        logverb("[index-shard] loaded multiindex component uses exact "
+                "serial path\n");
+        profile_mode = "serial-loaded-index";
+    }
+
+    if (index_shard_pthread_enabled(bp) &&
+        index_shard_pool_active(bp) &&
+        il_size(bp->fieldlist) != 1) {
+        logverb("[index-shard] multi-field input uses exact serial path "
+                "until field-aware reduction is available\n");
+        profile_mode = "serial-multi-field";
+    }
+
+    if (index_shard_pthread_enabled(bp) &&
+        index_shard_pool_active(bp) &&
+        il_size(bp->fieldlist) == 1 &&
+        bp->nsolves > 1) {
+        logverb("[index-shard] nsolves=%i uses exact serial path until "
+                "cross-index solve counting is available\n",
+                bp->nsolves);
+        profile_mode = "serial-nsolves";
+    }
+
+    if (index_shard_pthread_enabled(bp) &&
+        index_shard_pool_active(bp) &&
+        il_size(bp->fieldlist) == 1 &&
+        bp->nsolves <= 1 &&
+        (sp->maxquads != 0 || sp->maxmatches != 0)) {
+        logverb("[index-shard] maxquads=%i maxmatches=%i use exact serial "
+                "path until process-wide hypothesis limits are available\n",
+                sp->maxquads,
+                sp->maxmatches);
+        profile_mode = "serial-hypothesis-limits";
+    }
+
+    if (index_shard_pthread_enabled(bp) &&
+        index_shard_pool_active(bp) &&
+        il_size(bp->fieldlist) == 1 &&
+        bp->nsolves <= 1 &&
+        sp->maxquads == 0 &&
+        sp->maxmatches == 0 &&
+        (bp->rdls_tagalong || bp->rdls_tagalong_all)) {
+        logverb("[index-shard] RDLS tag-along columns use the exact serial "
+                "path until their list is worker-private\n");
+        profile_mode = "serial-rdls-tagalong";
+    }
+
+    if (index_shard_pthread_enabled(bp) &&
+        index_shard_pool_active(bp) &&
+        verification_datalog) {
+        logverb("[index-shard] process-global verification datalog uses "
+                "the exact serial path\n");
+        profile_mode = "serial-verification-datalog";
+    }
+
     // Start solving...
     if (bp->indexes_inparallel) {
 
         // Add all the indexes...
+        loaded_indexes = 0U;
         for (I=0; I<Nindexes; I++) {
-            index_t* index = get_index(bp, I);
+            index_t* index = onefield_internal_get_index(bp, I);
+
+            if (!index) {
+                bp->solver_failed = TRUE;
+                break;
+            }
             solver_add_index(sp, index);
+            loaded_indexes++;
         }
 
         // Record current CPU usage.
         bp->cpu_start = get_cpu_usage();
         // Record current wall-clock time.
-        bp->time_start = time(NULL);
+        bp->time_start = monotonic_seconds();
 
         // Do it!
-        solve_fields(bp, NULL);
+        if (!bp->solver_failed) {
+            solve_fields(bp, NULL);
+        }
+
+        if (bp->solver_failed || sp->profile.execution_failed) {
+            bp->solver_failed = TRUE;
+        }
 
         // Clean up the indices...
-        for (I=0; I<Nindexes; I++) {
-            index_t* index = get_index(bp, I);
-            done_with_index(bp, I, index);
+        for (I=0; I<loaded_indexes; I++) {
+            index_t* index = solver_get_index(sp, I);
+
+            /*
+             * Release the exact handle acquired above.  Re-entering
+             * onefield_internal_get_index() here would open a second copy when indexnames owns
+             * the admission list, leaking the mappings actually used by the
+             * grouped solver.
+             */
+            onefield_internal_done_with_index(bp, I, index);
         }
         solver_clear_indexes(sp);
 
@@ -461,38 +690,104 @@ void onefield_run(onefield_t* bp) {
         for (I=0; I<Nindexes; I++) {
             index_t* index;
 
-            if (bp->hit_total_timelimit || bp->hit_total_cpulimit)
+            /*
+             * The serial path creates a fresh solver_run() for every index.
+             * Poll the process-wide limits here so short per-index runs cannot
+             * indefinitely postpone the native deadline callback.
+             */
+            if (onefield_check_total_limits(bp)) {
                 break;
-            if (bp->single_field_solved)
+            }
+            if (bp->single_field_solved) {
                 break;
-            if (bp->cancelled)
+            }
+            if (bp->cancelled) {
                 break;
+            }
 
             // Load the index...
-            index = get_index(bp, I);
+            index = onefield_internal_get_index(bp, I);
+            if (!index) {
+                bp->solver_failed = TRUE;
+                break;
+            }
+
+            /*
+             * Index loading can fault substantial mapped data. If the native
+             * deadline expired during acquisition, release the index without
+             * entering the scalar solver.
+             */
+            if (onefield_check_total_limits(bp)) {
+                onefield_internal_done_with_index(bp, I, index);
+                break;
+            }
+
             solver_add_index(sp, index);
             logverb("Trying index %s...\n", index->indexname);
 
             // Record current CPU usage.
             bp->cpu_start = get_cpu_usage();
             // Record current wall-clock time.
-            bp->time_start = time(NULL);
+            bp->time_start = monotonic_seconds();
 
             // Do it!
             solve_fields(bp, NULL);
 
+            if (bp->solver_failed || sp->profile.execution_failed) {
+                bp->solver_failed = TRUE;
+                logerr("Solver execution failed while trying index %s\n",
+                       index->indexname ? index->indexname : "(null)");
+            }
+
+            /*
+             * Persist any total-limit decision across the next solver reset.
+             * This check runs once per completed index, not in CodeKD.
+             */
+            onefield_check_total_limits(bp);
+
             // Clean up this index...
-            done_with_index(bp, I, index);
+            onefield_internal_done_with_index(bp, I, index);
             solver_clear_indexes(sp);
+
+            if (bp->solver_failed) {
+                break;
+            }
+
+            if (bp->hit_total_timelimit || bp->hit_total_cpulimit) {
+                break;
+            }
         }
     }
 
  cleanup:
     // Clean up.
-    xylist_close(bp->xyls);
+    if (!onefield_internal_field_cache_valid(bp) ||
+        il_size(bp->fieldlist) != 1) {
+        if (bp->xyls) {
+            xylist_close(bp->xyls);
+            bp->xyls = NULL;
+        }
+    }
 
-    if (write_solutions(bp))
-        exit(-1);
+    if (bp->solver_failed) {
+        logerr("Suppressing solution output after solver execution failure\n");
+    } else {
+        if (write_solutions(bp)) {
+            bp->solver_failed = TRUE;
+            logerr("Solution output failed; reporting job error without "
+                   "publishing solved markers\n");
+        } else if (publish_solved_fields(bp)) {
+            bp->solver_failed = TRUE;
+            logerr("Solution output completed, but solved-marker publication "
+                   "failed\n");
+        }
+    }
+
+    logverb("[onefield] mode=%s candidates=%zu failed=%i cancelled=%i\n",
+            profile_mode,
+            Nindexes,
+            bp->solver_failed ? 1 : 0,
+            bp->cancelled ? 1 : 0);
 
     for (i=0; i<bl_size(bp->solutions); i++) {
         MatchObj* mo = bl_access(bp->solutions, i);
@@ -508,8 +803,10 @@ void onefield_init(onefield_t* bp) {
 
     bp->fieldlist = il_new(256);
     bp->solutions = bl_new(16, sizeof(MatchObj));
+    bp->solved_fields_pending = il_new(4);
     bp->indexnames = sl_new(16);
     bp->indexes = pl_new(16);
+    bp->owned_indexes = pl_new(4);
     bp->verify_wcs_list = bl_new(1, sizeof(sip_t));
     bp->verify_wcsfiles = sl_new(1);
     bp->fieldid_key = strdup("FIELDID");
@@ -518,6 +815,7 @@ void onefield_init(onefield_t* bp) {
     bp->quad_size_fraction_lo = DEFAULT_QSF_LO;
     bp->quad_size_fraction_hi = DEFAULT_QSF_HI;
     bp->nsolves = 1;
+    bp->index_shard_workers = 1;
 
     bp->xyls_tagalong_all = TRUE;
     // don't set sp-> here because solver_set_default_values()
@@ -529,7 +827,7 @@ int onefield_parameters_are_okay(onefield_t* bp, solver_t* sp) {
         logerr("You must set a \"distractors\" proportion.\n");
         return 0;
     }
-    if (!(sl_size(bp->indexnames) || (bp->indexes_inparallel && pl_size(bp->indexes)))) {
+    if (!(sl_size(bp->indexnames) || pl_size(bp->indexes))) {
         logerr("You must specify one or more indexes.\n");
         return 0;
     }
@@ -556,21 +854,37 @@ int onefield_parameters_are_okay(onefield_t* bp, solver_t* sp) {
 }
 
 int onefield_is_run_obsolete(onefield_t* bp, solver_t* sp) {
-    // If we're just solving one field, check to see if it's already
-    // solved before doing a bunch of work and spewing tons of output.
-    if ((il_size(bp->fieldlist) == 1) && bp->solved_in) {
-        if (is_field_solved(bp, il_get(bp->fieldlist, 0)))
-            return 1;
-    }
-    // Early check to see if this job was cancelled.
-    if (bp->cancelfname) {
-        if (file_exists(bp->cancelfname)) {
-            logerr("Run cancelled.\n");
-            return 1;
-        }
-    }
+  (void)sp;
 
-    return 0;
+  if (bp->single_field_solved) {
+    return 1;
+  }
+
+  if (bp->cancelled) {
+    return 1;
+  }
+
+  if (bp->hit_total_cpulimit || bp->hit_total_timelimit) {
+    return 1;
+  }
+  // If we're just solving one field, check to see if it's already
+  // solved before doing a bunch of work and spewing tons of output.
+  if ((il_size(bp->fieldlist) == 1) && bp->solved_in) {
+    if (is_field_solved(bp, il_get(bp->fieldlist, 0))) {
+      bp->single_field_solved = TRUE;
+      return 1;
+    }
+  }
+  // Early check to see if this job was cancelled.
+  if (bp->cancelfname) {
+    if (file_exists(bp->cancelfname)) {
+      bp->cancelled = TRUE;
+      logerr("Run cancelled.\n");
+      return 1;
+    }
+  }
+
+  return 0;
 }
 
 static void load_and_parse_wcsfiles(onefield_t* bp) {
@@ -594,9 +908,9 @@ void onefield_log_run_parameters(onefield_t* bp) {
 
     logverb("solver run parameters:\n");
     logverb("indexes:\n");
-    N = n_indexes(bp);
+    N = onefield_internal_index_count(bp);
     for (i=0; i<N; i++)
-        logverb("  %s\n", get_index_name(bp, i));
+        logverb("  %s\n", onefield_internal_get_index_name(bp, i));
     if (bp->fieldfname)
         logverb("fieldfname %s\n", bp->fieldfname);
     logverb("fields ");
@@ -633,17 +947,26 @@ void onefield_log_run_parameters(onefield_t* bp) {
         logverb("ycolname %s\n", bp->ycolname);
     logverb("maxquads %i\n", sp->maxquads);
     logverb("maxmatches %i\n", sp->maxmatches);
+    logverb("p_workers %i\n", bp->index_shard_workers);
     logverb("cpulimit %f\n", bp->cpulimit);
-    logverb("timelimit %i\n", bp->timelimit);
+    logverb("timelimit %g\n", bp->timelimit);
     logverb("total_timelimit %g\n", bp->total_timelimit);
     logverb("total_cpulimit %f\n", bp->total_cpulimit);
 }
 
 void onefield_cleanup(onefield_t* bp) {
+    onefield_job_field_cache_end(bp);
+    if (bp->xyls) {
+        xylist_close(bp->xyls);
+        bp->xyls = NULL;
+    }
+    onefield_clear_indexes(bp);
     il_free(bp->fieldlist);
+    il_free(bp->solved_fields_pending);
     bl_free(bp->solutions);
     sl_free2(bp->indexnames);
     pl_free(bp->indexes);
+    pl_free(bp->owned_indexes);
     sl_free2(bp->verify_wcsfiles);
     bl_free(bp->verify_wcs_list);
     sl_free2(bp->rdls_tagalong);
@@ -711,8 +1034,10 @@ static int sort_rdls(MatchObj* mymo, onefield_t* bp) {
     return 0;
 }
 
-static anbool record_match_callback(MatchObj* mo, void* userdata) {
+anbool onefield_internal_record_match_callback(MatchObj* mo, void* userdata) {
     onefield_t* bp = userdata;
+    // shard poll
+    index_shard_poll_from_callback(bp);
     solver_t* sp = &(bp->solver);
     MatchObj* mymo;
     int ind;
@@ -720,7 +1045,7 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
     check_time_limits(bp);
 
     // Copy "mo" to "mymo".
-    ind = bl_insert_sorted(bp->solutions, mo, compare_matchobjs);
+    ind = bl_insert_sorted(bp->solutions, mo, onefield_internal_compare_matchobjs);
     mymo = bl_access(bp->solutions, ind);
 
     // steal these arrays from "mo" (prevent them from being free()'d
@@ -782,25 +1107,29 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
         logmsg("Found a quad that solves the image; that makes %i of %i required.\n",
                bp->nsolves_sofar, bp->nsolves);
     } else {
-        if (bp->solver.index) {
-            char* base = basename_safe(bp->solver.index->indexname);
-            logmsg("Field %i: solved with index %s.\n", mymo->fieldnum, base);
-            free(base);
-        } else {
-            logmsg("Field %i: solved with index %i", mymo->fieldnum, mymo->indexid);
-            if (mymo->healpix >= 0)
-                logmsg(", healpix %i\n", mymo->healpix);
-            else
-                logmsg("\n");
+        if (!index_shard_worker_context_active()) {
+            if (bp->solver.index) {
+                char* base = basename_safe(bp->solver.index->indexname);
+                logmsg("Field %i: solved with index %s.\n", mymo->fieldnum, base);
+                free(base);
+            } else {
+                logmsg("Field %i: solved with index %i", mymo->fieldnum, mymo->indexid);
+                if (mymo->healpix >= 0) {
+                    logmsg(", healpix %i\n", mymo->healpix);
+                } else {
+                    logmsg("\n");
+                }
+            }
         }
         return TRUE;
     }
     return FALSE;
 }
 
-static time_t timer_callback(void* user_data) {
+time_t onefield_internal_timer_callback(void* user_data) {
     onefield_t* bp = user_data;
-
+    // shard poll
+    index_shard_poll_from_callback(bp);
     check_time_limits(bp);
 
     // check if the field has already been solved...
@@ -830,9 +1159,9 @@ static void add_onefield_params(onefield_t* bp, qfits_header* hdr) {
         fits_add_long_comment(hdr, "Circle: %s", sp->index->circle ? "yes" : "no");
         fits_add_long_comment(hdr, "Cxdx margin: %g", sp->cxdx_margin);
     }
-    Nindexes = n_indexes(bp);
+    Nindexes = onefield_internal_index_count(bp);
     for (i = 0; i < Nindexes; i++)
-        fits_add_long_comment(hdr, "Index(%i): %s", i, get_index_name(bp, i)?get_index_name(bp, i):"(null)");
+        fits_add_long_comment(hdr, "Index(%i): %s", i, onefield_internal_get_index_name(bp, i)?onefield_internal_get_index_name(bp, i):"(null)");
 
     fits_add_long_comment(hdr, "Field name: %s", bp->fieldfname?bp->fieldfname:"(null)");
     fits_add_long_comment(hdr, "Field scale lower: %g arcsec/pixel", sp->funits_lower);
@@ -841,10 +1170,12 @@ static void add_onefield_params(onefield_t* bp, qfits_header* hdr) {
     fits_add_long_comment(hdr, "Y col name: %s", bp->ycolname?bp->ycolname:"(null)");
     fits_add_long_comment(hdr, "Start obj: %i", sp->startobj);
     fits_add_long_comment(hdr, "End obj: %i", sp->endobj);
-	
+
     // 'Solved_in' is often a NULL pointer.
-    // If %s is a NULL pointer, vasprintf() causes a segmentation fault (due to strlen()) on Solaris -> added treatment of this case for portability. 
-    // GNU/Linux implementation of vasprintf() catches NULL pointer and prints "(null)" in header. Seems to be an issue on Solaris only.
+    // If %s is a NULL pointer, vasprintf() causes a segmentation fault (due to
+    // strlen()) on Solaris -> added treatment of this case for portability.
+    // GNU/Linux implementation of vasprintf() catches NULL pointer and prints
+    // "(null)" in header. Seems to be an issue on Solaris only.
     fits_add_long_comment(hdr, "Solved_in: %s", bp->solved_in?bp->solved_in:"(null)");
     fits_add_long_comment(hdr, "Solved_out: %s", bp->solved_out?bp->solved_out:"(null)");
 
@@ -855,7 +1186,7 @@ static void add_onefield_params(onefield_t* bp, qfits_header* hdr) {
     fits_add_long_comment(hdr, "Maxquads: %i", sp->maxquads);
     fits_add_long_comment(hdr, "Maxmatches: %i", sp->maxmatches);
     fits_add_long_comment(hdr, "Cpu limit: %f s", bp->cpulimit);
-    fits_add_long_comment(hdr, "Time limit: %i s", bp->timelimit);
+    fits_add_long_comment(hdr, "Time limit: %g s", bp->timelimit);
     fits_add_long_comment(hdr, "Total time limit: %g s", bp->total_timelimit);
     fits_add_long_comment(hdr, "Total CPU limit: %f s", bp->total_cpulimit);
 
@@ -868,7 +1199,7 @@ static void add_onefield_params(onefield_t* bp, qfits_header* hdr) {
     fits_add_long_comment(hdr, "--");
 }
 
-static void remove_invalid_fields(il* fieldlist, int maxfield) {
+void onefield_internal_remove_invalid_fields(il* fieldlist, int maxfield) {
     int i;
     for (i=0; i<il_size(fieldlist); i++) {
         int fieldnum = il_get(fieldlist, i);
@@ -887,10 +1218,14 @@ static void remove_invalid_fields(il* fieldlist, int maxfield) {
 
 static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
     solver_t* sp = &(bp->solver);
+    solver_profile_t profile_total;
     double last_utime, last_stime;
     double utime, stime;
     struct timeval wtime, last_wtime;
     int fi;
+
+    memset(&profile_total, 0, sizeof(profile_total));
+    memset(&sp->profile, 0, sizeof(sp->profile));
 
     get_resource_stats(&last_utime, &last_stime, NULL);
     gettimeofday(&last_wtime, NULL);
@@ -902,46 +1237,53 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
 
         fieldnum = il_get(bp->fieldlist, fi);
 
+        if (onefield_check_total_limits(bp)) {
+            break;
+        }
+
         memset(&template, 0, sizeof(MatchObj));
         template.fieldnum = fieldnum;
         template.fieldfile = bp->fieldid;
 
-        // Get the FIELDID string from the xyls FITS header.
-        if (xylist_open_field(bp->xyls, fieldnum)) {
-            logerr("Failed to open extension %i in xylist.\n", fieldnum);
+        // Has the field already been solved?
+        if (is_field_solved(bp, fieldnum)) {
             goto cleanup;
         }
+
+        if (onefield_internal_prepare_field_view(bp, fieldnum)) {
+            bp->solver_failed = TRUE;
+            profile_total.execution_failed = TRUE;
+            goto cleanup;
+        }
+        if (onefield_check_total_limits(bp)) {
+            goto cleanup;
+        }
+
+        /*
+         * Read metadata from the same currently prepared XYLS epoch. Cache
+         * invalidation may close and reopen the handle, so header access must
+         * follow field preparation rather than precede it.
+         */
         fieldhdr = xylist_get_header(bp->xyls);
         if (fieldhdr) {
-            char* idstr = fits_get_dupstring(fieldhdr, bp->fieldid_key);
-            if (idstr)
-                strncpy(template.fieldname, idstr, sizeof(template.fieldname) - 1);
+            char* idstr =
+                fits_get_dupstring(fieldhdr, bp->fieldid_key);
+            if (idstr) {
+                strncpy(
+                    template.fieldname,
+                    idstr,
+                    sizeof(template.fieldname) - 1);
+            }
             free(idstr);
         }
 
-        // Has the field already been solved?
-        if (is_field_solved(bp, fieldnum))
-            goto cleanup;
-
-        // Get the field.
-        solver_set_field(sp, xylist_read_field(bp->xyls, NULL));
-        if (!sp->fieldxy_orig) {
-            logerr("Failed to read xylist field.\n");
-            goto cleanup;
-        }
-
-        solver_reset_counters(sp);
-        solver_reset_best_match(sp);
-
         sp->mo_template = &template;
-        sp->record_match_callback = record_match_callback;
-        sp->timer_callback = timer_callback;
+        sp->record_match_callback = onefield_internal_record_match_callback;
+        sp->timer_callback = onefield_internal_timer_callback;
         sp->userdata = bp;
 
         bp->fieldnum = fieldnum;
         bp->nsolves_sofar = 0;
-
-        solver_preprocess_field(sp);
 
         if (verify_wcs) {
             //MatchObj mo;
@@ -955,7 +1297,18 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
             solver_log_params(sp);
 
             // The real thing
-            solver_run(sp);
+            if (solver_run(sp)) {
+                bp->solver_failed = TRUE;
+            }
+
+            solver_profile_accumulate(&profile_total, &sp->profile);
+
+            if (bp->solver_failed || sp->profile.execution_failed) {
+                bp->solver_failed = TRUE;
+                logerr("Solver execution failed for field %i\n",
+                       fieldnum);
+                goto cleanup;
+            }
 
             logverb("Field %i: tried %i quads, matched %i codes.\n",
                     fieldnum, sp->numtries, sp->nummatches);
@@ -972,23 +1325,24 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
 
 
         if (sp->best_match_solves) {
-            solved_field(bp, fieldnum);
+            onefield_internal_solved_field(bp, fieldnum);
         } else if (!verify_wcs) {
             // Field unsolved.
-            logerr("Field %i did not solve", fieldnum);
             if (bp->solver.index && bp->solver.index->indexname) {
                 char* copy;
                 char* base;
-                copy = strdup(bp->solver.index->indexname);
-                base = strdup(basename(copy));
+                copy = strdup_safe(bp->solver.index->indexname);
+                base = basename(copy);
+                if (bp->solver.endobj) {
+                    logerr("Field %i did not solve (index %s, field objects %i-%i).\n",
+                           fieldnum, base, bp->solver.startobj+1, bp->solver.endobj);
+                } else {
+                    logerr("Field %i did not solve (index %s).\n", fieldnum, base);
+                }
                 free(copy);
-                logerr(" (index %s", base);
-                free(base);
-                if (bp->solver.endobj)
-                    logerr(", field objects %i-%i", bp->solver.startobj+1, bp->solver.endobj);
-                logerr(")");
+            } else {
+                logerr("Field %i did not solve.\n", fieldnum);
             }
-            logerr(".\n");
             if (sp->have_best_match) {
                 logverb("Best match encountered: ");
                 matchobj_print(&(sp->best_match), log_get_level());
@@ -996,8 +1350,6 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
                 logverb("Best odds encountered: %g\n", exp(sp->best_logodds));
             }
         }
-
-        solver_free_field(sp);
 
         get_resource_stats(&utime, &stime, NULL);
         gettimeofday(&wtime, NULL);
@@ -1011,12 +1363,35 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
         last_wtime = wtime;
 
     cleanup:
-        solver_cleanup_field(sp);
+        sp->mo_template = NULL;
+        sp->record_match_callback = NULL;
+        sp->timer_callback = NULL;
+        sp->userdata = NULL;
+        if (onefield_internal_field_cache_has_field(bp, fieldnum) &&
+            il_size(bp->fieldlist) == 1 &&
+            sp->fieldxy_orig && sp->fieldxy && sp->vf) {
+            onefield_internal_reset_field_pass_state(bp);
+        } else {
+            solver_cleanup_field(sp);
+        }
+
+        if (bp->solver_failed) {
+            break;
+        }
     }
+
+    sp->profile = profile_total;
 }
 
 static anbool is_field_solved(onefield_t* bp, int fieldnum) {
     anbool solved = FALSE;
+
+    if (bp->solved_fields_pending &&
+        il_sorted_contains(bp->solved_fields_pending, fieldnum)) {
+        logverb("Field %i has already been solved in this run.\n", fieldnum);
+        return TRUE;
+    }
+
     if (bp->solved_in) {
         solved = solvedfile_get(bp->solved_in, fieldnum);
         logverb("Checking %s file %i to see if the field is solved: %s.\n",
@@ -1030,17 +1405,44 @@ static anbool is_field_solved(onefield_t* bp, int fieldnum) {
     return FALSE;
 }
 
-static void solved_field(onefield_t* bp, int fieldnum) {
-    // Record in solved file, or send to solved server.
-    if (bp->solved_out) {
-        logmsg("Field %i solved: writing to file %s to indicate this.\n", fieldnum, bp->solved_out);
-        if (solvedfile_set(bp->solved_out, fieldnum)) {
-            logerr("Failed to write solvedfile %s.\n", bp->solved_out);
-        }
+void onefield_internal_solved_field(onefield_t* bp, int fieldnum) {
+    bp->any_field_solved = TRUE;
+    if (bp->solved_fields_pending) {
+        il_insert_unique_ascending(bp->solved_fields_pending, fieldnum);
     }
+
     // If we're just solving a single field, and we solved it...
     if (il_size(bp->fieldlist) == 1)
         bp->single_field_solved = TRUE;
+}
+
+/*
+ * Publish external solved markers only after the complete solve pass has
+ * quiesced and final solution output succeeded. First-valid selection stops
+ * workers before the reducer commits in-memory solved state, and neither event
+ * may leave a marker that makes a failed output retry skip the input.
+ */
+static int publish_solved_fields(onefield_t* bp) {
+    int i;
+
+    if (!bp || !bp->solved_out || !bp->solved_fields_pending) {
+        return 0;
+    }
+
+    for (i = 0; i < il_size(bp->solved_fields_pending); i++) {
+        int fieldnum = il_get(bp->solved_fields_pending, i);
+
+        logmsg("Field %i solved: writing to file %s to indicate this.\n",
+               fieldnum,
+               bp->solved_out);
+    }
+    if (solvedfile_set_list_atomic(
+            bp->solved_out, bp->solved_fields_pending)) {
+        logerr("Failed to atomically publish solvedfile %s.\n",
+               bp->solved_out);
+        return -1;
+    }
+    return 0;
 }
 
 void onefield_matchobj_deep_copy(const MatchObj* mo, MatchObj* dest) {
@@ -1129,7 +1531,7 @@ void onefield_free_matchobj(MatchObj* mo) {
 static void remove_duplicate_solutions(onefield_t* bp) {
     int i, j;
     // The solutions can fall out of order because tweak2() updates their logodds.
-    bl_sort(bp->solutions, compare_matchobjs);
+    bl_sort(bp->solutions, onefield_internal_compare_matchobjs);
 
     for (i=0; i<bl_size(bp->solutions); i++) {
         MatchObj* mo = bl_access(bp->solutions, i);
@@ -1150,6 +1552,8 @@ static void remove_duplicate_solutions(onefield_t* bp) {
 
 static int write_match_file(onefield_t* bp) {
     int i;
+    int rtn = 0;
+
     bp->mf = matchfile_open_for_writing(bp->matchfname);
     if (!bp->mf) {
         logerr("Failed to open file %s to write match file.\n", bp->matchfname);
@@ -1160,27 +1564,36 @@ static int write_match_file(onefield_t* bp) {
     add_onefield_params(bp, bp->mf->header);
     if (matchfile_write_headers(bp->mf)) {
         logerr("Failed to write matchfile header.\n");
-        return -1;
+        rtn = -1;
+        goto cleanup;
     }
     for (i=0; i<bl_size(bp->solutions); i++) {
         MatchObj* mo = bl_access(bp->solutions, i);
         if (matchfile_write_match(bp->mf, mo)) {
             logerr("Field %i: error writing a match.\n", mo->fieldnum);
-            return -1;
+            rtn = -1;
+            goto cleanup;
         }
     }
-    if (matchfile_fix_headers(bp->mf) ||
-        matchfile_close(bp->mf)) {
+    if (matchfile_fix_headers(bp->mf)) {
+        logerr("Error fixing matchfile headers.\n");
+        rtn = -1;
+    }
+
+ cleanup:
+    if (matchfile_close(bp->mf)) {
         logerr("Error closing matchfile.\n");
-        return -1;
+        rtn = -1;
     }
     bp->mf = NULL;
-    return 0;
+    return rtn;
 }
 
 static int write_rdls_file(onefield_t* bp) {
     int i;
+    int rtn = 0;
     qfits_header* h;
+
     bp->indexrdls = rdlist_open_for_writing(bp->indexrdlsfname);
     if (!bp->indexrdls) {
         logerr("Failed to open index RDLS file %s for writing.\n",
@@ -1195,7 +1608,8 @@ static int write_rdls_file(onefield_t* bp) {
     add_onefield_params(bp, h);
     if (rdlist_write_primary_header(bp->indexrdls)) {
         logerr("Failed to write index RDLS header.\n");
-        return -1;
+        rtn = -1;
+        goto cleanup;
     }
 
     for (i=0; i<bl_size(bp->solutions); i++) {
@@ -1215,14 +1629,17 @@ static int write_rdls_file(onefield_t* bp) {
         }
         if (rdlist_write_header(bp->indexrdls)) {
             logerr("Failed to write index RDLS field header.\n");
-            return -1;
+            rtn = -1;
+            goto cleanup;
         }
         assert(mo->refradec);
 
         rd_from_array(&rd, mo->refradec, mo->nindex);
         if (rdlist_write_field(bp->indexrdls, &rd)) {
             logerr("Failed to write index RDLS entry.\n");
-            return -1;
+            rd_free_data(&rd);
+            rtn = -1;
+            goto cleanup;
         }
         rd_free_data(&rd);
 
@@ -1233,34 +1650,43 @@ static int write_rdls_file(onefield_t* bp) {
                 if (rdlist_write_tagalong_column(bp->indexrdls, tag->colnum,
                                                  0, mo->nindex, tag->data, tag->itemsize)) {
                     ERROR("Failed to write tag-along data column %s", tag->name);
-                    return -1;
+                    rtn = -1;
+                    goto cleanup;
                 }
             }
         }
 
         if (rdlist_fix_header(bp->indexrdls)) {
             logerr("Failed to fix index RDLS field header.\n");
-            return -1;
+            rtn = -1;
+            goto cleanup;
         }
         rdlist_next_field(bp->indexrdls);
     }
 
-    if (rdlist_fix_primary_header(bp->indexrdls) ||
-        rdlist_close(bp->indexrdls)) {
+    if (rdlist_fix_primary_header(bp->indexrdls)) {
+        logerr("Failed to fix index RDLS primary header.\n");
+        rtn = -1;
+    }
+
+ cleanup:
+    if (rdlist_close(bp->indexrdls)) {
         logerr("Failed to close index RDLS file.\n");
-        return -1;
+        rtn = -1;
     }
     bp->indexrdls = NULL;
-    return 0;
+    return rtn;
 }
 
 static int write_wcs_file(onefield_t* bp) {
     int i;
+
     for (i=0; i<bl_size(bp->solutions); i++) {
         char wcs_fn[1024];
-        FILE* fout;
-        qfits_header* hdr;
+        FILE* fout = NULL;
+        qfits_header* hdr = NULL;
         char* tm;
+        int rtn = 0;
 
         MatchObj* mo = bl_access(bp->solutions, i);
         snprintf(wcs_fn, sizeof(wcs_fn), bp->wcs_template, mo->fieldnum);
@@ -1275,6 +1701,11 @@ static int write_wcs_file(onefield_t* bp) {
             hdr = sip_create_header(mo->sip);
         else
             hdr = tan_create_header(&(mo->wcstan));
+        if (!hdr) {
+            logerr("Failed to allocate WCS header for %s.\n", wcs_fn);
+            rtn = -1;
+            goto file_cleanup;
+        }
 
         BOILERPLATE_ADD_FITS_HEADERS(hdr);
         qfits_header_add(hdr, "HISTORY", "This is a WCS header was created by Astrometry.net.", NULL, NULL);
@@ -1306,27 +1737,48 @@ static int write_wcs_file(onefield_t* bp) {
 
         if (strlen(mo->fieldname))
             qfits_header_add(hdr, bp->fieldid_key, mo->fieldname, "Field name (copied from input field)", NULL);
-			
+
         if (qfits_header_dump(hdr, fout)) {
             logerr("Failed to write FITS WCS header.\n");
+            rtn = -1;
+            goto file_cleanup;
+        }
+        if (fits_pad_file(fout)) {
+            logerr("Failed to pad FITS WCS file %s.\n", wcs_fn);
+            rtn = -1;
+        }
+
+    file_cleanup:
+        if (hdr) {
+            qfits_header_destroy(hdr);
+        }
+        if (fclose(fout)) {
+            logerr("Failed to close FITS WCS file %s: %s\n",
+                   wcs_fn,
+                   strerror(errno));
+            rtn = -1;
+        }
+        if (rtn) {
             return -1;
         }
-        fits_pad_file(fout);
-        qfits_header_destroy(hdr);
-        fclose(fout);
     }
     return 0;
 }
 
 static int write_scamp_file(onefield_t* bp) {
     int i;
-    scamp_cat_t* scamp;
+    int rtn = 0;
+    scamp_cat_t* scamp = NULL;
     qfits_header* hdr = NULL;
     MatchObj* mo;
     tan_t fakewcs;
 
     // HACK -- just hdr = NULL?
     hdr = qfits_header_default();
+    if (!hdr) {
+        logerr("Failed to allocate SCAMP reference header.\n");
+        return -1;
+    }
     fits_header_add_int(hdr, "BITPIX", 0, NULL);
     fits_header_add_int(hdr, "NAXIS", 2, NULL);
     fits_header_add_int(hdr, "NAXIS1", 0, NULL);
@@ -1338,11 +1790,13 @@ static int write_scamp_file(onefield_t* bp) {
     scamp = scamp_catalog_open_for_writing(bp->scamp_fname, TRUE);
     if (!scamp) {
         logerr("Failed to open SCAMP reference catalog for writing.\n");
+        qfits_header_destroy(hdr);
         return -1;
     }
     if (scamp_catalog_write_field_header(scamp, hdr)) {
         logerr("Failed to write SCAMP headers.\n");
-        return -1;
+        rtn = -1;
+        goto cleanup;
     }
     mo = bl_access(bp->solutions, 0);
     for (i=0; i<mo->nindex; i++) {
@@ -1356,19 +1810,25 @@ static int write_scamp_file(onefield_t* bp) {
 
         if (scamp_catalog_write_reference(scamp, &ref)) {
             logerr("Failed to write SCAMP object.\n");
-            return -1;
+            rtn = -1;
+            goto cleanup;
         }
     }
+
+ cleanup:
+    qfits_header_destroy(hdr);
     if (scamp_catalog_close(scamp)) {
         logerr("Failed to close SCAMP reference catalog.\n");
-        return -1;
+        rtn = -1;
     }
-    return 0;
+    return rtn;
 }
 
 static int write_corr_file(onefield_t* bp) {
     int i;
+    int rtn = 0;
     fitstable_t* tab;
+
     tab = fitstable_open_for_writing(bp->corr_fname);
     if (!tab) {
         ERROR("Failed to open correspondences file \"%s\" for writing", bp->corr_fname);
@@ -1378,7 +1838,8 @@ static int write_corr_file(onefield_t* bp) {
 
     if (fitstable_write_primary_header(tab)) {
         ERROR("Failed to write primary header for corr file \"%s\"", bp->corr_fname);
-        return -1;
+        rtn = -1;
+        goto cleanup;
     }
 
     for (i=0; i<bl_size(bp->solutions); i++) {
@@ -1409,7 +1870,7 @@ static int write_corr_file(onefield_t* bp) {
         fitstable_add_write_column(tab, itype, "index_id", "none");
         fitstable_add_write_column(tab, itype, "field_id", "none");
         fitstable_add_write_column(tab, dubl, "match_weight", "none");
-		
+
         if (mo->tagalong) {
             for (j=0; j<bl_size(mo->tagalong); j++) {
                 tagalong_t* tag = bl_access(mo->tagalong, j);
@@ -1430,7 +1891,8 @@ static int write_corr_file(onefield_t* bp) {
 
         if (fitstable_write_header(tab)) {
             ERROR("Failed to write correspondence file header.");
-            return -1;
+            rtn = -1;
+            goto cleanup;
         }
 
         {
@@ -1462,7 +1924,8 @@ static int write_corr_file(onefield_t* bp) {
             weight = verify_logodds_to_weight(mo->matchodds[j]);
             if (fitstable_write_row(tab, &fx, &fy, &fra, &fdec, &rx, &ry, &rra, &rdec, &ri, &ti, &weight)) {
                 ERROR("Failed to write coordinates to correspondences file \"%s\"", bp->corr_fname);
-                return -1;
+                rtn = -1;
+                goto cleanup;
             }
         }
 
@@ -1476,8 +1939,14 @@ static int write_corr_file(onefield_t* bp) {
                     int ri = mo->theta[k];
                     if (ri < 0)
                         continue;
-                    fitstable_write_one_column(tab, tag->colnum, row, 1,
-                                               (char*)tag->data + ri*tag->itemsize, 0);
+                    if (fitstable_write_one_column(
+                            tab, tag->colnum, row, 1,
+                            (char*)tag->data + ri*tag->itemsize, 0)) {
+                        ERROR("Failed to write correspondence tag-along column %s",
+                              tag->name);
+                        rtn = -1;
+                        goto cleanup;
+                    }
                     row++;
                 }
             }
@@ -1491,28 +1960,36 @@ static int write_corr_file(onefield_t* bp) {
                 for (k=0; k<mo->nfield; k++) {
                     if (mo->theta[k] < 0)
                         continue;
-                    fitstable_write_one_column(tab, tag->colnum, row, 1,
-                                               (char*)tag->data + k*tag->itemsize, 0);
+                    if (fitstable_write_one_column(
+                            tab, tag->colnum, row, 1,
+                            (char*)tag->data + k*tag->itemsize, 0)) {
+                        ERROR("Failed to write field tag-along column %s",
+                              tag->name);
+                        rtn = -1;
+                        goto cleanup;
+                    }
                     row++;
                 }
             }
         }
-		
+
         if (fitstable_fix_header(tab)) {
             ERROR("Failed to fix correspondence file header.");
-            return -1;
+            rtn = -1;
+            goto cleanup;
         }
 
         fitstable_next_extension(tab);
         fitstable_clear_table(tab);
     }
 
+ cleanup:
     if (fitstable_close(tab)) {
         ERROR("Failed to close correspondence file");
-        return -1;
+        rtn = -1;
     }
 
-    return 0;
+    return rtn;
 }
 
 static int write_solutions(onefield_t* bp) {
@@ -1523,7 +2000,7 @@ static int write_solutions(onefield_t* bp) {
         return 0;
 
     // The solutions can fall out of order because tweak2() updates their logodds.
-    bl_sort(bp->solutions, compare_matchobjs);
+    bl_sort(bp->solutions, onefield_internal_compare_matchobjs);
 
     if (bp->matchfname) {
         if (write_match_file(bp))
@@ -1552,7 +2029,7 @@ static int write_solutions(onefield_t* bp) {
     return 0;
 }
 
-static int compare_matchobjs(const void* v1, const void* v2) {
+int onefield_internal_compare_matchobjs(const void* v1, const void* v2) {
     int diff;
     float fdiff;
     const MatchObj* mo1 = v1;
