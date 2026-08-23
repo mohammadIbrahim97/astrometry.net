@@ -33,6 +33,7 @@
 #include "log.h"
 #include "mathutil.h"
 #include "onefield.h"
+#include "solver_profile_internal.h"
 #include "onefield_internal.h"
 #include "os-features.h"
 #include "permutedsort.h"
@@ -331,12 +332,6 @@ void onefield_run(onefield_t* bp) {
     solver_t* sp = &(bp->solver);
     size_t i, I;
     size_t Nindexes = 0U;
-    size_t profile_indexes_executed = 0;
-    double profile_wall_start = monotonic_seconds();
-    double profile_acquire_seconds = 0.0;
-    double profile_solver_seconds = 0.0;
-    double profile_release_seconds = 0.0;
-    double profile_output_seconds = 0.0;
     const char* profile_mode = "serial";
     anbool verification_datalog;
     anbool job_field_prepared = FALSE;
@@ -430,10 +425,7 @@ void onefield_run(onefield_t* bp) {
             for (I=0; I<Nindexes; I++) {
                 index_t* index = onefield_internal_get_index(bp, I);
                 if (!index_overlaps_scale_range(index, quadlo, quadhi)) {
-                    if (onefield_internal_done_with_index(bp, I, index)) {
-                        bp->solver_failed = TRUE;
-                        break;
-                    }
+                    onefield_internal_done_with_index(bp, I, index);
                     continue;
                 }
                 solver_add_index(sp, index);
@@ -442,9 +434,7 @@ void onefield_run(onefield_t* bp) {
                 // Do it!
                 solve_fields(bp, wcs);
                 // Clean up this index...
-                if (onefield_internal_done_with_index(bp, I, index)) {
-                    bp->solver_failed = TRUE;
-                }
+                onefield_internal_done_with_index(bp, I, index);
                 solver_clear_indexes(sp);
 
                 if (bp->solver_failed) {
@@ -500,13 +490,12 @@ void onefield_run(onefield_t* bp) {
       }
     }
 
-    // SECTION INDEX-SHARD: onefield-entry
     /*
      * The outer reducer currently commits the first valid field and stops the
      * pass. That is exact for the production single-field, first-solution
      * workload, but not for multi-extension XYLS input where other fields
      * must continue or for nsolves > 1 when hits can span indexes. Keep those
-     * runs on the legacy serial path until the reducer tracks the missing
+     * runs on the native serial path until the reducer tracks the missing
      * completion state authoritatively.
      */
     shard_candidate =
@@ -540,7 +529,6 @@ void onefield_run(onefield_t* bp) {
     }
     if (shard_candidate) {
       index_shard_solve_status_t shard_status;
-      double shard_wall_start = monotonic_seconds();
       if (onefield_check_total_limits(bp)) {
         goto cleanup;
       }
@@ -551,9 +539,6 @@ void onefield_run(onefield_t* bp) {
               bp,
               sp,
               Nindexes);
-      profile_solver_seconds +=
-          monotonic_seconds() - shard_wall_start;
-      onefield_internal_job_index_cache_flush(bp);
 
       switch (shard_status) {
       case INDEX_SHARD_SOLVE_HANDLED:
@@ -654,11 +639,8 @@ void onefield_run(onefield_t* bp) {
 
         // Add all the indexes...
         for (I=0; I<Nindexes; I++) {
-            double phase_wall_start = monotonic_seconds();
             index_t* index = onefield_internal_get_index(bp, I);
 
-            profile_acquire_seconds +=
-                monotonic_seconds() - phase_wall_start;
             solver_add_index(sp, index);
         }
 
@@ -668,15 +650,7 @@ void onefield_run(onefield_t* bp) {
         bp->time_start = monotonic_seconds();
 
         // Do it!
-        {
-            double phase_wall_start = monotonic_seconds();
-
-            solve_fields(bp, NULL);
-            profile_solver_seconds +=
-                monotonic_seconds() - phase_wall_start;
-        }
-
-        profile_indexes_executed = Nindexes;
+        solve_fields(bp, NULL);
 
         if (bp->solver_failed || sp->profile.execution_failed) {
             bp->solver_failed = TRUE;
@@ -684,7 +658,6 @@ void onefield_run(onefield_t* bp) {
 
         // Clean up the indices...
         for (I=0; I<Nindexes; I++) {
-            double phase_wall_start = monotonic_seconds();
             index_t* index = solver_get_index(sp, I);
 
             /*
@@ -693,11 +666,7 @@ void onefield_run(onefield_t* bp) {
              * the admission list, leaking the mappings actually used by the
              * grouped solver.
              */
-            if (onefield_internal_done_with_index(bp, I, index)) {
-                bp->solver_failed = TRUE;
-            }
-            profile_release_seconds +=
-                monotonic_seconds() - phase_wall_start;
+            onefield_internal_done_with_index(bp, I, index);
         }
         solver_clear_indexes(sp);
 
@@ -722,13 +691,7 @@ void onefield_run(onefield_t* bp) {
             }
 
             // Load the index...
-            {
-                double phase_wall_start = monotonic_seconds();
-
-                index = onefield_internal_get_index(bp, I);
-                profile_acquire_seconds +=
-                    monotonic_seconds() - phase_wall_start;
-            }
+            index = onefield_internal_get_index(bp, I);
 
             /*
              * Index loading can fault substantial mapped data. If the native
@@ -736,9 +699,7 @@ void onefield_run(onefield_t* bp) {
              * entering the scalar solver.
              */
             if (onefield_check_total_limits(bp)) {
-                if (onefield_internal_done_with_index(bp, I, index)) {
-                    bp->solver_failed = TRUE;
-                }
+                onefield_internal_done_with_index(bp, I, index);
                 break;
             }
 
@@ -751,15 +712,7 @@ void onefield_run(onefield_t* bp) {
             bp->time_start = monotonic_seconds();
 
             // Do it!
-            {
-                double phase_wall_start = monotonic_seconds();
-
-                solve_fields(bp, NULL);
-                profile_solver_seconds +=
-                    monotonic_seconds() - phase_wall_start;
-            }
-
-            profile_indexes_executed++;
+            solve_fields(bp, NULL);
 
             if (bp->solver_failed || sp->profile.execution_failed) {
                 bp->solver_failed = TRUE;
@@ -774,15 +727,7 @@ void onefield_run(onefield_t* bp) {
             onefield_check_total_limits(bp);
 
             // Clean up this index...
-            {
-                double phase_wall_start = monotonic_seconds();
-
-                if (onefield_internal_done_with_index(bp, I, index)) {
-                    bp->solver_failed = TRUE;
-                }
-                profile_release_seconds +=
-                    monotonic_seconds() - phase_wall_start;
-            }
+            onefield_internal_done_with_index(bp, I, index);
             solver_clear_indexes(sp);
 
             if (bp->solver_failed) {
@@ -808,8 +753,6 @@ void onefield_run(onefield_t* bp) {
     if (bp->solver_failed) {
         logerr("Suppressing solution output after solver execution failure\n");
     } else {
-        double phase_wall_start = monotonic_seconds();
-
         if (write_solutions(bp)) {
             exit(-1);
         }
@@ -819,22 +762,11 @@ void onefield_run(onefield_t* bp) {
             logerr("Solution output completed, but solved-marker publication "
                    "failed\n");
         }
-
-        profile_output_seconds =
-            monotonic_seconds() - phase_wall_start;
     }
 
-    logverb("[onefield-profile] mode=%s candidates=%zu serial_executed=%zu "
-            "acquire=%.6f solver=%.6f release=%.6f output=%.6f "
-            "total=%.6f failed=%i cancelled=%i\n",
+    logverb("[onefield] mode=%s candidates=%zu failed=%i cancelled=%i\n",
             profile_mode,
             Nindexes,
-            profile_indexes_executed,
-            profile_acquire_seconds,
-            profile_solver_seconds,
-            profile_release_seconds,
-            profile_output_seconds,
-            monotonic_seconds() - profile_wall_start,
             bp->solver_failed ? 1 : 0,
             bp->cancelled ? 1 : 0);
 
@@ -1275,9 +1207,6 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
         int fieldnum;
         MatchObj template ;
         qfits_header* fieldhdr = NULL;
-        double field_wall_start = monotonic_seconds();
-        double field_read_seconds = 0.0;
-        double preprocess_seconds = 0.0;
 
         fieldnum = il_get(bp->fieldlist, fi);
 
@@ -1294,11 +1223,7 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
             goto cleanup;
         }
 
-        if (onefield_internal_prepare_field_view(
-                bp,
-                fieldnum,
-                &field_read_seconds,
-                &preprocess_seconds)) {
+        if (onefield_internal_prepare_field_view(bp, fieldnum)) {
             bp->solver_failed = TRUE;
             profile_total.execution_failed = TRUE;
             goto cleanup;
@@ -1350,16 +1275,6 @@ static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
             }
 
             solver_profile_accumulate(&profile_total, &sp->profile);
-
-            logverb("[onefield-field-profile] field=%i read=%.6f "
-                    "preprocess=%.6f solver_run=%.6f total=%.6f "
-                    "failed=%i\n",
-                    fieldnum,
-                    field_read_seconds,
-                    preprocess_seconds,
-                    sp->profile.solver_run_wall_seconds,
-                    monotonic_seconds() - field_wall_start,
-                    sp->profile.execution_failed ? 1 : 0);
 
             if (bp->solver_failed || sp->profile.execution_failed) {
                 bp->solver_failed = TRUE;

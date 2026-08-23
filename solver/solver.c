@@ -41,6 +41,7 @@
 #include "solver_inline_internal.h"
 #include "solver_hypothesis_internal.h"
 #include "solver_profile_internal.h"
+#include "verify_prepared_internal.h"
 kdtree_qres_t* solver_codekd_rangesearch(
     const kdtree_t* tree,
     kdtree_qres_t* result,
@@ -382,6 +383,17 @@ void solver_print_to(const solver_t* sp, FILE* stream) {
  */
 
 static void find_field_boundaries(solver_t* solver);
+static int solver_handle_hit(
+    solver_t* solver,
+    MatchObj* mo,
+    sip_t* verifysip,
+    anbool fake_match);
+static int solver_handle_hit_after_verify(
+    solver_t* solver,
+    MatchObj* mo,
+    sip_t* verifysip,
+    anbool fake_match,
+    double match_distance_in_pixels2);
 
 static void field_getxy(
     const solver_t* sp,
@@ -392,7 +404,7 @@ static void field_getxy(
     *y = starxy_gety(sp->fieldxy, index);
 }
 
-void set_matchobj_template(solver_t* solver, MatchObj* mo) {
+static void set_matchobj_template(solver_t* solver, MatchObj* mo) {
     if (solver->mo_template)
         memcpy(mo, solver->mo_template, sizeof(MatchObj));
     else
@@ -440,8 +452,11 @@ void solver_clear_radec(solver_t* s) {
     s->use_radec = FALSE;
 }
 
-void set_center_and_radius(solver_t* solver, MatchObj* mo,
-                           tan_t* tan, sip_t* sip) {
+static void set_center_and_radius(
+    solver_t* solver,
+    MatchObj* mo,
+    tan_t* tan,
+    sip_t* sip) {
     double cx, cy, lx, ly;
     double xyz[3];
     get_field_center(solver, &cx, &cy);
@@ -467,14 +482,6 @@ static void set_diag(solver_t* s) {
 
 void solver_set_field(solver_t* s, starxy_t* field) {
     solver_free_field(s);
-
-    /*
-     * Reset the compatibility policy counters at the field boundary.
-     * Shard workers apply RANDOM only to sparse payload chunks; compact
-     * topology and serial solving retain original NORMAL mappings.
-     */
-    fitsbin_mmap_advice_state_reset(
-        &s->index_mmap_policy);
 
     s->fieldxy_orig = field;
 
@@ -634,8 +641,8 @@ void solver_execute_prepared_hypothesis_owner(
     int dimquad,
     solver_t* solver,
     anbool current_parity,
+    const solver_codekd_phase_context_t* phase,
     kdtree_qres_t* result,
-    double search_wall_seconds,
     solver_candidate_delivery_record_t* prepared,
     size_t prepared_quad_count,
     size_t prepared_star_count);
@@ -646,21 +653,7 @@ void solver_retire_codekd_failure_owner(
     int dimquad,
     solver_t* solver,
     anbool current_parity,
-    int search_errno,
-    double search_wall_seconds);
-
-static void resolve_matches_with_delivery(
-    kdtree_qres_t* krez,
-    const double* field,
-    const int* fstars,
-    int dimquads,
-    int quads_tried,
-    solver_t* solver,
-    anbool current_parity,
-    solver_candidate_delivery_record_t* prepared,
-    size_t prepared_first,
-    size_t prepared_quad_count,
-    size_t prepared_star_count);
+    int search_errno);
 
 void resolve_matches_native_range(
     kdtree_qres_t* krez,
@@ -672,6 +665,7 @@ void resolve_matches_native_range(
     anbool current_parity,
     int candidate_first,
     int candidate_end,
+    const solver_codekd_phase_context_t* phase,
     solver_candidate_delivery_record_t* prepared,
     size_t prepared_first,
     size_t prepared_quad_count,
@@ -689,6 +683,7 @@ static int solver_handle_scored_query_hit(
     MatchObj* mo,
     sip_t* sip,
     anbool fake_match,
+    const solver_codekd_phase_context_t* phase,
     solver_candidate_delivery_record_t* record);
 
 static void check_scale(pquad* pq, solver_t* s) {
@@ -986,10 +981,10 @@ static int solver_ab_descriptor_execute_phase(
     int dimquads,
     double min_ab2,
     double max_ab2,
-    kdtree_qres_t** query_result,
-    solver_ab_phase_mode_t* mode_out) {
+    kdtree_qres_t** query_result) {
     solver_ab_descriptor_workspace_t* workspace;
     solver_ab_descriptor_planner_t* planner;
+    solver_codekd_phase_context_t phase_context;
     solver_codekd_packet_wave_t* wave = NULL;
     kdtree_t* code_tree;
     fitsbin_t* delivery_source;
@@ -998,19 +993,14 @@ static int solver_ab_descriptor_execute_phase(
     unsigned long long total_combinations = 0U;
     unsigned long long combination_cursor = 0U;
     unsigned long long reduced = 0U;
-    unsigned long long parallel_reduced = 0U;
     size_t staged_capacity;
     size_t compute_width;
     size_t participants;
     size_t expansion;
     size_t max_task_combinations;
-    anbool assisted = FALSE;
     anbool packet_cleanup_failed = FALSE;
     int result = 0;
 
-    if (mode_out) {
-        *mode_out = SOLVER_AB_MODE_NATIVE;
-    }
     if (!solver || !field_geometry || !query_result ||
         !solver->index || !solver->index->codekd ||
         !solver->index->codekd->tree ||
@@ -1026,7 +1016,6 @@ static int solver_ab_descriptor_execute_phase(
     }
     delivery_source = (fitsbin_t*)code_tree->io;
     if (fitsbin_payload_io_service_width() <= 0 ||
-        fitsbin_payload_is_fully_resident(delivery_source) ||
         fitsbin_get_mmap_advice(delivery_source) !=
             FITSBIN_MMAP_ADVICE_RANDOM) {
         return 0;
@@ -1091,6 +1080,60 @@ static int solver_ab_descriptor_execute_phase(
         return 0;
     }
 
+    memset(&phase_context, 0, sizeof(phase_context));
+    phase_context.descriptor.field_geometry = field_geometry;
+    phase_context.descriptor.pairs = pairs;
+    phase_context.descriptor.pair_count = pair_count;
+    phase_context.descriptor.phase = phase;
+    phase_context.descriptor.newpoint = newpoint;
+    phase_context.descriptor.dimquads = dimquads;
+    phase_context.descriptor.parity = solver->parity;
+    phase_context.descriptor.cx_less_than_dx =
+        solver->index->cx_less_than_dx;
+    phase_context.descriptor.meanx_less_than_half =
+        solver->index->meanx_less_than_half;
+    phase_context.descriptor.cxdx_margin = solver->cxdx_margin;
+    phase_context.tree = code_tree;
+    phase_context.quads = solver->index->quads;
+    phase_context.starkd = solver->index->starkd;
+    phase_context.use_radec = solver->use_radec;
+    phase_context.field_minx = solver->field_minx;
+    phase_context.field_maxx = solver->field_maxx;
+    phase_context.field_miny = solver->field_miny;
+    phase_context.field_maxy = solver->field_maxy;
+    phase_context.abscale_low = solver->abscale_low;
+    phase_context.abscale_high = solver->abscale_high;
+    phase_context.funits_lower = solver->funits_lower;
+    phase_context.funits_upper = solver->funits_upper;
+    if (solver->mo_template) {
+        memcpy(
+            &phase_context.verification.match_template,
+            solver->mo_template,
+            sizeof(*solver->mo_template));
+    }
+    phase_context.verification.field = solver->vf;
+    phase_context.verification.index_cutnside =
+        solver->index->cutnside;
+    phase_context.verification.indexid = solver->index->indexid;
+    phase_context.verification.healpix = solver->index->healpix;
+    phase_context.verification.hpnside = solver->index->hpnside;
+    phase_context.verification.index_jitter =
+        solver->index->index_jitter;
+    phase_context.verification.verify_pix = solver->verify_pix;
+    phase_context.verification.distractor_ratio =
+        solver->distractor_ratio;
+    phase_context.verification.logratio_bail_threshold =
+        solver->logratio_bail_threshold;
+    phase_context.verification.logaccept = MIN(
+        solver->logratio_tokeep,
+        solver->logratio_totune);
+    phase_context.verification.logratio_stoplooking =
+        solver->logratio_stoplooking;
+    phase_context.verification.distance_from_quad_bonus =
+        solver->distance_from_quad_bonus;
+    phase_context.verification.enabled =
+        solver->vf && !verify_datalog_enabled();
+
     while (combination_cursor < total_combinations) {
         solver_codekd_packet_task_input_t* inputs = wave->inputs;
         solver_codekd_search_packet_t* packets = wave->packets;
@@ -1119,8 +1162,6 @@ static int solver_ab_descriptor_execute_phase(
         index_shard_staged_run_stats_t run_stats;
         solver_codekd_packet_retire_context_t retire_context;
         anbool run_inline = FALSE;
-        anbool wave_assisted = FALSE;
-        unsigned long long reduced_before = reduced;
 
         if (!task_count) {
             result = -1;
@@ -1152,99 +1193,29 @@ static int solver_ab_descriptor_execute_phase(
         for (task_index = 0U;
              task_index < task_count;
              task_index++) {
-            solver_ab_descriptor_task_input_t* descriptor_input =
-                &inputs[task_index].descriptor;
             unsigned long long task_combinations =
                 base + (task_index < remainder ? 1U : 0U);
-            unsigned long long work_units;
 
             if (!task_combinations ||
                 task_combinations > max_task_combinations) {
                 result = -1;
                 goto fail;
             }
-            descriptor_input->field_geometry = field_geometry;
-            descriptor_input->pairs = pairs;
-            descriptor_input->pair_count = pair_count;
-            descriptor_input->combination_first = task_cursor;
+            inputs[task_index].phase = &phase_context;
+            inputs[task_index].combination_first = task_cursor;
             task_cursor += task_combinations;
-            descriptor_input->combination_end = task_cursor;
-            descriptor_input->phase = phase;
-            descriptor_input->newpoint = newpoint;
-            descriptor_input->dimquads = dimquads;
-            descriptor_input->parity = solver->parity;
-            descriptor_input->cx_less_than_dx =
-                solver->index->cx_less_than_dx;
-            descriptor_input->meanx_less_than_half =
-                solver->index->meanx_less_than_half;
-            descriptor_input->cxdx_margin = solver->cxdx_margin;
-            inputs[task_index].tree = code_tree;
-            inputs[task_index].quads = solver->index->quads;
-            inputs[task_index].starkd = solver->index->starkd;
-            inputs[task_index].detailed = solver->profile.detailed;
-            inputs[task_index].use_radec = solver->use_radec;
-            inputs[task_index].field_minx = solver->field_minx;
-            inputs[task_index].field_maxx = solver->field_maxx;
-            inputs[task_index].field_miny = solver->field_miny;
-            inputs[task_index].field_maxy = solver->field_maxy;
-            inputs[task_index].abscale_low = solver->abscale_low;
-            inputs[task_index].abscale_high = solver->abscale_high;
-            inputs[task_index].funits_lower = solver->funits_lower;
-            inputs[task_index].funits_upper = solver->funits_upper;
-            if (solver->mo_template) {
-                memcpy(
-                    &inputs[task_index].verification.match_template,
-                    solver->mo_template,
-                    sizeof(*solver->mo_template));
-            }
-            inputs[task_index].verification.field = solver->vf;
-            inputs[task_index].verification.index_cutnside =
-                solver->index->cutnside;
-            inputs[task_index].verification.indexid =
-                solver->index->indexid;
-            inputs[task_index].verification.healpix =
-                solver->index->healpix;
-            inputs[task_index].verification.hpnside =
-                solver->index->hpnside;
-            inputs[task_index].verification.index_jitter =
-                solver->index->index_jitter;
-            inputs[task_index].verification.verify_pix =
-                solver->verify_pix;
-            inputs[task_index].verification.distractor_ratio =
-                solver->distractor_ratio;
-            inputs[task_index].verification.logratio_bail_threshold =
-                solver->logratio_bail_threshold;
-            inputs[task_index].verification.logaccept = MIN(
-                solver->logratio_tokeep,
-                solver->logratio_totune);
-            inputs[task_index].verification.logratio_stoplooking =
-                solver->logratio_stoplooking;
-            inputs[task_index].verification.distance_from_quad_bonus =
-                solver->distance_from_quad_bonus;
-            inputs[task_index].verification.enabled =
-                solver->vf && !verify_datalog_enabled();
+            inputs[task_index].combination_end = task_cursor;
 
-            work_units = task_combinations *
-                (unsigned long long)expansion;
             tasks[task_index].input = &inputs[task_index];
             tasks[task_index].input_bytes = sizeof(inputs[task_index]);
             tasks[task_index].output = &packets[task_index];
             tasks[task_index].output_bytes = sizeof(packets[task_index]);
-            tasks[task_index].work_units = work_units;
         }
         if (task_cursor !=
             combination_cursor + wave_combinations) {
             result = -1;
             goto fail;
         }
-
-        solver->profile.hypothesis_batches++;
-        solver->profile.task_ranges_planned += task_count;
-        solver->profile.task_ranges_submitted += task_count;
-        solver->profile.task_ranges_executed += task_count;
-        solver->profile.max_task_ranges = MAX(
-            solver->profile.max_task_ranges,
-            task_count);
 
         if (task_count) {
             int packet_prepare_status = 0;
@@ -1257,14 +1228,9 @@ static int solver_ab_descriptor_execute_phase(
                         solver,
                         &packets[task_index],
                         &workspace->outputs[task_index],
-                        inputs[task_index].tree,
-                        inputs[task_index].quads,
-                        inputs[task_index].starkd,
-                        inputs[task_index].descriptor.dimquads,
-                        inputs[task_index].use_radec,
+                        &phase_context,
                         candidate_budget_per_task,
-                        inputs[task_index].descriptor.combination_first,
-                        inputs[task_index].detailed);
+                        inputs[task_index].combination_first);
                 if (packet_prepare_status) {
                     break;
                 }
@@ -1284,7 +1250,6 @@ static int solver_ab_descriptor_execute_phase(
             }
             if (packet_prepare_status > 0) {
                 solver->profile.allocation_failures++;
-                solver->profile.page_plan_allocation_refused++;
                 for (task_index = 0U;
                      task_index < prepared_packets;
                      task_index++) {
@@ -1309,27 +1274,13 @@ static int solver_ab_descriptor_execute_phase(
                 for (task_index = 0U;
                      task_index < prepared_packets;
                      task_index++) {
-                    solver_codekd_packet_profile_accumulate(
-                        solver, &packets[task_index]);
+                    solver->profile.candidate_delivery_windows +=
+                        packets[task_index].candidate_delivery_windows;
                     if (solver_codekd_search_packet_cleanup(
                             &packets[task_index])) {
                         packet_cleanup_failed = TRUE;
                     }
                 }
-                solver->profile.staged_owner_claims +=
-                    run_stats.owner_claims;
-                solver->profile.staged_foreign_claims +=
-                    run_stats.foreign_claims;
-                solver->profile.staged_io_submitted +=
-                    run_stats.io_submitted;
-                solver->profile.staged_io_completed +=
-                    run_stats.io_completed;
-                solver->profile.max_staged_io_submitted = MAX(
-                    solver->profile.max_staged_io_submitted,
-                    run_stats.max_io_submitted);
-                solver->profile.max_staged_compute_ready = MAX(
-                    solver->profile.max_staged_compute_ready,
-                    run_stats.max_compute_ready);
 
                 if (packet_cleanup_failed) {
                     result = -1;
@@ -1341,25 +1292,19 @@ static int solver_ab_descriptor_execute_phase(
                 } else if (run_status == INDEX_SHARD_HELPER_STOPPED) {
                     (void)solver_poll_worker_stop(solver);
                     solver->quit_now = TRUE;
-                    solver->profile.hypothesis_batches_stopped++;
                     result = 1;
                     goto cleanup;
                 } else if (run_status != INDEX_SHARD_HELPER_OK) {
                     result = -1;
                     goto fail;
                 } else {
-                    if (run_stats.io_completed >
-                            run_stats.io_submitted ||
-                        run_stats.owner_claims +
-                            run_stats.foreign_claims == 0U) {
-                        result = -1;
-                        goto fail;
-                    }
                     if (run_stats.foreign_compute_executes) {
-                        wave_assisted = TRUE;
-                        assisted = TRUE;
-                        solver->profile.parallel_batches++;
-                        solver->profile.parallel_batches_observed++;
+                        if (!solver->profile.ab_helper_tasks &&
+                            index_shard_trace_enabled()) {
+                            logverb("[solver-ab-phase] mode=assisted "
+                                    "helper_tasks=%zu\n",
+                                    run_stats.foreign_compute_executes);
+                        }
                         solver->profile.ab_helper_tasks =
                             solver_ab_saturating_add(
                                 solver->profile.ab_helper_tasks,
@@ -1375,23 +1320,25 @@ static int solver_ab_descriptor_execute_phase(
         }
 
         if (run_inline) {
-            solver->profile.task_ranges_inline += task_count;
             for (task_index = 0U;
                  task_index < task_count;
                  task_index++) {
-                const solver_ab_descriptor_task_input_t* descriptor_input =
-                    &inputs[task_index].descriptor;
+                solver_ab_descriptor_task_input_t descriptor_input;
                 index_shard_helper_task_status_t task_status;
                 int owner_status;
 
+                descriptor_input.phase = &phase_context.descriptor;
+                descriptor_input.combination_first =
+                    inputs[task_index].combination_first;
+                descriptor_input.combination_end =
+                    inputs[task_index].combination_end;
                 task_status = solver_ab_descriptor_helper_execute(
-                    descriptor_input,
-                    sizeof(*descriptor_input),
+                    &descriptor_input,
+                    sizeof(descriptor_input),
                     &workspace->outputs[task_index],
                     sizeof(workspace->outputs[task_index]));
                 if (task_status == INDEX_SHARD_HELPER_TASK_STOPPED) {
                     (void)solver_poll_worker_stop(solver);
-                    solver->profile.hypothesis_batches_stopped++;
                     result = 1;
                     goto cleanup;
                 }
@@ -1410,13 +1357,12 @@ static int solver_ab_descriptor_execute_phase(
                     goto fail;
                 }
                 if (owner_status > 0) {
-                    solver->profile.hypothesis_batches_stopped++;
                     result = 1;
                     goto cleanup;
                 }
                 retire_context.next_task_index++;
                 retire_context.next_sequence =
-                    descriptor_input->combination_end;
+                    descriptor_input.combination_end;
             }
         }
 
@@ -1426,12 +1372,6 @@ static int solver_ab_descriptor_execute_phase(
             goto fail;
         }
 
-        if (wave_assisted) {
-            parallel_reduced = solver_ab_saturating_add(
-                parallel_reduced,
-                reduced - reduced_before);
-        }
-        solver->profile.hypothesis_batches_completed++;
         combination_cursor += wave_combinations;
     }
 
@@ -1439,20 +1379,10 @@ static int solver_ab_descriptor_execute_phase(
     goto cleanup;
 
 fail:
-    solver->profile.hypothesis_batches_failed++;
     solver->profile.execution_failed = TRUE;
     solver->quit_now = TRUE;
 
 cleanup:
-    solver->profile.parallel_hypotheses =
-        solver_ab_saturating_add(
-            solver->profile.parallel_hypotheses,
-            parallel_reduced);
-    if (mode_out && result > 0) {
-        *mode_out = assisted
-            ? SOLVER_AB_MODE_ASSISTED
-            : SOLVER_AB_MODE_FLATTENED_OWNER;
-    }
     solver_ab_descriptor_release_pairs(workspace);
     if (!packet_cleanup_failed) {
         solver_codekd_packet_wave_destroy(wave);
@@ -1464,7 +1394,6 @@ cleanup:
 int solver_run(solver_t* solver) {
     int numxy, newpoint;
     double usertime, systime;
-    double run_wall_start;
     // first timer callback is called after 1 second
     time_t next_timer_callback_time = time(NULL) + 1;
     pquad* pquads = NULL;
@@ -1475,7 +1404,6 @@ int solver_run(solver_t* solver) {
     // Reuse CodeKD result capacity across all hypotheses in this run.
     kdtree_qres_t* codekd_result = NULL;
 
-    run_wall_start = monotonic_seconds();
     memset(&solver->profile, 0, sizeof(solver->profile));
     solver->profile.detailed = index_shard_trace_enabled();
 
@@ -1492,8 +1420,6 @@ int solver_run(solver_t* solver) {
     if (solver->endobj && (numxy > solver->endobj))
         numxy = solver->endobj;
     if (solver->startobj >= numxy) {
-        solver->profile.solver_run_wall_seconds =
-            monotonic_seconds() - run_wall_start;
         solver_profile_report(solver);
         return 0;
     }
@@ -1690,15 +1616,9 @@ int solver_run(solver_t* solver) {
                 index_t* index = pl_get(solver->indexes, i);
                 int dimquads;
                 int ab_phase_result = 0;
-                solver_ab_phase_mode_t phase_mode =
-                    SOLVER_AB_MODE_NATIVE;
-                solver_ab_phase_telemetry_t phase_telemetry;
 
                 set_index(solver, index);
                 dimquads = index_dimquads(index);
-                solver_ab_phase_telemetry_begin(
-                    solver,
-                    &phase_telemetry);
                 if (num_indexes == 1U &&
                     field_geometry) {
                     ab_phase_result =
@@ -1710,24 +1630,11 @@ int solver_run(solver_t* solver) {
                             dimquads,
                             minAB2s[i],
                             maxAB2s[i],
-                            &codekd_result,
-                            &phase_mode);
+                            &codekd_result);
                     if (ab_phase_result < 0) {
-                        solver_ab_phase_telemetry_report(
-                            solver,
-                            &phase_telemetry,
-                            newpoint,
-                            SOLVER_AB_PHASE_DIAGONAL,
-                            phase_mode);
                         goto quitnow;
                     }
                     if (ab_phase_result > 0) {
-                        solver_ab_phase_telemetry_report(
-                            solver,
-                            &phase_telemetry,
-                            newpoint,
-                            SOLVER_AB_PHASE_DIAGONAL,
-                            phase_mode);
                         continue;
                     }
                 }
@@ -1755,21 +1662,9 @@ int solver_run(solver_t* solver) {
                               tol2,
                               &codekd_result);
                     if (solver->quit_now) {
-                        solver_ab_phase_telemetry_report(
-                            solver,
-                            &phase_telemetry,
-                            newpoint,
-                            SOLVER_AB_PHASE_DIAGONAL,
-                            SOLVER_AB_MODE_NATIVE);
                         goto quitnow;
                     }
                 }
-                solver_ab_phase_telemetry_report(
-                    solver,
-                    &phase_telemetry,
-                    newpoint,
-                    SOLVER_AB_PHASE_DIAGONAL,
-                    SOLVER_AB_MODE_NATIVE);
             }
 
             if (solver->quit_now)
@@ -1781,19 +1676,13 @@ int solver_run(solver_t* solver) {
             debug("Trying quads with C=%i\n", newpoint);
             {
                 int ab_phase_result = 0;
-                solver_ab_phase_mode_t phase_mode =
-                    SOLVER_AB_MODE_NATIVE;
                 anbool phase_pquads_prepared = FALSE;
-                solver_ab_phase_telemetry_t phase_telemetry;
 
                 if (num_indexes == 1U) {
                     set_index(
                         solver,
                         pl_get(solver->indexes, 0));
                 }
-                solver_ab_phase_telemetry_begin(
-                    solver,
-                    &phase_telemetry);
 
                 if (num_indexes == 1U &&
                     field_geometry) {
@@ -1811,15 +1700,8 @@ int solver_run(solver_t* solver) {
                             dimquads,
                             minAB2s[0],
                             maxAB2s[0],
-                            &codekd_result,
-                            &phase_mode);
+                            &codekd_result);
                     if (ab_phase_result < 0) {
-                        solver_ab_phase_telemetry_report(
-                            solver,
-                            &phase_telemetry,
-                            newpoint,
-                            SOLVER_AB_PHASE_OFF_DIAGONAL,
-                            phase_mode);
                         goto quitnow;
                     }
                     /*
@@ -1944,24 +1826,12 @@ int solver_run(solver_t* solver) {
                                         &codekd_result);
                                 }
                                 if (solver->quit_now) {
-                                    solver_ab_phase_telemetry_report(
-                                        solver,
-                                        &phase_telemetry,
-                                        newpoint,
-                                        SOLVER_AB_PHASE_OFF_DIAGONAL,
-                                        SOLVER_AB_MODE_NATIVE);
                                     goto quitnow;
                                 }
                             }
                         }
                     }
                 }
-                solver_ab_phase_telemetry_report(
-                    solver,
-                    &phase_telemetry,
-                    newpoint,
-                    SOLVER_AB_PHASE_OFF_DIAGONAL,
-                    phase_mode);
             }
 
             logverb("object %u of %u: %i quads tried, %i matched.\n",
@@ -1987,8 +1857,6 @@ int solver_run(solver_t* solver) {
     }
 
 finish:
-    solver->profile.solver_run_wall_seconds =
-        monotonic_seconds() - run_wall_start;
     solver_profile_report(solver);
     return solver->profile.execution_failed ? -1 : 0;
 }
@@ -2230,10 +2098,6 @@ void solver_begin_hypothesis_owner(
     int dimquad,
     solver_t* solver,
     anbool current_parity) {
-    solver->profile.hypotheses_generated++;
-    if (solver->profile.max_batch_hypotheses < 1U) {
-        solver->profile.max_batch_hypotheses = 1U;
-    }
     if (solver->profile.detailed) {
         uint64_t hypothesis_digest =
             solver_hypothesis_order_digest(
@@ -2254,18 +2118,16 @@ static void solver_reduce_codekd_result_owner(
     int dimquad,
     solver_t* solver,
     anbool current_parity,
+    const solver_codekd_phase_context_t* phase,
     kdtree_qres_t* result,
-    double search_wall_seconds,
     solver_candidate_delivery_record_t* prepared,
     size_t prepared_quad_count,
     size_t prepared_star_count) {
     solver->profile.codekd_calls++;
-    solver->profile.hypotheses_executed++;
     if (solver->profile.detailed) {
         uint64_t kd_result_digest =
             solver_kd_result_order_digest(result);
 
-        solver->profile.codekd_wall_seconds += search_wall_seconds;
         solver->profile.kd_result_order_hash =
             solver_order_hash_mix(
                 solver->profile.kd_result_order_hash,
@@ -2279,17 +2141,13 @@ static void solver_reduce_codekd_result_owner(
     }
     if (result->nres) {
         double pixvals[DQMAX * 2];
-        double resolve_wall_start = 0.0;
         int j;
 
         for (j = 0; j < dimquad; j++) {
             setx(pixvals, j, field_getx(solver, stars[j]));
             sety(pixvals, j, field_gety(solver, stars[j]));
         }
-        if (solver->profile.detailed) {
-            resolve_wall_start = monotonic_seconds();
-        }
-        resolve_matches_with_delivery(
+        resolve_matches_native_range(
             result,
             pixvals,
             stars,
@@ -2297,17 +2155,15 @@ static void solver_reduce_codekd_result_owner(
             solver->numtries,
             solver,
             current_parity,
+            0,
+            result->nres,
+            phase,
             prepared,
             0U,
             prepared_quad_count,
             prepared_star_count);
         solver->profile.resolve_calls++;
-        if (solver->profile.detailed) {
-            solver->profile.resolve_wall_seconds +=
-                monotonic_seconds() - resolve_wall_start;
-        }
     }
-    solver->profile.hypotheses_reduced++;
 }
 
 void solver_execute_prepared_hypothesis_owner(
@@ -2316,8 +2172,8 @@ void solver_execute_prepared_hypothesis_owner(
     int dimquad,
     solver_t* solver,
     anbool current_parity,
+    const solver_codekd_phase_context_t* phase,
     kdtree_qres_t* result,
-    double search_wall_seconds,
     solver_candidate_delivery_record_t* prepared,
     size_t prepared_quad_count,
     size_t prepared_star_count) {
@@ -2331,8 +2187,8 @@ void solver_execute_prepared_hypothesis_owner(
         dimquad,
         solver,
         current_parity,
+        phase,
         result,
-        search_wall_seconds,
         prepared,
         prepared_quad_count,
         prepared_star_count);
@@ -2344,25 +2200,19 @@ void solver_retire_codekd_failure_owner(
     int dimquad,
     solver_t* solver,
     anbool current_parity,
-    int search_errno,
-    double search_wall_seconds) {
+    int search_errno) {
     if (!solver) {
         return;
     }
     solver_begin_hypothesis_owner(
         stars, code, dimquad, solver, current_parity);
     solver->profile.codekd_calls++;
-    solver->profile.hypotheses_executed++;
-    if (solver->profile.detailed) {
-        solver->profile.codekd_wall_seconds += search_wall_seconds;
-    }
     errno = search_errno;
     if (search_errno == ECANCELED &&
         solver_poll_worker_stop(solver)) {
         solver->quit_now = TRUE;
         return;
     }
-    solver->profile.search_failures++;
     solver->profile.execution_failed = TRUE;
     solver->quit_now = TRUE;
 }
@@ -2375,41 +2225,24 @@ void solver_execute_hypothesis_owner(
     anbool current_parity,
     double tol2,
     kdtree_qres_t** presult) {
-    double search_wall_seconds = 0.0;
-    double search_wall_start = 0.0;
-
     if (solver_poll_worker_stop(solver)) {
         return;
     }
     solver_begin_hypothesis_owner(
         stars, code, dimquad, solver, current_parity);
-    if (solver->profile.detailed) {
-        search_wall_start = monotonic_seconds();
-    }
     *presult = solver_codekd_rangesearch(
         solver->index->codekd->tree,
         *presult,
         code,
         tol2,
         SOLVER_CODEKD_SEARCH_OPTIONS);
-    if (solver->profile.detailed) {
-        search_wall_seconds =
-            monotonic_seconds() - search_wall_start;
-    }
-
     if (!*presult) {
         solver->profile.codekd_calls++;
-        solver->profile.hypotheses_executed++;
-        if (solver->profile.detailed) {
-            solver->profile.codekd_wall_seconds +=
-                search_wall_seconds;
-        }
         if (errno == ECANCELED &&
             solver_poll_worker_stop(solver)) {
             solver->quit_now = TRUE;
             return;
         }
-        solver->profile.search_failures++;
         solver->profile.execution_failed = TRUE;
         solver->quit_now = TRUE;
         return;
@@ -2420,8 +2253,8 @@ void solver_execute_hypothesis_owner(
         dimquad,
         solver,
         current_parity,
+        NULL,
         *presult,
-        search_wall_seconds,
         NULL,
         0U,
         0U);
@@ -2446,6 +2279,7 @@ void resolve_matches_native_range(
     anbool current_parity,
     int candidate_first,
     int candidate_end,
+    const solver_codekd_phase_context_t* phase,
     solver_candidate_delivery_record_t* prepared,
     size_t prepared_first,
     size_t prepared_quad_count,
@@ -2590,7 +2424,6 @@ void resolve_matches_native_range(
                     thisquadno,
                     krez->sdists[jj]);
                 solver->num_radec_skipped++;
-                solver->profile.candidate_math_reused++;
                 continue;
 
             case SOLVER_AB_CANDIDATE_ABSCALE_SKIP:
@@ -2600,7 +2433,6 @@ void resolve_matches_native_range(
                     thisquadno,
                     krez->sdists[jj]);
                 solver->num_abscale_skipped++;
-                solver->profile.candidate_math_reused++;
                 continue;
 
             case SOLVER_AB_CANDIDATE_BAD_QUAD:
@@ -2609,7 +2441,6 @@ void resolve_matches_native_range(
                     SOLVER_AB_CANDIDATE_BAD_QUAD,
                     thisquadno,
                     krez->sdists[jj]);
-                solver->profile.candidate_math_reused++;
                 logverb("bad quad at %s:%i\n", __FILE__, __LINE__);
                 continue;
 
@@ -2619,7 +2450,6 @@ void resolve_matches_native_range(
                     SOLVER_AB_CANDIDATE_SCALE_SKIP,
                     thisquadno,
                     krez->sdists[jj]);
-                solver->profile.candidate_math_reused++;
                 debug("          bad scale (%g arcsec/pix, range %g %g)\n",
                       record->prepared_scale,
                       solver->funits_lower,
@@ -2629,7 +2459,6 @@ void resolve_matches_native_range(
             case SOLVER_AB_CANDIDATE_VERIFY:
                 memcpy(&wcs, &record->prepared_wcs, sizeof(wcs));
                 arcsecperpix = record->prepared_scale;
-                solver->profile.candidate_math_reused++;
                 break;
 
             default:
@@ -2756,6 +2585,7 @@ void resolve_matches_native_range(
                     &mo,
                     NULL,
                     FALSE,
+                    phase,
                     record)) {
                 solver->quit_now = TRUE;
             }
@@ -2781,92 +2611,11 @@ void resolve_matches_native_range(
     }
 }
 
-static void resolve_matches_with_delivery(
-    kdtree_qres_t* krez,
-    const double* field_xy,
-    const int* fieldstars,
-    int dimquads,
-    int quads_tried,
-    solver_t* solver,
-    anbool current_parity,
-    solver_candidate_delivery_record_t* prepared,
-    size_t prepared_first,
-    size_t prepared_quad_count,
-    size_t prepared_star_count) {
-    size_t window_first;
-
-    /*
-     * field_xy contains [x_A, y_A, x_B, y_B, ...]. Cold payloads remain on
-     * the original owner-local path. Prepared verification is permitted only
-     * when its complete Quad/Star input is already resident.
-     */
-    assert(krez);
-    assert(dimquads > 0);
-    assert(dimquads <= DQMAX);
-
-    if (!solver_payload_candidate_data_fully_resident(solver)) {
-        resolve_matches_native_range(
-            krez,
-            field_xy,
-            fieldstars,
-            dimquads,
-            quads_tried,
-            solver,
-            current_parity,
-            0,
-            krez->nres,
-            prepared,
-            prepared_first,
-            prepared_quad_count,
-            prepared_star_count);
-        return;
-    }
-
-    window_first = 0U;
-    while (window_first < (size_t)krez->nres) {
-        size_t window_end = MIN(
-            (size_t)krez->nres,
-            window_first +
-                (size_t)SOLVER_VERIFICATION_WINDOW_CANDIDATES);
-        int handled = solver_ab_try_verification_wave(
-            krez,
-            field_xy,
-            fieldstars,
-            dimquads,
-            quads_tried,
-            solver,
-            current_parity,
-            (int)window_first,
-            (int)window_end);
-
-        if (!handled) {
-            resolve_matches_native_range(
-                krez,
-                field_xy,
-                fieldstars,
-                dimquads,
-                quads_tried,
-                solver,
-                current_parity,
-                (int)window_first,
-                (int)window_end,
-                NULL,
-                0U,
-                0U,
-                0U);
-        }
-        if (solver->quit_now || solver_poll_worker_stop(solver)) {
-            return;
-        }
-        window_first = window_end;
-    }
-}
-
 void solver_inject_match(solver_t* solver, MatchObj* mo, sip_t* sip) {
     solver_handle_hit(solver, mo, sip, TRUE);
 }
 
-double solver_prepare_hit_for_verify(
+static double solver_prepare_hit_for_verify(
     solver_t* sp,
     MatchObj* mo,
     double* logaccept) {
@@ -2887,10 +2636,12 @@ double solver_prepare_hit_for_verify(
         square(sp->index->index_jitter / mo->scale);
 }
 
-int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
-                      anbool fake_match) {
+static int solver_handle_hit(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* verifysip,
+    anbool fake_match) {
     double match_distance_in_pixels2;
-    double verify_wall_start = 0.0;
     double logaccept;
 
     assert(sp);
@@ -2904,10 +2655,6 @@ int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
         solver_prepare_hit_for_verify(
             sp, mo, &logaccept);
 
-    if (sp->profile.detailed) {
-        verify_wall_start = monotonic_seconds();
-    }
-
     verify_hit(sp->index->starkd, sp->index->cutnside,
                mo, verifysip, sp->vf, match_distance_in_pixels2,
                sp->distractor_ratio, sp->field_maxx, sp->field_maxy,
@@ -2915,11 +2662,6 @@ int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
                sp->logratio_stoplooking,
                sp->distance_from_quad_bonus, fake_match);
     sp->profile.verify_calls++;
-
-    if (sp->profile.detailed) {
-        sp->profile.verify_wall_seconds +=
-            monotonic_seconds() - verify_wall_start;
-    }
 
     return solver_handle_hit_after_verify(
         sp,
@@ -2943,7 +2685,6 @@ static int solver_handle_query_hit(
     verify_prepared_hit_t* prepared = NULL;
     verify_prepared_score_t score;
     double match_distance_in_pixels2;
-    double verify_wall_start = 0.0;
     double logaccept;
     int status;
 
@@ -2964,9 +2705,6 @@ static int solver_handle_query_hit(
         solver_prepare_hit_for_verify(
             sp, mo, &logaccept);
     memset(&score, 0, sizeof(score));
-    if (sp->profile.detailed) {
-        verify_wall_start = monotonic_seconds();
-    }
     status = verify_prepare_hit_from_query(
         sp->index->starkd,
         query,
@@ -3002,10 +2740,6 @@ static int solver_handle_query_hit(
     }
     verify_destroy_prepared_hit(prepared);
     sp->profile.verify_calls++;
-    if (sp->profile.detailed) {
-        sp->profile.verify_wall_seconds +=
-            monotonic_seconds() - verify_wall_start;
-    }
     return solver_handle_hit_after_verify(
         sp,
         mo,
@@ -3024,22 +2758,21 @@ static int solver_handle_scored_query_hit(
     MatchObj* mo,
     sip_t* verifysip,
     anbool fake_match,
+    const solver_codekd_phase_context_t* phase,
     solver_candidate_delivery_record_t* record) {
+    const solver_codekd_verification_snapshot_t* snapshot;
+    double prepared_verify_pix2;
     double match_distance_in_pixels2;
-    double verify_wall_start = 0.0;
     double logaccept;
 
     assert(sp);
     assert(mo);
 
-    if (!record || fake_match ||
+    if (!phase || !record || fake_match ||
         record->verify_query ||
         !record->prepared_verification ||
         !record->verification_score_ready) {
         if (record) {
-            if (record->verification_score_ready) {
-                sp->profile.verification_score_fallback_batches++;
-            }
             solver_codekd_record_clear_prepared_verification(record);
         }
         return solver_handle_hit(
@@ -3053,6 +2786,9 @@ static int solver_handle_scored_query_hit(
     match_distance_in_pixels2 =
         solver_prepare_hit_for_verify(
             sp, mo, &logaccept);
+    snapshot = &phase->verification;
+    prepared_verify_pix2 = square(snapshot->verify_pix) +
+        square(snapshot->index_jitter / mo->scale);
     if (memcmp(
             mo->center,
             record->verify_center,
@@ -3063,62 +2799,49 @@ static int solver_handle_scored_query_hit(
             sizeof(mo->radius)) ||
         memcmp(
             &match_distance_in_pixels2,
-            &record->prepared_verify_pix2,
+            &prepared_verify_pix2,
             sizeof(match_distance_in_pixels2)) ||
         memcmp(
             &logaccept,
-            &record->prepared_logaccept,
+            &snapshot->logaccept,
             sizeof(logaccept)) ||
         memcmp(
             &sp->distractor_ratio,
-            &record->prepared_distractor_ratio,
+            &snapshot->distractor_ratio,
             sizeof(sp->distractor_ratio)) ||
         memcmp(
             &sp->logratio_bail_threshold,
-            &record->prepared_logratio_bail_threshold,
+            &snapshot->logratio_bail_threshold,
             sizeof(sp->logratio_bail_threshold)) ||
         memcmp(
             &sp->logratio_stoplooking,
-            &record->prepared_logratio_stoplooking,
+            &snapshot->logratio_stoplooking,
             sizeof(sp->logratio_stoplooking)) ||
         memcmp(
             &sp->field_maxx,
-            &record->prepared_field_maxx,
+            &phase->field_maxx,
             sizeof(sp->field_maxx)) ||
         memcmp(
             &sp->field_maxy,
-            &record->prepared_field_maxy,
+            &phase->field_maxy,
             sizeof(sp->field_maxy)) ||
         sp->distance_from_quad_bonus !=
-            record->prepared_distance_from_quad_bonus) {
-        sp->profile.verification_score_fallback_batches++;
+            snapshot->distance_from_quad_bonus) {
         solver_codekd_record_clear_prepared_verification(record);
         return solver_handle_hit(
             sp, mo, verifysip, fake_match);
     }
 
-    if (sp->profile.detailed) {
-        verify_wall_start = monotonic_seconds();
-    }
     if (verify_finish_prepared_hit(
             record->prepared_verification,
             &record->prepared_score,
             mo)) {
-        sp->profile.verification_score_fallback_batches++;
-        if (sp->profile.detailed) {
-            sp->profile.verify_wall_seconds +=
-                monotonic_seconds() - verify_wall_start;
-        }
         solver_codekd_record_clear_prepared_verification(record);
         return solver_handle_hit(
             sp, mo, verifysip, fake_match);
     }
     solver_codekd_record_clear_prepared_verification(record);
     sp->profile.verify_calls++;
-    if (sp->profile.detailed) {
-        sp->profile.verify_wall_seconds +=
-            monotonic_seconds() - verify_wall_start;
-    }
     return solver_handle_hit_after_verify(
         sp,
         mo,
@@ -3127,13 +2850,12 @@ static int solver_handle_scored_query_hit(
         match_distance_in_pixels2);
 }
 
-int solver_handle_hit_after_verify(
+static int solver_handle_hit_after_verify(
     solver_t* sp,
     MatchObj* mo,
     sip_t* verifysip,
     anbool fake_match,
     double match_distance_in_pixels2) {
-    double verify_wall_start = 0.0;
     anbool solved;
 
     mo->nverified = sp->num_verified++;
@@ -3164,10 +2886,6 @@ int solver_handle_hit_after_verify(
                 return FALSE;
             }
 
-            if (sp->profile.detailed) {
-                verify_wall_start = monotonic_seconds();
-            }
-
             verify_hit(sp->index->starkd, sp->index->cutnside,
                        mo, mo->sip, sp->vf, match_distance_in_pixels2,
                        sp->distractor_ratio,
@@ -3178,11 +2896,6 @@ int solver_handle_hit_after_verify(
                        sp->distance_from_quad_bonus,
                        fake_match);
             sp->profile.verify_calls++;
-
-            if (sp->profile.detailed) {
-                sp->profile.verify_wall_seconds +=
-                    monotonic_seconds() - verify_wall_start;
-            }
 
             logverb("Checking tuned result: logodds = %g (%g)\n",
                     mo->logodds, exp(mo->logodds));
@@ -3428,10 +3141,6 @@ solver_t* solver_new() {
 
 void solver_set_default_values(solver_t* solver) {
     memset(solver, 0, sizeof(solver_t));
-
-    fitsbin_mmap_advice_state_init(
-        &solver->index_mmap_policy,
-        fitsbin_get_configured_mmap_policy());
 
     solver->indexes = pl_new(16);
     solver->funits_upper = LARGE_VAL;

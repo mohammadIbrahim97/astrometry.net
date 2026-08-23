@@ -37,6 +37,8 @@ struct solver_field_geometry {
     unsigned long long reused_solver_runs;
 };
 
+anbool solver_prepare_field_geometry(solver_t* solver);
+void solver_release_incompatible_field_geometry(solver_t* solver);
 void solver_release_field_geometry(solver_t* solver);
 
 anbool solver_field_geometry_compatible(

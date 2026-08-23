@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "fitsbin.h"
+#include "fitsbin_internal.h"
 #include "fitsioutils.h"
 
 #include "cutest.h"
@@ -44,63 +45,15 @@ static fitsbin_t* make_mmap_test_fitsbin(void* mapping,
     return fb;
 }
 
-// Verify that legacy mmap environment variables no longer alter production.
+/* Thread-local policy affects payload mappings, not topology mappings. */
 void test_fitsbin_mmap_advice(CuTest* ct) {
-    static const char* envname = "ASTROMETRY_INDEX_MMAP_ADVICE";
-    const char* oldvalue;
-    char* saved = NULL;
     fitsbin_t fb;
     fitsbin_chunk_t payload;
     fitsbin_chunk_t topology;
     int result;
-    int restore_result;
-
-    oldvalue = getenv(envname);
-    if (oldvalue) {
-        saved = strdup(oldvalue);
-        CuAssertPtrNotNull(ct, saved);
-    }
-
-    result = setenv(envname, "normal", 1);
-    CuAssertIntEquals(ct, 0, result);
-
-    /*
-     * The parser is retained for controlled callers, but its fallback must
-     * agree with the serial no-override NORMAL behavior. An absent or
-     * misspelled value must not select RANDOM through the parser.
-     */
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_POLICY_FIXED_NORMAL,
-        fitsbin_mmap_policy_parse(NULL));
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_POLICY_FIXED_NORMAL,
-        fitsbin_mmap_policy_parse(""));
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_POLICY_FIXED_NORMAL,
-        fitsbin_mmap_policy_parse("unknown"));
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_POLICY_FIXED_NORMAL,
-        fitsbin_mmap_policy_parse("normal"));
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_POLICY_FIXED_RANDOM,
-        fitsbin_mmap_policy_parse("random"));
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_POLICY_ADAPTIVE,
-        fitsbin_mmap_policy_parse("adaptive"));
 
     fitsbin_mmap_clear_thread_advice();
     memset(&fb, 0, sizeof(fb));
-
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_POLICY_FIXED_RANDOM,
-        fitsbin_get_configured_mmap_policy());
 
     result = fitsbin_configure_index_mmap(&fb);
     CuAssertIntEquals(ct, 0, result);
@@ -157,52 +110,6 @@ void test_fitsbin_mmap_advice(CuTest* ct) {
         ct,
         FITSBIN_MMAP_ADVICE_NORMAL,
         fitsbin_mmap_current_advice());
-
-    if (saved) {
-        restore_result = setenv(envname, saved, 1);
-    } else {
-        restore_result = unsetenv(envname);
-    }
-
-    free(saved);
-    CuAssertIntEquals(ct, 0, restore_result);
-}
-
-void test_fitsbin_mmap_prefetch(CuTest* ct) {
-    static const char* envname = "ASTROMETRY_INDEX_MMAP_PREFETCH";
-    const char* oldvalue;
-    char* saved = NULL;
-    fitsbin_t fb;
-    int result;
-    int restore_result;
-
-    oldvalue = getenv(envname);
-    if (oldvalue) {
-        saved = strdup(oldvalue);
-        CuAssertPtrNotNull(ct, saved);
-    }
-
-    result = setenv(envname, "1", 1);
-    CuAssertIntEquals(ct, 0, result);
-
-    memset(&fb, 0, sizeof(fb));
-    result = fitsbin_configure_index_mmap(&fb);
-
-    CuAssertIntEquals(ct, 0, result);
-#if defined(MADV_POPULATE_READ)
-    CuAssertIntEquals(ct, TRUE, fb.mmap_prefetch_enabled);
-#else
-    CuAssertIntEquals(ct, FALSE, fb.mmap_prefetch_enabled);
-#endif
-
-    if (saved) {
-        restore_result = setenv(envname, saved, 1);
-    } else {
-        restore_result = unsetenv(envname);
-    }
-
-    free(saved);
-    CuAssertIntEquals(ct, 0, restore_result);
 }
 
 void test_fitsbin_mmap_range_advice(CuTest* ct) {
@@ -436,204 +343,6 @@ void test_fitsbin_open_file_identity(CuTest* ct) {
     CuAssertTrue(ct, before_close.st_ctime == after_close.st_ctime);
     CuAssertIntEquals(ct, 0, fitsbin_close(in));
     CuAssertIntEquals(ct, 0, unlink(fn));
-}
-
-void test_fitsbin_mmap_adaptive_policy(CuTest* ct) {
-    fitsbin_mmap_advice_state_t state;
-    anbool transitioned;
-
-    fitsbin_mmap_advice_state_init(
-        &state,
-        FITSBIN_MMAP_POLICY_ADAPTIVE);
-
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_RANDOM,
-        state.effective_advice);
-
-    CuAssertIntEquals(ct, 0, state.pass_number);
-    CuAssertIntEquals(
-        ct,
-        0,
-        state.completed_clean_unsolved_passes);
-
-    CuAssertIntEquals(ct, 0, state.transition_count);
-
-    /*
-     * Partial pass.
-     */
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        FALSE,
-        FALSE,
-        FALSE,
-        FALSE,
-        0,
-        0);
-
-    CuAssertIntEquals(ct, FALSE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_RANDOM,
-        state.effective_advice);
-
-    /*
-     * Cancelled pass.
-     */
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        TRUE,
-        TRUE,
-        FALSE,
-        TRUE,
-        0,
-        0);
-
-    CuAssertIntEquals(ct, FALSE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_RANDOM,
-        state.effective_advice);
-
-    /*
-     * Failed pass.
-     */
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        TRUE,
-        TRUE,
-        FALSE,
-        FALSE,
-        -1,
-        0);
-
-    CuAssertIntEquals(ct, FALSE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_RANDOM,
-        state.effective_advice);
-
-    /*
-     * Solved pass.
-     */
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        TRUE,
-        FALSE,
-        TRUE,
-        FALSE,
-        0,
-        0);
-
-    CuAssertIntEquals(ct, FALSE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_RANDOM,
-        state.effective_advice);
-
-    /*
-     * First clean, exhaustive, unsolved pass.
-     */
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        TRUE,
-        TRUE,
-        FALSE,
-        FALSE,
-        0,
-        0);
-
-    CuAssertIntEquals(ct, TRUE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_NORMAL,
-        state.effective_advice);
-
-    CuAssertIntEquals(
-        ct,
-        1,
-        state.completed_clean_unsolved_passes);
-
-    CuAssertIntEquals(ct, 1, state.transition_count);
-
-    /*
-     * Later clean pass remains NORMAL and does not transition again.
-     */
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        TRUE,
-        TRUE,
-        FALSE,
-        FALSE,
-        0,
-        0);
-
-    CuAssertIntEquals(ct, FALSE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_NORMAL,
-        state.effective_advice);
-
-    CuAssertIntEquals(ct, 1, state.transition_count);
-
-    /*
-     * New field.
-     */
-    fitsbin_mmap_advice_state_reset(&state);
-
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_RANDOM,
-        state.effective_advice);
-
-    CuAssertIntEquals(ct, 0, state.pass_number);
-    CuAssertIntEquals(
-        ct,
-        0,
-        state.completed_clean_unsolved_passes);
-
-    CuAssertIntEquals(ct, 0, state.transition_count);
-
-    /*
-     * Fixed policies never transition.
-     */
-    fitsbin_mmap_advice_state_init(
-        &state,
-        FITSBIN_MMAP_POLICY_FIXED_NORMAL);
-
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        TRUE,
-        TRUE,
-        FALSE,
-        FALSE,
-        0,
-        0);
-
-    CuAssertIntEquals(ct, FALSE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_NORMAL,
-        state.effective_advice);
-
-    fitsbin_mmap_advice_state_init(
-        &state,
-        FITSBIN_MMAP_POLICY_FIXED_RANDOM);
-
-    transitioned = fitsbin_mmap_policy_complete_pass(
-        &state,
-        TRUE,
-        TRUE,
-        FALSE,
-        FALSE,
-        0,
-        0);
-
-    CuAssertIntEquals(ct, FALSE, transitioned);
-    CuAssertIntEquals(
-        ct,
-        FITSBIN_MMAP_ADVICE_RANDOM,
-        state.effective_advice);
 }
 
 void test_fitsbin_1(CuTest* ct) {

@@ -1,38 +1,22 @@
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ # This file is part of the Astrometry.net suite.
+ # Licensed under a 3-clause BSD style license - see LICENSE
  */
+
 #include <assert.h>
-#include <errno.h>
-#include <limits.h>
-#include <math.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "index_shard_private.h"
-#include "astrometry/bl.h"
-#include "astrometry/errors.h"
 #include "astrometry/log.h"
-#include "astrometry/tic.h"
-#include "astrometry/fitsbin.h"
-#include "astrometry/fitsioutils.h"
-/*
- # This file is part of the Astrometry.net suite.
- # Licensed under a 3-clause BSD style license - see LICENSE
- */
-/*
- * Bounded inverse-permutation cache and asynchronous preparation.
- *
- * This module owns the bounded inverse-permutation cache and its leases.
- */
+#include "astrometry/ioutils.h"
+
+/* Own the bounded inverse-permutation cache and its leases. */
 
 size_t index_shard_inverse_cache_budget(void) {
   struct rlimit address_limit;
@@ -101,20 +85,7 @@ static int index_shard_inverse_source(
     return -1;
   }
   source->filename = fitsbin_get_filename(fb);
-  source->device = source_stat.st_dev;
-  source->inode = source_stat.st_ino;
-  source->file_size = source_stat.st_size;
-  source->mtime_seconds = source_stat.st_mtime;
-  source->ctime_seconds = source_stat.st_ctime;
-#if defined(__APPLE__)
-  source->mtime_nanoseconds =
-      source_stat.st_mtimespec.tv_nsec;
-  source->ctime_nanoseconds =
-      source_stat.st_ctimespec.tv_nsec;
-#elif defined(__linux__) || defined(__FreeBSD__)
-  source->mtime_nanoseconds = source_stat.st_mtim.tv_nsec;
-  source->ctime_nanoseconds = source_stat.st_ctim.tv_nsec;
-#endif
+  source->file_stat = source_stat;
   source->ndata = startree_N(starkd);
   source->ndim = starkd->tree->ndim;
   source->treetype = starkd->tree->treetype;
@@ -134,43 +105,20 @@ static anbool index_shard_inverse_entry_matches(
       entry->ndim == source->ndim &&
       entry->treetype == source->treetype &&
       entry->bytes == source->bytes &&
-      entry->device == source->device &&
-      entry->inode == source->inode &&
-      entry->file_size == source->file_size &&
-      entry->mtime_seconds == source->mtime_seconds &&
-      entry->mtime_nanoseconds == source->mtime_nanoseconds &&
-      entry->ctime_seconds == source->ctime_seconds &&
-      entry->ctime_nanoseconds == source->ctime_nanoseconds;
+      stat_file_identity_equal(
+          &entry->file_stat, &source->file_stat);
 }
 
 static anbool index_shard_inverse_source_path_unchanged(
-    const index_shard_inverse_source_t *source) {
+  const index_shard_inverse_source_t *source) {
   struct stat current;
-  time_t mtime_seconds;
-  time_t ctime_seconds;
-  long mtime_nanoseconds = 0L;
-  long ctime_nanoseconds = 0L;
 
   if (!source || !source->filename ||
       stat(source->filename, &current)) {
     return FALSE;
   }
-  mtime_seconds = current.st_mtime;
-  ctime_seconds = current.st_ctime;
-#if defined(__APPLE__)
-  mtime_nanoseconds = current.st_mtimespec.tv_nsec;
-  ctime_nanoseconds = current.st_ctimespec.tv_nsec;
-#elif defined(__linux__) || defined(__FreeBSD__)
-  mtime_nanoseconds = current.st_mtim.tv_nsec;
-  ctime_nanoseconds = current.st_ctim.tv_nsec;
-#endif
-  return source->device == current.st_dev &&
-      source->inode == current.st_ino &&
-      source->file_size == current.st_size &&
-      source->mtime_seconds == mtime_seconds &&
-      source->mtime_nanoseconds == mtime_nanoseconds &&
-      source->ctime_seconds == ctime_seconds &&
-      source->ctime_nanoseconds == ctime_nanoseconds;
+  return stat_file_identity_equal(
+      &source->file_stat, &current);
 }
 
 static index_shard_inverse_cache_entry_t*
@@ -196,7 +144,6 @@ static void index_shard_inverse_cache_free_entry(
     return;
   }
   free(entry->inverse_perm);
-  free(entry->filename);
   free(entry);
 }
 
@@ -274,9 +221,8 @@ static anbool index_shard_inverse_cache_make_room(
     assert(pool->inverse_cache_bytes >= oldest->bytes);
     pool->inverse_cache_bytes -= oldest->bytes;
     pool->inverse_cache_evicted++;
-    logverb("[index-shard] inverse-cache state=evict index=%s "
+    logverb("[index-shard] inverse-cache state=evict "
             "bytes=%zu used=%zu budget=%zu\n",
-            oldest->filename ? oldest->filename : "(unnamed)",
             oldest->bytes,
             pool->inverse_cache_bytes,
             pool->inverse_cache_budget);
@@ -327,11 +273,10 @@ static void index_shard_inverse_prepare_callback(
     lease->borrowed = TRUE;
     pool->inverse_cache_hits++;
     logverb("[index-shard] inverse-cache state=hit index=%s "
-            "bytes=%zu generation=%lu\n",
+            "bytes=%zu\n",
             lease->source.filename ?
                 lease->source.filename : "(unnamed)",
-            entry->bytes,
-            lease->generation_seen);
+            entry->bytes);
     pthread_mutex_unlock(&pool->inverse_cache_mutex);
     return;
   }
@@ -445,10 +390,8 @@ void index_shard_inverse_cache_attach(
     return;
   }
   lease->source_valid = TRUE;
-  lease->initially_empty = TRUE;
   lease->pool = pool;
   lease->starkd = index->starkd;
-  lease->generation_seen = ctx->generation_seen;
   if (!startree_set_inverse_perm_callbacks(
           index->starkd,
           index_shard_inverse_prepare_callback,
@@ -540,8 +483,7 @@ void index_shard_inverse_cache_release(
     return;
   }
 
-  if (!lease->initially_empty ||
-      !starkd->inverse_perm ||
+  if (!starkd->inverse_perm ||
       !starkd->inverse_perm_owned ||
       !lease->allocation_completed ||
       !lease->active_reserved ||
@@ -551,15 +493,7 @@ void index_shard_inverse_cache_release(
           &lease->source) ||
       !index_shard_inverse_entry_matches(
           &(index_shard_inverse_cache_entry_t){
-              .device = lease->source.device,
-              .inode = lease->source.inode,
-              .file_size = lease->source.file_size,
-              .mtime_seconds = lease->source.mtime_seconds,
-              .mtime_nanoseconds =
-                  lease->source.mtime_nanoseconds,
-              .ctime_seconds = lease->source.ctime_seconds,
-              .ctime_nanoseconds =
-                  lease->source.ctime_nanoseconds,
+              .file_stat = lease->source.file_stat,
               .ndata = lease->source.ndata,
               .ndim = lease->source.ndim,
               .treetype = lease->source.treetype,
@@ -584,24 +518,7 @@ void index_shard_inverse_cache_release(
     pthread_mutex_unlock(&pool->inverse_cache_mutex);
     return;
   }
-  entry->filename = strdup(
-      source_now.filename ? source_now.filename : "(unnamed)");
-  if (!entry->filename) {
-    free(entry);
-    pthread_mutex_lock(&pool->inverse_cache_mutex);
-    index_shard_inverse_active_release_locked(
-        pool, lease);
-    pool->inverse_cache_refused++;
-    pthread_mutex_unlock(&pool->inverse_cache_mutex);
-    return;
-  }
-  entry->device = source_now.device;
-  entry->inode = source_now.inode;
-  entry->file_size = source_now.file_size;
-  entry->mtime_seconds = source_now.mtime_seconds;
-  entry->mtime_nanoseconds = source_now.mtime_nanoseconds;
-  entry->ctime_seconds = source_now.ctime_seconds;
-  entry->ctime_nanoseconds = source_now.ctime_nanoseconds;
+  entry->file_stat = source_now.file_stat;
   entry->ndata = source_now.ndata;
   entry->ndim = source_now.ndim;
   entry->treetype = source_now.treetype;
@@ -647,12 +564,11 @@ void index_shard_inverse_cache_release(
   pthread_mutex_unlock(&pool->inverse_cache_mutex);
 
   logverb("[index-shard] inverse-cache state=admit index=%s "
-          "bytes=%zu used=%zu budget=%zu generation=%lu\n",
+          "bytes=%zu used=%zu budget=%zu\n",
           log_name ? log_name : "(unnamed)",
           admitted_bytes,
           cache_bytes,
-          pool->inverse_cache_budget,
-          ctx->generation_seen);
+          pool->inverse_cache_budget);
 }
 
 void index_shard_inverse_cache_destroy(

@@ -21,12 +21,11 @@
 #include "log.h"
 #include "mathutil.h"
 #include "onefield_internal.h"
+#include "solver_field_geometry_internal.h"
 #include "os-features.h"
 #include "permutedsort.h"
 #include "tic.h"
 #include "verify.h"
-
-// SECTION INDEX-SHARD: bridge
 
 static index_shard_hook_result_t onefield_index_shard_hook_result(
     index_shard_hook_outcome_t outcome,
@@ -36,7 +35,6 @@ static index_shard_hook_result_t onefield_index_shard_hook_result(
   return result;
 }
 
-// ANCHOR INDEX-SHARD: bridge-get-index
 static index_shard_hook_result_t onefield_index_shard_get_index(
     onefield_t *bp,
     size_t index_order,
@@ -54,37 +52,13 @@ static index_shard_hook_result_t onefield_index_shard_get_index(
 
   if (index_order < (size_t)sl_size(bp->indexnames)) {
     const char *index_name = sl_get(bp->indexnames, index_order);
-    size_t worker_stride =
-        bp->index_shard_workers > 1
-            ? (size_t)bp->index_shard_workers
-            : 1U;
 
-    index = onefield_internal_job_index_cache_get(
-        bp,
-        index_name);
+    index = index_load(index_name, bp->index_options, NULL);
     if (!index) {
       ERROR("Failed to load index %s", index_name);
       return onefield_index_shard_hook_result(
           INDEX_SHARD_HOOK_TASK_LOCAL_FAILURE,
           -1);
-    }
-
-    /*
-     * Preparing one worker-width ahead overlaps mapping setup without claiming
-     * that future index. The single prepared handoff transfers to the first
-     * exact claimant and is freed when that worker finishes the index task.
-     */
-    if (index_order <= SIZE_MAX - worker_stride) {
-      size_t prepare_order =
-          index_order + worker_stride;
-
-      if (prepare_order <
-          (size_t)sl_size(bp->indexnames)) {
-        onefield_internal_job_index_cache_prepare(
-            bp,
-            sl_get(bp->indexnames,
-                   prepare_order));
-      }
     }
 
     *index_out = index;
@@ -114,7 +88,6 @@ static index_shard_hook_result_t onefield_index_shard_get_index(
       0);
 }
 
-// ANCHOR INDEX-SHARD: bridge-done-with-index
 static index_shard_hook_result_t
 onefield_index_shard_done_with_index(
     onefield_t *bp,
@@ -125,17 +98,12 @@ onefield_index_shard_done_with_index(
         INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
         -1);
   }
-  if (onefield_internal_done_with_index(bp, index_order, index)) {
-    return onefield_index_shard_hook_result(
-        INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
-        -1);
-  }
+  onefield_internal_done_with_index(bp, index_order, index);
   return onefield_index_shard_hook_result(
       INDEX_SHARD_HOOK_COMPLETED_UNSOLVED,
       0);
 }
 
-// ANCHOR INDEX-SHARD: bridge-report-committed-solution
 static int onefield_index_shard_report_committed_solution(
     onefield_t *bp,
     size_t index_order,
@@ -174,15 +142,12 @@ static int onefield_index_shard_report_committed_solution(
   return 0;
 }
 
-// ANCHOR INDEX-SHARD: bridge-prepare-shared-field
 /*
  * Prepare the immutable field representation once on the pass owner. Worker
  * solvers borrow these pointers and release only their private task state.
  */
 int onefield_index_shard_prepare_job_field_for_run(
     onefield_t *bp) {
-  double field_read_seconds = 0.0;
-  double preprocess_seconds = 0.0;
   int fieldnum;
 
   if (!bp || il_size(bp->fieldlist) != 1) {
@@ -193,11 +158,7 @@ int onefield_index_shard_prepare_job_field_for_run(
   fieldnum = il_get(bp->fieldlist, 0);
   bp->fieldnum = fieldnum;
 
-  if (onefield_internal_prepare_field_view(
-          bp,
-          fieldnum,
-          &field_read_seconds,
-          &preprocess_seconds)) {
+  if (onefield_internal_prepare_field_view(bp, fieldnum)) {
     return -1;
   }
   if (!onefield_internal_field_cache_valid(bp)) {
@@ -215,11 +176,8 @@ int onefield_index_shard_prepare_job_field_for_run(
             "fallback=native\n");
   }
 
-  logverb("[onefield] shared-field-cache=job-owned field=%i "
-          "read=%.6f preprocess=%.6f\n",
-          fieldnum,
-          field_read_seconds,
-          preprocess_seconds);
+  logverb("[onefield] shared-field-cache=job-owned field=%i\n",
+          fieldnum);
 
   return 0;
 }
@@ -227,6 +185,7 @@ int onefield_index_shard_prepare_job_field_for_run(
 typedef struct onefield_index_shard_worker_view {
   solver_t solver;
   struct stat source_identity;
+  /* Borrowed from the master until every worker has quiesced. */
   char *fieldfname;
   char *indexrdlsfname;
   char *corr_fname;
@@ -242,7 +201,6 @@ typedef struct onefield_index_shard_worker_view {
   int nsolves;
   int fieldnum;
   int fieldid;
-  anbool xyls_tagalong_all;
 } onefield_index_shard_worker_view_t;
 
 /*
@@ -304,45 +262,10 @@ static void onefield_index_shard_initialize_local_solver(
   local->vf = base->vf;
   local->field_geometry = base->field_geometry;
   local->field_geometry_owned = FALSE;
-  local->index_mmap_policy = base->index_mmap_policy;
 
   solver_reset_counters(local);
   local->num_meanx_skipped = 0;
   solver_reset_best_match(local);
-}
-
-static int onefield_index_shard_duplicate_optional(
-    char **destination,
-    const char *source) {
-  if (!destination) {
-    return -1;
-  }
-  *destination = NULL;
-  if (!source) {
-    return 0;
-  }
-  *destination = strdup(source);
-  return *destination ? 0 : -1;
-}
-
-static void onefield_index_shard_destroy_worker_view(
-    void *opaque) {
-  onefield_index_shard_worker_view_t *view = opaque;
-
-  if (!view) {
-    return;
-  }
-  free(view->fieldfname);
-  free(view->indexrdlsfname);
-  free(view->corr_fname);
-  free(view->scamp_fname);
-  free(view->solved_in);
-  free(view->xcolname);
-  free(view->ycolname);
-  free(view->fieldid_key);
-  free(view->sort_rdls);
-  free(view->cancelfname);
-  free(view);
 }
 
 static int onefield_index_shard_create_worker_view(
@@ -370,8 +293,7 @@ static int onefield_index_shard_create_worker_view(
     return -1;
   }
   fieldnum = il_get_const(master->fieldlist, 0);
-  if (!onefield_internal_field_cache_valid(master) ||
-      !onefield_field_cache_key_matches(
+  if (!onefield_field_cache_key_matches(
           master, fieldnum, &source_identity)) {
     return -1;
   }
@@ -388,31 +310,16 @@ static int onefield_index_shard_create_worker_view(
   view->nsolves = master->nsolves;
   view->fieldnum = fieldnum;
   view->fieldid = master->fieldid;
-  view->xyls_tagalong_all = master->xyls_tagalong_all;
-
-  if (onefield_index_shard_duplicate_optional(
-          &view->fieldfname, master->fieldfname) ||
-      onefield_index_shard_duplicate_optional(
-          &view->indexrdlsfname, master->indexrdlsfname) ||
-      onefield_index_shard_duplicate_optional(
-          &view->corr_fname, master->corr_fname) ||
-      onefield_index_shard_duplicate_optional(
-          &view->scamp_fname, master->scamp_fname) ||
-      onefield_index_shard_duplicate_optional(
-          &view->solved_in, master->solved_in) ||
-      onefield_index_shard_duplicate_optional(
-          &view->xcolname, master->xcolname) ||
-      onefield_index_shard_duplicate_optional(
-          &view->ycolname, master->ycolname) ||
-      onefield_index_shard_duplicate_optional(
-          &view->fieldid_key, master->fieldid_key) ||
-      onefield_index_shard_duplicate_optional(
-          &view->sort_rdls, master->sort_rdls) ||
-      onefield_index_shard_duplicate_optional(
-          &view->cancelfname, master->cancelfname)) {
-    onefield_index_shard_destroy_worker_view(view);
-    return -1;
-  }
+  view->fieldfname = master->fieldfname;
+  view->indexrdlsfname = master->indexrdlsfname;
+  view->corr_fname = master->corr_fname;
+  view->scamp_fname = master->scamp_fname;
+  view->solved_in = master->solved_in;
+  view->xcolname = master->xcolname;
+  view->ycolname = master->ycolname;
+  view->fieldid_key = master->fieldid_key;
+  view->sort_rdls = master->sort_rdls;
+  view->cancelfname = master->cancelfname;
 
   *worker_view_out = view;
   return 0;
@@ -441,11 +348,40 @@ static void onefield_index_shard_initialize_local_params(
   local->rdls_tagalong_all = FALSE;
   local->sort_rdls = view->sort_rdls;
   local->xyls_tagalong = NULL;
-  local->xyls_tagalong_all = view->xyls_tagalong_all;
+  local->xyls_tagalong_all = TRUE;
   local->cancelfname = view->cancelfname;
 }
 
-// ANCHOR INDEX-SHARD: bridge-prepare-local-context
+static void onefield_index_shard_release_local_context(
+    onefield_t *local_bp) {
+  if (!local_bp) {
+    return;
+  }
+  local_bp->solver.mo_template = NULL;
+  local_bp->solver.record_match_callback = NULL;
+  local_bp->solver.timer_callback = NULL;
+  local_bp->solver.userdata = NULL;
+  solver_clear_indexes(&local_bp->solver);
+
+  /* Field storage is borrowed from the master for one complete pass. */
+  local_bp->solver.fieldxy_orig = NULL;
+  local_bp->solver.fieldxy = NULL;
+  local_bp->solver.vf = NULL;
+  local_bp->solver.field_geometry = NULL;
+  local_bp->solver.field_geometry_owned = FALSE;
+  solver_cleanup_field(&local_bp->solver);
+
+  if (local_bp->xyls) {
+    xylist_close(local_bp->xyls);
+    local_bp->xyls = NULL;
+  }
+  if (local_bp->solver.indexes) {
+    pl_free(local_bp->solver.indexes);
+    local_bp->solver.indexes = NULL;
+  }
+  local_bp->solutions = NULL;
+}
+
 static int onefield_index_shard_prepare_local_context(onefield_t *local_bp,
                                                       const void *opaque) {
   const onefield_index_shard_worker_view_t *view = opaque;
@@ -464,38 +400,6 @@ static int onefield_index_shard_prepare_local_context(onefield_t *local_bp,
     return -1;
   }
 
-  local_bp->solver.index = NULL;
-  local_bp->solver.mo_template = NULL;
-  local_bp->solver.record_match_callback = NULL;
-  local_bp->solver.timer_callback = NULL;
-  local_bp->solver.userdata = NULL;
-  local_bp->solver.quit_now = FALSE;
-  memset(&local_bp->solver.profile,
-         0,
-         sizeof(local_bp->solver.profile));
-
-  solver_reset_counters(&local_bp->solver);
-  solver_reset_best_match(&local_bp->solver);
-
-  local_bp->solutions = NULL;
-  local_bp->solved_out = NULL;
-  local_bp->solved_fields_pending = NULL;
-
-  local_bp->single_field_solved = FALSE;
-  local_bp->solver_failed = FALSE;
-  local_bp->nsolves_sofar = 0;
-
-  local_bp->hit_cpulimit = FALSE;
-  local_bp->hit_total_cpulimit = FALSE;
-  local_bp->hit_timelimit = FALSE;
-  local_bp->hit_total_timelimit = FALSE;
-  local_bp->cancelled = FALSE;
-
-  local_bp->cpulimit = 0.0;
-  local_bp->total_cpulimit = 0.0;
-  local_bp->timelimit = 0.0;
-  local_bp->total_timelimit = 0.0;
-
   if (!view->solver.fieldxy_orig ||
       !view->solver.fieldxy ||
       !view->solver.vf) {
@@ -504,9 +408,8 @@ static int onefield_index_shard_prepare_local_context(onefield_t *local_bp,
   }
 
   fieldnum = view->fieldnum;
-  local_bp->fieldnum = fieldnum;
   if (stat(view->fieldfname, &source_stat_after) ||
-      !onefield_internal_same_source_identity(
+      !stat_file_identity_equal(
           &view->source_identity, &source_stat_after)) {
     logerr("[index-shard] worker field source changed before "
            "local view preparation\n");
@@ -534,7 +437,7 @@ static int onefield_index_shard_prepare_local_context(onefield_t *local_bp,
     goto fail;
   }
   if (stat(view->fieldfname, &source_stat_after) ||
-      !onefield_internal_same_source_identity(
+      !stat_file_identity_equal(
           &view->source_identity, &source_stat_after)) {
     logerr("[index-shard] worker field source changed during "
            "local view preparation\n");
@@ -547,28 +450,10 @@ static int onefield_index_shard_prepare_local_context(onefield_t *local_bp,
   return 0;
 
 fail:
-  /* Never release master-owned field data from a worker error path. */
-  local_bp->solver.fieldxy_orig = NULL;
-  local_bp->solver.fieldxy = NULL;
-  local_bp->solver.vf = NULL;
-  local_bp->solver.field_geometry = NULL;
-  local_bp->solver.field_geometry_owned = FALSE;
-  solver_cleanup_field(&local_bp->solver);
-
-  if (local_bp->xyls) {
-    xylist_close(local_bp->xyls);
-    local_bp->xyls = NULL;
-  }
-
-  if (local_bp->solver.indexes) {
-    pl_free(local_bp->solver.indexes);
-    local_bp->solver.indexes = NULL;
-  }
-
+  onefield_index_shard_release_local_context(local_bp);
   return -1;
 }
 
-// ANCHOR INDEX-SHARD: bridge-reset-local-context
 static void
 onefield_index_shard_reset_local_context_for_task(onefield_t *local_bp,
                                                   bl *local_solutions) {
@@ -597,40 +482,6 @@ onefield_index_shard_reset_local_context_for_task(onefield_t *local_bp,
   solver_clear_indexes(&local_bp->solver);
 }
 
-// ANCHOR INDEX-SHARD: bridge-cleanup-local-context
-static void onefield_index_shard_cleanup_local_context(onefield_t *local_bp) {
-  if (!local_bp) {
-    return;
-  }
-
-  local_bp->solver.mo_template = NULL;
-  local_bp->solver.record_match_callback = NULL;
-  local_bp->solver.timer_callback = NULL;
-  local_bp->solver.userdata = NULL;
-
-  solver_clear_indexes(&local_bp->solver);
-
-  /* Field storage is owned by the master solver for the pass. */
-  local_bp->solver.fieldxy_orig = NULL;
-  local_bp->solver.fieldxy = NULL;
-  local_bp->solver.vf = NULL;
-  local_bp->solver.field_geometry = NULL;
-  local_bp->solver.field_geometry_owned = FALSE;
-  solver_cleanup_field(&local_bp->solver);
-
-  if (local_bp->xyls) {
-    xylist_close(local_bp->xyls);
-    local_bp->xyls = NULL;
-  }
-
-  if (local_bp->solver.indexes) {
-    pl_free(local_bp->solver.indexes);
-    local_bp->solver.indexes = NULL;
-  }
-
-  local_bp->solutions = NULL;
-}
-
 /*
  * Run one index against the immutable field representation prepared once by
  * the pass owner. The owner-visible MatchObj template and every solver counter
@@ -641,7 +492,6 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
   solver_t *sp = &local_bp->solver;
   MatchObj template;
   qfits_header *fieldhdr;
-  double field_wall_start;
   anbool interrupted_by_parallel_stop = FALSE;
   int fieldnum = local_bp->fieldnum;
 
@@ -675,8 +525,6 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
   sp->distance_from_quad_bonus = TRUE;
 
   local_bp->nsolves_sofar = 0;
-  field_wall_start = monotonic_seconds();
-
   logverb("Solving field %i.\n", fieldnum);
   solver_log_params(sp);
 
@@ -700,14 +548,6 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
   sp->record_match_callback = NULL;
   sp->timer_callback = NULL;
   sp->userdata = NULL;
-
-  logverb("[onefield-field-profile] field=%i read=0.000000 "
-          "preprocess=0.000000 solver_run=%.6f total=%.6f "
-          "field_view=job-borrowed failed=%i\n",
-          fieldnum,
-          sp->profile.solver_run_wall_seconds,
-          monotonic_seconds() - field_wall_start,
-          sp->profile.execution_failed ? 1 : 0);
 
   if (local_bp->solver_failed || sp->profile.execution_failed) {
     local_bp->solver_failed = TRUE;
@@ -767,7 +607,6 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
   return 0;
 }
 
-// ANCHOR INDEX-SHARD: bridge-solve-one-index
 static index_shard_hook_result_t
 onefield_index_shard_solve_one_index(
     onefield_t *local_bp,
@@ -814,7 +653,6 @@ onefield_index_shard_solve_one_index(
   return hook_result;
 }
 
-// ANCHOR INDEX-SHARD: bridge-analyze-solutions
 static index_shard_hook_result_t
 onefield_index_shard_analyze_solutions(
     onefield_t *master_bp,
@@ -871,10 +709,10 @@ onefield_index_shard_analyze_solutions(
       0);
 }
 
-// ANCHOR INDEX-SHARD: bridge-disown-matchobj
 static void onefield_index_shard_disown_matchobj(MatchObj *mo) {
-  if (!mo)
+  if (!mo) {
     return;
+  }
 
   mo->sip = NULL;
   mo->refradec = NULL;
@@ -889,7 +727,6 @@ static void onefield_index_shard_disown_matchobj(MatchObj *mo) {
   mo->field_tagalong = NULL;
 }
 
-// ANCHOR INDEX-SHARD: bridge-merge-solutions
 static int onefield_index_shard_merge_solutions(onefield_t *master_bp,
                                                 bl *solutions,
                                                 anbool *solved_out) {
@@ -946,12 +783,12 @@ static int onefield_index_shard_merge_solutions(onefield_t *master_bp,
   return 0;
 }
 
-// ANCHOR INDEX-SHARD: bridge-free-solutions
 static void onefield_index_shard_free_solutions(bl *solutions) {
   int i;
 
-  if (!solutions)
+  if (!solutions) {
     return;
+  }
 
   for (i = 0; i < bl_size(solutions); i++) {
     MatchObj *mo = bl_access(solutions, i);
@@ -962,7 +799,6 @@ static void onefield_index_shard_free_solutions(bl *solutions) {
   bl_free(solutions);
 }
 
-// ANCHOR INDEX-SHARD: bridge-hooks
 static const index_shard_hooks_t onefield_index_shard_hooks = {
     .get_index = onefield_index_shard_get_index,
     .done_with_index = onefield_index_shard_done_with_index,
@@ -971,22 +807,19 @@ static const index_shard_hooks_t onefield_index_shard_hooks = {
 
     .create_worker_view =
         onefield_index_shard_create_worker_view,
-    .destroy_worker_view =
-        onefield_index_shard_destroy_worker_view,
+    .destroy_worker_view = free,
     .prepare_local_context =
         onefield_index_shard_prepare_local_context,
     .reset_local_context_for_task =
         onefield_index_shard_reset_local_context_for_task,
     .cleanup_local_context =
-        onefield_index_shard_cleanup_local_context,
+        onefield_index_shard_release_local_context,
 
     .solve_one_index = onefield_index_shard_solve_one_index,
     .analyze_solutions =
         onefield_index_shard_analyze_solutions,
     .merge_solutions = onefield_index_shard_merge_solutions,
     .free_solutions = onefield_index_shard_free_solutions};
-
-
 
 index_shard_solve_status_t onefield_index_shard_solve(
     onefield_t* bp,

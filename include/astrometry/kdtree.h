@@ -142,10 +142,6 @@ typedef struct kdtree kdtree_t;
 struct kdtree_qres;
 typedef struct kdtree_qres kdtree_qres_t;
 
-struct kdtree_rangesearch_continuation;
-typedef struct kdtree_rangesearch_continuation
-    kdtree_rangesearch_continuation_t;
-
 struct kdtree_funcs {
     void* (*get_data)(const kdtree_t* kd, int i);
     void  (*copy_data_double)(const kdtree_t* kd, int start, int N, double* dest);
@@ -157,28 +153,6 @@ struct kdtree_funcs {
 
     void  (*nearest_neighbour_internal)(const kdtree_t* kd, const void* query, double* bestd2, int* pbest);
     kdtree_qres_t* (*rangesearch)(const kdtree_t* kd, kdtree_qres_t* res, const void* pt, double maxd2, int options);
-
-    /*
-     * Private resumable split-tree range-search implementation.
-     * Public callers continue to use the existing one-call API.
-     */
-    int (*rangesearch_continuation_init)(
-        kdtree_rangesearch_continuation_t* continuation,
-        const kdtree_t* kd,
-        kdtree_qres_t* res,
-        const void* pt,
-        double maxd2,
-        int options);
-
-    int (*rangesearch_continuation_step)(
-        kdtree_rangesearch_continuation_t* continuation,
-        size_t node_budget);
-
-    kdtree_qres_t* (*rangesearch_continuation_finish)(
-        kdtree_rangesearch_continuation_t* continuation);
-
-    void (*rangesearch_continuation_cleanup)(
-        kdtree_rangesearch_continuation_t* continuation);
 
     void (*nodes_contained)(const kdtree_t* kd,
                             const void* querylow, const void* queryhi,

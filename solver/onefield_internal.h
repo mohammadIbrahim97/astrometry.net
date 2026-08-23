@@ -17,16 +17,9 @@
 size_t onefield_internal_index_count(const onefield_t* bp);
 index_t* onefield_internal_get_index(onefield_t* bp, size_t index_order);
 char* onefield_internal_get_index_name(onefield_t* bp, size_t index_order);
-int onefield_internal_done_with_index(onefield_t* bp,
-                                      size_t index_order,
-                                      index_t* index);
-
-index_t* onefield_internal_job_index_cache_get(onefield_t* bp,
-                                               const char* configured_path);
-void onefield_internal_job_index_cache_prepare(
-    onefield_t* bp,
-    const char* configured_path);
-void onefield_internal_job_index_cache_flush(onefield_t* bp);
+void onefield_internal_done_with_index(onefield_t* bp,
+                                       size_t index_order,
+                                       index_t* index);
 
 /*
  * The master owns cached field storage. Worker views borrow it only while the
@@ -34,13 +27,8 @@ void onefield_internal_job_index_cache_flush(onefield_t* bp);
  */
 int onefield_internal_open_master_xyls(onefield_t* bp);
 int onefield_internal_validate_single_field_list(onefield_t* bp);
-anbool onefield_internal_same_source_identity(
-    const struct stat* first,
-    const struct stat* second);
 int onefield_internal_prepare_field_view(onefield_t* bp,
-                                         int fieldnum,
-                                         double* field_read_seconds,
-                                         double* preprocess_seconds);
+                                         int fieldnum);
 void onefield_internal_reset_field_pass_state(onefield_t* bp);
 anbool onefield_internal_field_cache_valid(const onefield_t* bp);
 anbool onefield_internal_field_cache_has_field(const onefield_t* bp,

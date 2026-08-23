@@ -4,7 +4,6 @@
  */
 
 #include <assert.h>
-#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -150,130 +149,6 @@ int verify_index_query_capture_sweep(const startree_t* skdt,
     return 0;
 }
 
-static int verify_mapped_page_buffers_validate(
-    const verify_mapped_page_buffer_t* buffers,
-    size_t buffer_count) {
-    uintptr_t previous_end = 0U;
-    size_t i;
-
-    if (!buffers || !buffer_count) {
-        return -1;
-    }
-    for (i = 0U; i < buffer_count; i++) {
-        uintptr_t begin;
-        uintptr_t end;
-
-        if (!buffers[i].mapping_data || !buffers[i].bytes ||
-            !buffers[i].size) {
-            return -1;
-        }
-        begin = (uintptr_t)buffers[i].mapping_data;
-        if (buffers[i].size > UINTPTR_MAX - begin) {
-            return -1;
-        }
-        end = begin + buffers[i].size;
-        if (i && begin < previous_end) {
-            return -1;
-        }
-        previous_end = end;
-    }
-    return 0;
-}
-
-static int verify_mapped_page_buffer_find(
-    const verify_mapped_page_buffer_t* buffers,
-    size_t buffer_count,
-    uintptr_t target,
-    size_t target_size,
-    const unsigned char** bytes) {
-    size_t low = 0U;
-    size_t high = buffer_count;
-
-    if (!bytes || !target_size) {
-        return -1;
-    }
-    *bytes = NULL;
-    while (low < high) {
-        size_t middle = low + (high - low) / 2U;
-        uintptr_t begin = (uintptr_t)buffers[middle].mapping_data;
-        uintptr_t end = begin + buffers[middle].size;
-
-        if (target < begin) {
-            high = middle;
-            continue;
-        }
-        if (target >= end) {
-            low = middle + 1U;
-            continue;
-        }
-        if (target_size > end - target) {
-            return -1;
-        }
-        *bytes = buffers[middle].bytes + (size_t)(target - begin);
-        return 0;
-    }
-    return -1;
-}
-
-int verify_index_query_capture_sweep_buffers(
-    const startree_t* skdt,
-    verify_index_query_t* query,
-    const verify_mapped_page_buffer_t* buffers,
-    size_t buffer_count) {
-    uint8_t* sweep;
-    size_t count;
-    int nstars;
-    int i;
-
-    if (!skdt || !query || query->source != skdt ||
-        !skdt->tree || !skdt->sweep ||
-        query->nrall < 0 ||
-        (query->nrall && !query->refstarid)) {
-        return -1;
-    }
-    if (query->sweep || !query->nrall) {
-        return 0;
-    }
-    if (verify_mapped_page_buffers_validate(
-            buffers, buffer_count)) {
-        return -1;
-    }
-    count = (size_t)query->nrall;
-    if (count > SIZE_MAX / sizeof(*sweep)) {
-        return -1;
-    }
-    sweep = malloc(count * sizeof(*sweep));
-    if (!sweep) {
-        return -1;
-    }
-    nstars = startree_N(skdt);
-    for (i = 0; i < query->nrall; i++) {
-        const unsigned char* bytes;
-        uintptr_t target;
-        int starid = query->refstarid[i];
-
-        if (!(i & 255) &&
-            verify_internal_worker_stop_requested()) {
-            free(sweep);
-            return -1;
-        }
-        if (starid < 0 || starid >= nstars) {
-            free(sweep);
-            return -1;
-        }
-        target = (uintptr_t)(skdt->sweep + starid);
-        if (verify_mapped_page_buffer_find(
-                buffers, buffer_count,
-                target, sizeof(*sweep), &bytes)) {
-            free(sweep);
-            return -1;
-        }
-        memcpy(&sweep[i], bytes, sizeof(*sweep));
-    }
-    query->sweep = sweep;
-    return 0;
-}
-
 void verify_destroy_index_query(verify_index_query_t* query) {
     if (!query) {
         return;
@@ -284,8 +159,6 @@ void verify_destroy_index_query(verify_index_query_t* query) {
     memset(query, 0, sizeof(*query));
     free(query);
 }
-
-
 int verify_prepare_hit_from_query(const startree_t* skdt,
                                   verify_index_query_t** query,
                                   int index_cutnside,
@@ -484,38 +357,6 @@ fail:
     v->refstarid = NULL;
     verify_destroy_prepared_hit(context);
     return -1;
-}
-
-int verify_prepare_hit(const startree_t* skdt, int index_cutnside,
-                       const MatchObj* mo, const sip_t* sip,
-                       const verify_field_t* vf,
-                       double pix2, double distractors,
-                       double fieldW, double fieldH,
-                       double logbail, double logaccept,
-                       double logstoplooking,
-                       anbool do_gamma, anbool fake_match,
-                       verify_prepared_hit_t** prepared) {
-    verify_index_query_t* query = NULL;
-    double fieldr2;
-    int status;
-
-    if (!prepared || !skdt || !mo || !vf ||
-        (!mo->wcs_valid && !sip) ||
-        !isfinite(logaccept) || !isfinite(logbail)) {
-        return -1;
-    }
-    *prepared = NULL;
-    fieldr2 = square(mo->radius);
-    if (verify_query_hit(skdt, mo->center, fieldr2, &query)) {
-        return -1;
-    }
-    status = verify_prepare_hit_from_query(
-        skdt, &query, index_cutnside, mo, sip, vf,
-        pix2, distractors, fieldW, fieldH,
-        logbail, logaccept, logstoplooking,
-        do_gamma, fake_match, prepared);
-    verify_destroy_index_query(query);
-    return status;
 }
 
 int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,
@@ -791,7 +632,7 @@ size_t verify_prepared_hit_peak_bytes(
     /*
      * Scoring retains one conflict array, the packed nearest-neighbor
      * inputs, the result vectors, and at most one nearest-neighbor
-     * workspace. Grid and legacy KD storage never coexist, so use the
+     * workspace. Grid and KD storage never coexist, so use the
      * larger exact payload bound.
      */
     score_peak = verify_prepared_add_bytes(
@@ -829,22 +670,6 @@ size_t verify_prepared_hit_peak_bytes(
         3U * sizeof(double));
     transient_peak = MAX(score_peak, finish_peak);
     return verify_prepared_add_bytes(retained, transient_peak, 1U);
-}
-
-unsigned long long
-verify_prepared_hit_work_units(const verify_prepared_hit_t* prepared) {
-    unsigned long long nr;
-    unsigned long long nt;
-
-    if (!prepared || prepared->state != VERIFY_PREPARED_READY) {
-        return 0U;
-    }
-    nr = (unsigned long long)prepared->verify.NR;
-    nt = (unsigned long long)prepared->verify.NT;
-    if (nr && nt > ULLONG_MAX / nr) {
-        return ULLONG_MAX;
-    }
-    return nr * nt;
 }
 
 void verify_destroy_prepared_score(verify_prepared_score_t* score) {

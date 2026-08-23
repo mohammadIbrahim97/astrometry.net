@@ -180,8 +180,6 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
     }
     bp->logratio_tosolve = log(qfits_header_getdouble(hdr, "ANODDSSL", default_odds_tosolve));
     logverb("Set odds ratio to solve to %g (log = %g)\n", exp(bp->logratio_tosolve), bp->logratio_tosolve);
-
-
     sp->logratio_toprint = log(qfits_header_getdouble(hdr, "ANODDSPR", default_odds_toprint));
     sp->logratio_tokeep = log(qfits_header_getdouble(hdr, "ANODDSKP", default_odds_tokeep));
     sp->logratio_totune = log(qfits_header_getdouble(hdr, "ANODDSTU", default_odds_totune));
@@ -461,7 +459,6 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
         dl_append(job->scales, arcsecperpix);
     }
 
-    // SECTION INDEX-SHARD: limit-precedence
     /*
      * Wall time is the primary user-facing deadline.  A job may reduce the
      * backend wall limit but may not increase it.  CPU time remains aggregate
@@ -536,7 +533,7 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
             /*
              * An empty site default means the original unbounded depth
              * interval. Keep this scientific search space independent of
-             * worker count and of the legacy "inparallel" token.
+             * worker count and of the existing "inparallel" token.
              */
             il_append(job->depths, 0);
             il_append(job->depths, 0);

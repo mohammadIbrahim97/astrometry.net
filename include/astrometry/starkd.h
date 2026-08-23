@@ -207,60 +207,6 @@ qfits_header* startree_header(const startree_t* s);
 
 int startree_get(startree_t* s, int starid, double *p_xyz);
 
-// Compatibility advisory wrapper. Returns zero unless validation or delivery
-// fails. The subsequent mapped lookup remains authoritative.
-int startree_prefetch_stars(startree_t* s,
-                            const unsigned int* starids,
-                            int nstars);
-
-// Strict internal preparation contract: positive means every requested row is
-// ready, zero means inapplicable, and -1 means complete preparation failed.
-int startree_prepare_stars(startree_t* s,
-                           const unsigned int* starids,
-                           int nstars);
-
-/*
- * Submit a complete bounded set of StarKD coordinate rows to the payload
- * loader. The returned ticket must be waited or cancelled before the tree is
- * closed. FITSBIN_PAYLOAD_IO_SUBMIT_READY returns without a ticket when the
- * exact live-mapping completion record already covers every requested page.
- * Refusal leaves the original mapped lookup authoritative.
- */
-int startree_prefetch_stars_submit(
-    startree_t* s,
-    const unsigned int* starids,
-    int nstars,
-    fitsbin_payload_io_ticket_t** ticket);
-
-/*
- * Submit exact StarKD rows only when canonical IDs already have an immutable
- * data-index mapping. Unlike startree_prefetch_stars_submit(), this helper
- * never constructs or publishes the lazy inverse permutation. It uses the
- * same queued-versus-immediate-ready return contract.
- */
-int startree_prefetch_stars_ready_submit(
-    const startree_t* s,
-    const unsigned int* starids,
-    int nstars,
-    fitsbin_payload_io_ticket_t** ticket);
-
-/* Copy one row without constructing the lazy inverse permutation. */
-int startree_get_ready(
-    const startree_t* s,
-    int starid,
-    double* posn);
-
-/*
- * Advise mapped coordinate rows for selected canonical star IDs. If a tree
- * needs an inverse permutation that has not already been built, this
- * advisory operation declines the request rather than constructing it. It
- * returns the number of advised spans, zero when inapplicable, or -1 on
- * invalid input or advice failure.
- */
-int startree_advise_rows(startree_t* s,
-                         const unsigned int* starids,
-                         int nstars);
-
 int startree_get_radec(startree_t* s, int starid, double *p_ra, double *p_dec);
 
 int startree_close(startree_t* s);

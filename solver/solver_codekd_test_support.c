@@ -77,6 +77,7 @@ int solver_codekd_test_run_nonresident_fallback(
     solver_codekd_test_fallback_result_t* result) {
     fitsbin_t source;
     quadfile_t quads;
+    solver_codekd_phase_context_t phase;
     solver_codekd_search_packet_t packet;
     solver_candidate_delivery_record_t record;
     uint32_t quadrow[DQMAX];
@@ -88,15 +89,17 @@ int solver_codekd_test_run_nonresident_fallback(
     memset(result, 0, sizeof(*result));
     memset(&source, 0, sizeof(source));
     memset(&quads, 0, sizeof(quads));
+    memset(&phase, 0, sizeof(phase));
     memset(&packet, 0, sizeof(packet));
     memset(&record, 0, sizeof(record));
     memset(quadrow, 0, sizeof(quadrow));
     source.mmap_prefetch_enabled = FALSE;
-    source.payload_fully_resident = FALSE;
     quads.numquads = 1U;
     quads.dimquads = DQMAX;
     quads.fb = &source;
     quads.quadarray = quadrow;
+    phase.quads = &quads;
+    packet.phase = &phase;
     packet.candidate_records = &record;
     packet.inds = &quadid;
     packet.candidate_count = 1U;
@@ -110,51 +113,10 @@ int solver_codekd_test_run_nonresident_fallback(
         packet.state == SOLVER_CODEKD_PACKET_RESULTS_READY;
     result->quad_compute_ready =
         packet.state == SOLVER_CODEKD_PACKET_QUAD_COMPUTE_READY;
-    result->quad_fallback = packet.candidate_quad_fallback;
     result->quad_delivery_disabled =
         packet.candidate_quad_delivery_disabled;
     result->star_delivery_disabled =
         packet.candidate_star_delivery_disabled;
-    result->quad_submitted = packet.candidate_quad_submitted;
-    result->quad_ready = packet.candidate_quad_ready;
     result->has_delivery_ticket = packet.delivery_ticket != NULL;
-    result->has_delivery_source = packet.delivery_source != NULL;
-    return 0;
-}
-
-int solver_codekd_test_run_verification_reserve(
-    solver_codekd_test_reserve_result_t* result) {
-    solver_verification_packet_t packet;
-    size_t impossible_candidates =
-        SOLVER_AB_CANDIDATE_LIMIT_BYTES /
-            sizeof(solver_ab_candidate_t) +
-        1U;
-
-    if (!result) {
-        return -1;
-    }
-    memset(result, 0, sizeof(*result));
-    memset(&packet, 0, sizeof(packet));
-    result->maximum_capacity =
-        SOLVER_AB_CANDIDATE_LIMIT_BYTES /
-        sizeof(*packet.candidates);
-    result->initial_status =
-        (solver_codekd_test_reserve_status_t)
-        solver_verification_packet_reserve(&packet, 1U);
-    result->initial_capacity = packet.candidate_capacity;
-    if (result->initial_status != SOLVER_CODEKD_TEST_RESERVE_OK ||
-        result->initial_capacity > result->maximum_capacity) {
-        result->allocation_failed = packet.allocation_failed;
-        solver_verification_packet_free(&packet);
-        return 0;
-    }
-    result->oversized_status =
-        (solver_codekd_test_reserve_status_t)
-        solver_verification_packet_reserve(
-            &packet,
-            impossible_candidates);
-    result->final_capacity = packet.candidate_capacity;
-    result->allocation_failed = packet.allocation_failed;
-    solver_verification_packet_free(&packet);
     return 0;
 }

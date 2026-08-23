@@ -14,7 +14,6 @@
 #include "errors.h"
 #include "cutest.h"
 #include "kdtree.h"
-#include "kdtree_continuation_internal.h"
 #include "mathutil.h"
 #include "an-fls.h"
 
@@ -259,60 +258,6 @@ void test_nlevels(CuTest* ct) {
     CuAssertIntEquals(ct, 10, kdtree_nnodes_to_nlevels(1023));
 }
 
-static void run_continuation_to_completion(
-    CuTest* ct,
-    const kdtree_t* kd,
-    const double* query,
-    double maxd2,
-    int options,
-    size_t node_budget,
-    kdtree_qres_t* reuse,
-    kdtree_qres_t** result_out) {
-    kdtree_rangesearch_continuation_t continuation;
-    kdtree_rangesearch_continuation_init_status_t init_status;
-    kdtree_rangesearch_continuation_status_t status;
-
-    CuAssertPtrNotNull(ct, result_out);
-    *result_out = NULL;
-
-    kdtree_rangesearch_continuation_zero(&continuation);
-
-    init_status = kdtree_rangesearch_continuation_init(
-        &continuation,
-        kd,
-        reuse,
-        query,
-        maxd2,
-        options);
-
-    CuAssertIntEquals(
-        ct,
-        KDTREE_RANGESEARCH_CONTINUATION_INIT_OK,
-        init_status);
-
-    do {
-        status = kdtree_rangesearch_continuation_step(
-            &continuation,
-            node_budget);
-    } while (status == KDTREE_RANGESEARCH_CONTINUATION_MORE);
-
-    CuAssertIntEquals(
-        ct,
-        KDTREE_RANGESEARCH_CONTINUATION_DONE,
-        status);
-
-    *result_out = kdtree_rangesearch_continuation_finish(
-        &continuation);
-
-    CuAssertPtrNotNull(ct, *result_out);
-    CuAssert(
-        ct,
-        "continuation must visit at least the root",
-        continuation.nodes_visited > 0);
-
-    kdtree_rangesearch_continuation_cleanup(&continuation);
-}
-
 static void assert_query_indices_and_distances_equal(
     CuTest* ct,
     const kdtree_qres_t* expected,
@@ -336,41 +281,6 @@ static void assert_query_indices_and_distances_equal(
     }
 }
 
-static void assert_query_results_equal(
-    CuTest* ct,
-    const kdtree_qres_t* expected,
-    const kdtree_qres_t* actual,
-    int dimension) {
-    unsigned int i;
-    int d;
-
-    CuAssertPtrNotNull(ct, expected);
-    CuAssertPtrNotNull(ct, actual);
-    CuAssertIntEquals(ct, (int)expected->nres, (int)actual->nres);
-
-    for (i = 0; i < expected->nres; i++) {
-        CuAssertIntEquals(
-            ct,
-            (int)expected->inds[i],
-            (int)actual->inds[i]);
-
-        CuAssert(
-            ct,
-            "continuation squared distance differs",
-            expected->sdists[i] == actual->sdists[i]);
-
-        for (d = 0; d < dimension; d++) {
-            CuAssert(
-                ct,
-                "continuation result point differs",
-                expected->results.d[(size_t)i * (size_t)dimension +
-                                    (size_t)d] ==
-                actual->results.d[(size_t)i * (size_t)dimension +
-                                  (size_t)d]);
-        }
-    }
-}
-
 void test_rangesearch_index_distance_only(CuTest* ct) {
     const int N = 257;
     const int D = 4;
@@ -386,7 +296,6 @@ void test_rangesearch_index_distance_only(CuTest* ct) {
     kdtree_qres_t* with_points;
     kdtree_qres_t* without_points;
     kdtree_qres_t* reuse;
-    kdtree_qres_t* continuation;
     kdtree_qres_t* defaults;
     int i;
     int d;
@@ -466,24 +375,6 @@ void test_rangesearch_index_distance_only(CuTest* ct) {
         without_points,
         reuse);
 
-    continuation = kdtree_rangesearch_continuation_execute(
-        kd,
-        NULL,
-        query,
-        0.08,
-        base_options,
-        KDTREE_RANGESEARCH_CONTINUATION_RUN_TO_COMPLETION);
-
-    CuAssertPtrNotNull(ct, continuation);
-    CuAssert(
-        ct,
-        "continuation must honor index-and-distance-only output",
-        continuation->results.any == NULL);
-    assert_query_indices_and_distances_equal(
-        ct,
-        without_points,
-        continuation);
-
     defaults = kdtree_rangesearch(kd, query, 0.08);
     CuAssertPtrNotNull(ct, defaults);
     CuAssertPtrNotNull(ct, defaults->results.any);
@@ -493,134 +384,8 @@ void test_rangesearch_index_distance_only(CuTest* ct) {
         defaults);
 
     kdtree_free_query(defaults);
-    kdtree_free_query(continuation);
     kdtree_free_query(reuse);
     kdtree_free_query(without_points);
-    kdtree_free(kd);
-}
-
-void test_rangesearch_continuation_split_parity(CuTest* ct) {
-    const int N = 257;
-    const int D = 4;
-    const int Nleaf = 8;
-    const int options =
-        KD_OPTIONS_SMALL_RADIUS |
-        KD_OPTIONS_COMPUTE_DISTS |
-        KD_OPTIONS_RETURN_POINTS |
-        KD_OPTIONS_NO_RESIZE_RESULTS |
-        KD_OPTIONS_USE_SPLIT;
-
-    double query[4] = {0.47, 0.51, 0.39, 0.62};
-    double* data;
-    kdtree_t* kd;
-    kdtree_qres_t* one_shot;
-    kdtree_qres_t* fast_path;
-    kdtree_qres_t* stepped_one;
-    kdtree_qres_t* stepped_seven;
-    kdtree_qres_t* stepped_reuse;
-    kdtree_qres_t* reuse;
-    double reuse_seed_query[4] = {0.12, 0.18, 0.24, 0.30};
-    int i;
-    int d;
-
-    data = malloc((size_t)N * (size_t)D * sizeof(double));
-    CuAssertPtrNotNull(ct, data);
-
-    for (i = 0; i < N; i++) {
-        for (d = 0; d < D; d++) {
-            unsigned int value =
-                (unsigned int)(i * 37 + d * 53 + i * d * 11);
-
-            data[(size_t)i * (size_t)D + (size_t)d] =
-                (double)(value % 997U) / 996.0;
-        }
-    }
-
-    kd = kdtree_build(
-        NULL,
-        data,
-        N,
-        D,
-        Nleaf,
-        KDTT_DSS,
-        KD_BUILD_SPLIT | KD_BUILD_SPLITDIM);
-
-    CuAssertPtrNotNull(ct, kd);
-    free(data);
-
-    one_shot = kdtree_rangesearch_options_reuse(
-        kd,
-        NULL,
-        query,
-        0.08,
-        options);
-
-    CuAssertPtrNotNull(ct, one_shot);
-
-    fast_path = kdtree_rangesearch_continuation_execute(
-        kd,
-        NULL,
-        query,
-        0.08,
-        options,
-        KDTREE_RANGESEARCH_CONTINUATION_RUN_TO_COMPLETION);
-
-    CuAssertPtrNotNull(ct, fast_path);
-
-    run_continuation_to_completion(
-        ct,
-        kd,
-        query,
-        0.08,
-        options,
-        1,
-        NULL,
-        &stepped_one);
-
-    run_continuation_to_completion(
-        ct,
-        kd,
-        query,
-        0.08,
-        options,
-        7,
-        NULL,
-        &stepped_seven);
-
-    reuse = kdtree_rangesearch_options_reuse(
-        kd,
-        NULL,
-        reuse_seed_query,
-        0.01,
-        options);
-
-    CuAssertPtrNotNull(ct, reuse);
-
-    run_continuation_to_completion(
-        ct,
-        kd,
-        query,
-        0.08,
-        options,
-        3,
-        reuse,
-        &stepped_reuse);
-
-    CuAssert(
-        ct,
-        "continuation must preserve the caller's reuse object",
-        stepped_reuse == reuse);
-
-    assert_query_results_equal(ct, one_shot, fast_path, D);
-    assert_query_results_equal(ct, one_shot, stepped_one, D);
-    assert_query_results_equal(ct, one_shot, stepped_seven, D);
-    assert_query_results_equal(ct, one_shot, stepped_reuse, D);
-
-    kdtree_free_query(stepped_reuse);
-    kdtree_free_query(fast_path);
-    kdtree_free_query(stepped_seven);
-    kdtree_free_query(stepped_one);
-    kdtree_free_query(one_shot);
     kdtree_free(kd);
 }
 
@@ -901,4 +666,3 @@ void test_no_lr_with_ints(CuTest* tc) {
 
     errors_free();
 }
-

@@ -14,6 +14,7 @@
 #include "cutest.h"
 #include "kdtree.h"
 #include "kdtree_fits_io.h"
+#include "../util/fitsbin_internal.h"
 
 #include "test_libkd_common.c"
 

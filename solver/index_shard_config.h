@@ -10,11 +10,6 @@
 #define INDEX_SHARD_WORKERS_AUTO 0
 #define INDEX_SHARD_WORKERS_UNSET (-1)
 
-typedef struct index_shard_width_plan {
-  size_t producer_width;
-  size_t helper_width;
-} index_shard_width_plan_t;
-
 /*
  * Return the number of logical CPUs currently available to this process.
  * Linux process affinity is preferred; portable online-CPU detection is the
@@ -43,12 +38,8 @@ int index_shard_config_validate_workers(int requested_workers,
 int index_shard_config_resolve_workers(int requested_workers,
                                        int available_cpus);
 
-/*
- * Return the configured fixed-pool width. nindexes is retained for source
- * compatibility with the preceding implementation.
- */
-int index_shard_config_effective_workers(int configured_workers,
-                                         size_t nindexes);
+/* Return the configured fixed-pool width. */
+int index_shard_config_effective_workers(int configured_workers);
 
 /*
  * Return nonzero only when one pass can use detached exact-demand delivery
@@ -58,10 +49,8 @@ int index_shard_config_exact_demand_pass(
     int detached_completion,
     int payload_io_width,
     int mapped_population_supported,
-    int random_mmap_advice,
     size_t filename_indexes,
-    size_t loaded_indexes,
-    int full_cohort_resident);
+    size_t loaded_indexes);
 
 /*
  * When exact_demand is nonzero, bound simultaneous cold outer owners by
@@ -69,11 +58,10 @@ int index_shard_config_exact_demand_pass(
  * execute staged work. Resident and loaded-index passes use the full outer
  * width. Without detached completion, retain the fixed-helper policy.
  */
-int index_shard_config_plan_widths(
+size_t index_shard_config_producer_width(
     int worker_count,
     int payload_io_width,
     int detached_completion,
-    int exact_demand,
-    index_shard_width_plan_t *plan);
+    int exact_demand);
 
 #endif

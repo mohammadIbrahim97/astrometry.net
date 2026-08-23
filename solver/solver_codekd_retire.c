@@ -57,7 +57,6 @@ solver_codekd_packet_retire_nonwindow_descriptor(
             slot,
             &result_view,
             context->dimquads);
-        context->solver->profile.hypotheses_reduced++;
     } else if (slot->state ==
                SOLVER_CODEKD_RESULT_OWNER_REPLAY) {
         solver_execute_hypothesis_owner(
@@ -76,8 +75,7 @@ solver_codekd_packet_retire_nonwindow_descriptor(
             context->dimquads,
             context->solver,
             descriptor->current_parity,
-            slot->search_errno,
-            slot->search_wall_seconds);
+            slot->search_errno);
     } else {
         packet->state = SOLVER_CODEKD_PACKET_FAILED;
         return INDEX_SHARD_STAGED_RETIRE_ERROR;
@@ -233,6 +231,7 @@ solver_codekd_search_packet_retire_window(
                     context->dimquads,
                     (int)packet->retire_hit_offset,
                     (int)local_end,
+                    packet->phase,
                     NULL,
                     0U,
                     0U,
@@ -249,10 +248,6 @@ solver_codekd_search_packet_retire_window(
                     packet->state = SOLVER_CODEKD_PACKET_FAILED;
                     return INDEX_SHARD_STAGED_RETIRE_ERROR;
                 }
-                packet->candidate_retired_rows +=
-                    processed_count;
-                packet->candidate_native_rows +=
-                    processed_count;
                 packet->retire_hit_offset +=
                     processed_count;
                 packet->candidate_cursor +=
@@ -266,7 +261,6 @@ solver_codekd_search_packet_retire_window(
                 }
                 if (context->solver->quit_now ||
                     solver_poll_worker_stop(context->solver)) {
-                    context->solver->profile.hypotheses_reduced++;
                     (*context->reduced)++;
                     packet->retire_descriptor_started = FALSE;
                     packet->state = SOLVER_CODEKD_PACKET_STOPPED;
@@ -276,7 +270,6 @@ solver_codekd_search_packet_retire_window(
                     packet->state = SOLVER_CODEKD_PACKET_FAILED;
                     return INDEX_SHARD_STAGED_RETIRE_ERROR;
                 }
-                context->solver->profile.hypotheses_reduced++;
                 (*context->reduced)++;
                 packet->retire_descriptor_started = FALSE;
                 packet->retire_hit_offset = 0U;
@@ -333,6 +326,7 @@ solver_codekd_search_packet_retire_window(
                 context->dimquads,
                 (int)packet->retire_hit_offset,
                 (int)local_end,
+                packet->phase,
                 packet->candidate_records +
                     packet->candidate_window_offset,
                 packet->retire_hit_offset,
@@ -348,12 +342,6 @@ solver_codekd_search_packet_retire_window(
                 packet->state = SOLVER_CODEKD_PACKET_FAILED;
                 return INDEX_SHARD_STAGED_RETIRE_ERROR;
             }
-            packet->candidate_retired_rows += processed_count;
-            packet->candidate_native_rows +=
-                processed_count > prepared_star_count
-                ? processed_count -
-                    prepared_star_count
-                : 0U;
             packet->retire_hit_offset += processed_count;
             packet->candidate_cursor += processed_count;
             packet->candidate_window_offset += processed_count;
@@ -364,7 +352,6 @@ solver_codekd_search_packet_retire_window(
             }
             if (context->solver->quit_now ||
                 solver_poll_worker_stop(context->solver)) {
-                context->solver->profile.hypotheses_reduced++;
                 (*context->reduced)++;
                 packet->retire_descriptor_started = FALSE;
                 packet->state = SOLVER_CODEKD_PACKET_STOPPED;
@@ -394,7 +381,6 @@ solver_codekd_search_packet_retire_window(
 
                 if (packet->retire_hit_offset ==
                     (size_t)slot->hit_count) {
-                    context->solver->profile.hypotheses_reduced++;
                     (*context->reduced)++;
                     packet->retire_descriptor_started = FALSE;
                     packet->retire_hit_offset = 0U;
@@ -434,7 +420,6 @@ solver_codekd_search_packet_retire_window(
                 }
                 return INDEX_SHARD_STAGED_RETIRE_MORE;
             }
-            context->solver->profile.hypotheses_reduced++;
             (*context->reduced)++;
             packet->retire_descriptor_started = FALSE;
             packet->retire_hit_offset = 0U;
@@ -495,20 +480,17 @@ solver_codekd_search_packet_retire(
     }
     input = task->input;
     packet = task->output;
-    if (input->descriptor.combination_first != context->next_sequence ||
-        input->descriptor.combination_first >=
-            input->descriptor.combination_end ||
-        packet->sequence != input->descriptor.combination_first ||
+    if (!input->phase ||
+        input->combination_first != context->next_sequence ||
+        input->combination_first >=
+            input->combination_end ||
+        packet->sequence != input->combination_first ||
         packet->state != SOLVER_CODEKD_PACKET_RESULTS_READY ||
         packet->descriptors == NULL ||
         packet->count != packet->descriptors->descriptor_count ||
-        packet->first != 0U ||
         packet->next_descriptor != packet->count ||
         packet->plan_complete || packet->delivery_ticket ||
         packet->pending_descriptor_plan ||
-        packet->pending_descriptor_raw_ranges ||
-        packet->pending_descriptor_logical_bytes ||
-        packet->delivery_source ||
         (packet->candidate_count &&
          packet->candidate_count != packet->hit_count) ||
         (packet->candidate_count && !packet->candidate_records) ||
@@ -536,9 +518,6 @@ solver_codekd_search_packet_retire(
     }
 
     packet->state = SOLVER_CODEKD_PACKET_RETIRING;
-    context->solver->profile.max_batch_hypotheses = MAX(
-        context->solver->profile.max_batch_hypotheses,
-        packet->count);
     if (packet->candidate_count) {
         index_shard_staged_retire_status_t status =
             solver_codekd_search_packet_retire_window(
@@ -548,12 +527,12 @@ solver_codekd_search_packet_retire(
             packet->state = SOLVER_CODEKD_PACKET_RETIRED;
             context->next_task_index++;
             context->next_sequence =
-                input->descriptor.combination_end;
+                input->combination_end;
         }
         return status;
     }
-    end = packet->first + packet->count;
-    for (descriptor_index = packet->first;
+    end = packet->count;
+    for (descriptor_index = 0U;
          descriptor_index < end;
          descriptor_index++) {
         const solver_ab_descriptor_t* descriptor =
@@ -616,8 +595,8 @@ solver_codekd_search_packet_retire(
                 context->dimquads,
                 context->solver,
                 descriptor->current_parity,
+                packet->phase,
                 &result_view,
-                slot->search_wall_seconds,
                 prepared,
                 prepared_quad_count,
                 prepared_star_count);
@@ -639,8 +618,7 @@ solver_codekd_search_packet_retire(
                 context->dimquads,
                 context->solver,
                 descriptor->current_parity,
-                slot->search_errno,
-                slot->search_wall_seconds);
+                slot->search_errno);
         } else {
             packet->state = SOLVER_CODEKD_PACKET_FAILED;
             return INDEX_SHARD_STAGED_RETIRE_ERROR;
@@ -672,6 +650,6 @@ solver_codekd_search_packet_retire(
 
     packet->state = SOLVER_CODEKD_PACKET_RETIRED;
     context->next_task_index++;
-    context->next_sequence = input->descriptor.combination_end;
+    context->next_sequence = input->combination_end;
     return INDEX_SHARD_STAGED_RETIRE_OK;
 }

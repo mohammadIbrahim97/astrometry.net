@@ -116,12 +116,11 @@ ANLIBS := $(ANFILES_LIB) $(LIBKD_LIB) $(ANUTILS_LIB) $(GSL_LIB) $(QFITS_LIB)
 
 INSTALL_LIB := $(ENGINE_LIB) $(ENGINE_SO)
 
-ENGINE_CORE_OBJS := engine.o engine_job.o engine_pass.o engine_policy.o \
-	engine_residency.o
+ENGINE_CORE_OBJS := engine.o engine_job.o engine_pass.o engine_policy.o
 ONEFIELD_OBJS := onefield.o onefield_job_cache.o onefield_index_shard.o
-INDEX_SHARD_OBJS := index_shard.o index_shard_control.o \
-	index_shard_helper.o index_shard_inverse.o index_shard_pass.o \
-	index_shard_pool.o index_shard_profile.o index_shard_reducer.o \
+INDEX_SHARD_OBJS := index_shard_control.o \
+	index_shard_inverse.o index_shard_pass.o \
+	index_shard_pool.o index_shard_reducer.o \
 	index_shard_scheduler.o index_shard_staged.o index_shard_worker.o \
 	index_shard_config.o
 SOLVER_CORE_OBJS := solver.o solver_profile.o solver_field_geometry.o \
@@ -129,7 +128,7 @@ SOLVER_CORE_OBJS := solver.o solver_profile.o solver_field_geometry.o \
 SOLVER_CODEKD_OBJS := solver_codekd_plan.o solver_codekd_delivery.o \
 	solver_codekd_verification.o solver_codekd_staged.o \
 	solver_codekd_retire.o
-VERIFY_OBJS := verify.o verify_score.o verify_projection.o verify_prepared.o
+VERIFY_OBJS := verify.o verify_score.o verify_prepared.o
 CONTROL_PROGRAM_ENGINE_OBJS := $(ENGINE_CORE_OBJS) codetree.o codefile.o \
 	$(ONEFIELD_OBJS) $(INDEX_SHARD_OBJS) solverutils.o quad-utils.o \
 	image2xy-files.o solvedfile.o $(SOLVER_CORE_OBJS) \
@@ -156,6 +155,7 @@ CORE_STATE_HEADERS := engine_internal.h engine_private.h \
 	solver_field_geometry_internal.h solver_inline_internal.h \
 	solver_hypothesis_internal.h solver_profile_internal.h \
 	verify_internal.h verify_prepared_internal.h \
+	../util/fitsbin_internal.h \
 	../include/astrometry/index_shard.h \
 	../include/astrometry/onefield.h ../include/astrometry/solver.h \
 	../include/astrometry/fitsbin.h ../include/astrometry/starkd.h
@@ -335,7 +335,7 @@ control-program-2: control-program.o $(CONTROL_PROGRAM_ENGINE_OBJS) $(SLIB)
 		$(CONTROL_PROGRAM_ENGINE_OBJS) \
 		$(addprefix ../qfits-an/,anqfits.o qfits_tools.o qfits_table.o qfits_float.o qfits_error.o qfits_time.o qfits_card.o qfits_header.o qfits_rw.o qfits_memory.o qfits_convert.o qfits_byteswap.o) \
 		$(addprefix ../libkd/,kdtree.o kdtree_dim.o kdtree_fits_io.o kdint_ddd.o kdint_dds.o kdint_ddu.o kdint_dss.o kdint_duu.o kdint_fff.o kdint_lll.o) \
-		$(addprefix ../util/,index.o index_residency.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starkd_payload.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsbin_mmap.o fitsbin_payload_source.o fitsbin_payload_plan.o fitsbin_payload_service.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
+		$(addprefix ../util/,index.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starkd_payload.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsbin_mmap.o fitsbin_payload_source.o fitsbin_payload_plan.o fitsbin_payload_service.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
 		$(CFITS_LIB) $(LDLIBS)
 ALL_EXECS += control-program-2
 

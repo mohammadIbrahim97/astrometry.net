@@ -4,7 +4,6 @@
  */
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
@@ -71,24 +70,6 @@ static int parse_positive_double_env(
     }
     *value_out = value;
     return 1;
-}
-
-static int touch_before_second_pass(const char* env_name) {
-    const char* path = getenv(env_name);
-
-    if (!path || !path[0]) {
-        return 0;
-    }
-    if (utimensat(AT_FDCWD, path, NULL, 0)) {
-        fprintf(
-            stderr,
-            "failed to update %s source identity for %s: %s\n",
-            env_name,
-            path,
-            strerror(errno));
-        return -1;
-    }
-    return 0;
 }
 
 static void signature_hash_bytes(
@@ -217,14 +198,6 @@ static void signature_hash_match(
         sizeof(match->nverified));
 }
 
-static uint64_t scientific_match_digest(
-    const MatchObj* match) {
-    uint64_t hash = UINT64_C(1469598103934665603);
-
-    signature_hash_science(&hash, match);
-    return hash;
-}
-
 /*
  * onefield_run() intentionally releases its in-memory MatchObj list before
  * returning. Read the match artifact written before that cleanup so this
@@ -274,57 +247,6 @@ static int read_result_signature(
         return -1;
     }
     return 0;
-}
-
-static int print_match_records(
-    const char* match_path,
-    const char* mode,
-    int pass_number,
-    int workers,
-    int first_object,
-    int last_object) {
-    matchfile* matches;
-    int solution_count;
-    int row;
-
-    if (!file_exists(match_path)) {
-        return 0;
-    }
-    matches = matchfile_open(match_path);
-    if (!matches) {
-        return -1;
-    }
-    solution_count = matchfile_count(matches);
-    if (solution_count < 0) {
-        matchfile_close(matches);
-        return -1;
-    }
-    for (row = 0; row < solution_count; row++) {
-        const MatchObj* match = matchfile_read_match(matches);
-
-        if (!match) {
-            matchfile_close(matches);
-            return -1;
-        }
-        printf(
-            "SOLVER_TEST_MATCH mode=%s pass=%i workers=%i "
-            "first_object=%i last_object=%i "
-            "digest=%016llx indexid=%i healpix=%i hpnside=%i "
-            "parity=%i quad=%u max_field_object=%i\n",
-            mode,
-            pass_number,
-            workers,
-            first_object,
-            last_object,
-            (unsigned long long)scientific_match_digest(match),
-            match->indexid,
-            match->healpix,
-            match->hpnside,
-            match->parity,
-            match->quadno,
-            match->objs_tried);
-    }
-    return matchfile_close(matches);
 }
 
 static void print_result_record(
@@ -998,7 +920,7 @@ int main(int argc, char** argv) {
         /*
          * Accept a verified astronomical match, not the first arbitrary
          * negative-log-odds CodeKD candidate.  This makes a valid nonmatching
-         * index usable ahead of the known APOD4 winner.
+         * index usable ahead of the first verified match.
          */
         bp.logratio_tosolve = log(1.0e6);
         bp.solver.logratio_toprint = log(1.0e6);
@@ -1036,13 +958,6 @@ int main(int argc, char** argv) {
          pass_number <= pass_count;
          pass_number++) {
         if (pass_number == 2) {
-            if (touch_before_second_pass(
-                    "SOLVER_TEST_TOUCH_FIELD_BEFORE_SECOND") ||
-                touch_before_second_pass(
-                    "SOLVER_TEST_TOUCH_INDEX_BEFORE_SECOND")) {
-                result = 1;
-                goto cleanup;
-            }
             first_object = second_first_object;
             last_object = second_last_object;
             bp.solver.startobj = first_object - 1;
@@ -1070,17 +985,6 @@ int main(int argc, char** argv) {
             first_object,
             last_object,
             argc - 7);
-        if (print_match_records(
-                match_path,
-                mode,
-                pass_number,
-                workers,
-                first_object,
-                last_object)) {
-            fprintf(stderr, "failed to read integration match records\n");
-            result = 1;
-            goto cleanup;
-        }
         if (bp.solver_failed) {
             result = 1;
             goto cleanup;

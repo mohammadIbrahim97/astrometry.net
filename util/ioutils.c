@@ -34,6 +34,30 @@ uint32_t ENDIAN_DETECTOR = 0x01020304;
 
 #include "qsort_reentrant.c"
 
+anbool stat_file_identity_equal(
+    const struct stat* first,
+    const struct stat* second) {
+    if (!first || !second ||
+        first->st_dev != second->st_dev ||
+        first->st_ino != second->st_ino ||
+        first->st_size != second->st_size ||
+        first->st_mtime != second->st_mtime ||
+        first->st_ctime != second->st_ctime) {
+        return FALSE;
+    }
+#if defined(__APPLE__)
+    return first->st_mtimespec.tv_nsec ==
+            second->st_mtimespec.tv_nsec &&
+        first->st_ctimespec.tv_nsec ==
+            second->st_ctimespec.tv_nsec;
+#elif defined(__linux__) || defined(__FreeBSD__)
+    return first->st_mtim.tv_nsec == second->st_mtim.tv_nsec &&
+        first->st_ctim.tv_nsec == second->st_ctim.tv_nsec;
+#else
+    return TRUE;
+#endif
+}
+
 int copy_file(const char* infn, const char* outfn) {
     FILE* fin = fopen(infn, "rb");
     FILE* fout = fopen(outfn, "wb");

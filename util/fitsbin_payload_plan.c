@@ -30,32 +30,18 @@
 #include "tic.h"
 #include "log.h"
 
-int fitsbin_prepare_direct_ranges(
-    fitsbin_t* fb,
-    const fitsbin_pread_range_t* ranges,
-    size_t range_count,
-    size_t byte_budget,
-    fitsbin_prepared_pread_range_t* prepared,
-    size_t* physical_bytes_out,
-    size_t* logical_bytes_out,
-    unsigned long long* page_count_out) {
-    size_t physical_bytes = 0U;
-    size_t logical_bytes = 0U;
-    unsigned long long page_count = 0ULL;
-    size_t page_size;
-    size_t i;
+int fitsbin_prefetch_row_budget(
+    const fitsbin_t* fb,
+    size_t row_size,
+    size_t row_count,
+    size_t* byte_budget) {
+    size_t page_size = fb ? fb->mmap_page_size : 0U;
+    size_t per_row;
 
-    if (!fb || !ranges || !range_count || !byte_budget ||
-        !prepared || !physical_bytes_out ||
-        !logical_bytes_out || !page_count_out) {
+    if (!row_size || !row_count || !byte_budget) {
         errno = EINVAL;
         return -1;
     }
-    if (range_count > FITSBIN_PREAD_ASYNC_RANGE_LIMIT) {
-        errno = E2BIG;
-        return -1;
-    }
-    page_size = fb->mmap_page_size;
     if (!page_size) {
         long detected = sysconf(_SC_PAGESIZE);
 
@@ -65,83 +51,16 @@ int fitsbin_prepare_direct_ranges(
         }
         page_size = (size_t)detected;
     }
-    for (i = 0U; i < range_count; i++) {
-        unsigned long long file_offset;
-        unsigned long long last_offset;
-        unsigned long long first_page;
-        unsigned long long last_page;
-        unsigned long long page_span;
-
-        if (!ranges[i].data || !ranges[i].size ||
-            !ranges[i].logical_size ||
-            ranges[i].logical_size > ranges[i].size ||
-            !ranges[i].destination) {
-            errno = EINVAL;
-            return -1;
-        }
-        if (fitsbin_mapped_file_offset(
-            fb,
-            ranges[i].data,
-            ranges[i].size,
-            &prepared[i].offset)) {
-            return -1;
-        }
-        prepared[i].size = ranges[i].size;
-        prepared[i].logical_size = ranges[i].logical_size;
-        prepared[i].destination = ranges[i].destination;
-        if (ranges[i].size > (size_t)LLONG_MAX ||
-            prepared[i].offset >
-                (off_t)LLONG_MAX -
-                    (off_t)ranges[i].size) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        if (ranges[i].size > SIZE_MAX - physical_bytes ||
-            ranges[i].logical_size >
-                SIZE_MAX - logical_bytes) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        physical_bytes += ranges[i].size;
-        logical_bytes += ranges[i].logical_size;
-        if (physical_bytes > byte_budget) {
-            errno = E2BIG;
-            return -1;
-        }
-        file_offset =
-            (unsigned long long)prepared[i].offset;
-        if ((unsigned long long)ranges[i].size - 1ULL >
-            ULLONG_MAX - file_offset) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        last_offset = file_offset +
-            (unsigned long long)ranges[i].size - 1ULL;
-        first_page = file_offset /
-            (unsigned long long)page_size;
-        last_page = last_offset /
-            (unsigned long long)page_size;
-        page_span = last_page - first_page;
-        if (page_span == ULLONG_MAX ||
-            page_span + 1ULL >
-                ULLONG_MAX - page_count) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        page_count += page_span + 1ULL;
+    if (page_size > (SIZE_MAX - row_size) / 2U) {
+        errno = EOVERFLOW;
+        return -1;
     }
-    *physical_bytes_out = physical_bytes;
-    *logical_bytes_out = logical_bytes;
-    *page_count_out = page_count;
-    if (range_count > 1U &&
-        fitsbin_prepared_pread_destinations_disjoint(
-            prepared, range_count)) {
-        qsort(
-            prepared,
-            range_count,
-            sizeof(prepared[0]),
-            fitsbin_compare_prepared_pread_range);
+    per_row = row_size + 2U * page_size;
+    if (row_count > SIZE_MAX / per_row) {
+        errno = EOVERFLOW;
+        return -1;
     }
+    *byte_budget = row_count * per_row;
     return 0;
 }
 
@@ -166,7 +85,7 @@ static int fitsbin_compare_file_span(
     return 0;
 }
 
-int fitsbin_compare_mapped_span(
+static int fitsbin_compare_mapped_span(
     const void* left,
     const void* right) {
     const fitsbin_mapped_span_t* lhs = left;
@@ -193,366 +112,15 @@ int fitsbin_compare_mapped_span(
     return 0;
 }
 
-static fitsbin_chunk_t* fitsbin_payload_mapping_chunk(
-    fitsbin_t* fb,
-    uintptr_t map_begin,
-    uintptr_t map_end) {
-    int i;
-
-    if (!fb || map_end <= map_begin) {
-        return NULL;
-    }
-    for (i = 0; i < fitsbin_n_chunks(fb); i++) {
-        fitsbin_chunk_t* chunk = fitsbin_get_chunk(fb, i);
-
-        if (!chunk || chunk->mmap_region !=
-                FITSBIN_MMAP_REGION_PAYLOAD ||
-            !chunk->map || !chunk->mapsize) {
-            continue;
-        }
-        if ((uintptr_t)chunk->map == map_begin &&
-            chunk->mapsize == (size_t)(map_end - map_begin)) {
-            return chunk;
-        }
-    }
-    return NULL;
-}
-
-static unsigned int* fitsbin_payload_page_sequences_get(
-    fitsbin_t* fb,
-    fitsbin_chunk_t* chunk,
-    size_t page_size,
-    anbool create) {
-    unsigned int* sequences;
-    unsigned int* candidate;
-    unsigned int* expected;
-    size_t page_count;
-
-    if (!fb || !chunk || !chunk->map || !chunk->mapsize ||
-        !page_size) {
-        return NULL;
-    }
-    sequences = __atomic_load_n(
-        &chunk->payload_page_sequences, __ATOMIC_ACQUIRE);
-    if (sequences || !create) {
-        return sequences;
-    }
-    page_count = chunk->mapsize / page_size;
-    if (chunk->mapsize % page_size) {
-        page_count++;
-    }
-    if (!page_count ||
-        page_count > SIZE_MAX / sizeof(*candidate)) {
-        return NULL;
-    }
-    candidate = calloc(page_count, sizeof(*candidate));
-    if (!candidate) {
-        return NULL;
-    }
-    expected = NULL;
-    if (__atomic_compare_exchange_n(
-            &chunk->payload_page_sequences,
-            &expected,
-            candidate,
-            FALSE,
-            __ATOMIC_RELEASE,
-            __ATOMIC_ACQUIRE)) {
-        __atomic_add_fetch(
-            &fb->payload_cache_allocations,
-            1ULL,
-            __ATOMIC_RELAXED);
-        return candidate;
-    }
-    free(candidate);
-    return expected;
-}
-
-/*
- * Drop only pages completed recently for the exact VMA. A mapping-lifetime
- * bit is not sufficient because the kernel may reclaim a populated page.
- * Limit reuse to the service admission window so READY never relies on an
- * arbitrarily old completion. Native mapped access remains authoritative.
- * Return SIZE_MAX when split output would overflow.
- */
-static size_t fitsbin_payload_filter_completed_pages(
-    fitsbin_t* fb,
-    fitsbin_mapped_span_t* spans,
-    size_t span_count,
-    size_t span_capacity,
-    size_t page_size,
-    unsigned long long sequence,
-    unsigned long long* reused_pages) {
-    fitsbin_mapped_span_t filtered[FITSBIN_PREFETCH_RANGE_LIMIT];
-    unsigned long long hits = 0ULL;
-    unsigned long long misses = 0ULL;
-    size_t filtered_count = 0U;
-    size_t i;
-
-    if (!fb || !spans || span_count > span_capacity ||
-        span_capacity > FITSBIN_PREFETCH_RANGE_LIMIT || !page_size ||
-        !reused_pages) {
-        return SIZE_MAX;
-    }
-    *reused_pages = 0ULL;
-    for (i = 0U; i < span_count; i++) {
-        fitsbin_chunk_t* chunk = fitsbin_payload_mapping_chunk(
-            fb, spans[i].map_begin, spans[i].map_end);
-        unsigned int* sequences =
-            fitsbin_payload_page_sequences_get(
-            fb, chunk, page_size, TRUE);
-        uintptr_t cursor = spans[i].begin;
-        unsigned int current_sequence = (unsigned int)sequence;
-
-        while (cursor < spans[i].end) {
-            uintptr_t next = spans[i].end - cursor < page_size
-                ? spans[i].end
-                : cursor + page_size;
-            size_t page_index = (size_t)(
-                (cursor - spans[i].map_begin) / page_size);
-            unsigned int completed_sequence = sequences
-                ? __atomic_load_n(
-                    &sequences[page_index], __ATOMIC_ACQUIRE)
-                : 0U;
-            anbool completed = current_sequence &&
-                completed_sequence &&
-                (unsigned int)(
-                    current_sequence - completed_sequence) <
-                    FITSBIN_PAYLOAD_IO_MAX_JOBS;
-
-            if (completed) {
-                hits++;
-            } else {
-                fitsbin_mapped_span_t* output;
-
-                misses++;
-                if (filtered_count &&
-                    filtered[filtered_count - 1U].map_begin ==
-                        spans[i].map_begin &&
-                    filtered[filtered_count - 1U].map_end ==
-                        spans[i].map_end &&
-                    filtered[filtered_count - 1U].end == cursor) {
-                    filtered[filtered_count - 1U].end = next;
-                    cursor = next;
-                    continue;
-                }
-                if (filtered_count >= span_capacity) {
-                    return SIZE_MAX;
-                }
-                output = &filtered[filtered_count++];
-                output->map_begin = spans[i].map_begin;
-                output->map_end = spans[i].map_end;
-                output->begin = cursor;
-                output->end = next;
-            }
-            cursor = next;
-        }
-    }
-    memcpy(spans, filtered, filtered_count * sizeof(*spans));
-    *reused_pages = hits;
-    __atomic_add_fetch(
-        &fb->payload_cache_hits, hits, __ATOMIC_RELAXED);
-    __atomic_add_fetch(
-        &fb->payload_cache_misses, misses, __ATOMIC_RELAXED);
-    return filtered_count;
-}
-
-void fitsbin_payload_mark_completed_span(
-    fitsbin_t* fb,
-    const fitsbin_mapped_span_t* span,
-    unsigned long long sequence) {
-    fitsbin_chunk_t* chunk;
-    unsigned int* sequences;
-    unsigned int completed_sequence = (unsigned int)sequence;
-    size_t page_size;
-    uintptr_t cursor;
-
-    if (!fb || !span || span->end <= span->begin ||
-        !completed_sequence) {
-        return;
-    }
-    page_size = fb->mmap_page_size;
-    if (!page_size) {
-        return;
-    }
-    chunk = fitsbin_payload_mapping_chunk(
-        fb, span->map_begin, span->map_end);
-    sequences = fitsbin_payload_page_sequences_get(
-        fb, chunk, page_size, TRUE);
-    if (!sequences) {
-        return;
-    }
-    cursor = span->begin;
-    while (cursor < span->end) {
-        size_t page_index = (size_t)(
-            (cursor - span->map_begin) / page_size);
-        __atomic_store_n(
-            &sequences[page_index],
-            completed_sequence,
-            __ATOMIC_RELEASE);
-        if (span->end - cursor <= page_size) {
-            break;
-        }
-        cursor += page_size;
-    }
-}
-
-int fitsbin_prepare_prefetch_spans(
-    fitsbin_t* fb,
-    const fitsbin_prefetch_range_t* ranges,
-    size_t range_count,
-    size_t byte_budget,
-    fitsbin_file_span_t* spans,
-    size_t* span_count,
-    size_t* byte_count) {
-    struct stat source;
-    size_t accepted = 0U;
-    size_t actual_bytes = 0U;
-    size_t page_size;
-    size_t i;
-    size_t merged;
-
-    if (!span_count || !byte_count) {
-        errno = EINVAL;
-        return -1;
-    }
-    *span_count = 0U;
-    *byte_count = 0U;
-    if (!range_count) {
-        return 0;
-    }
-    if (!fb || !ranges || !byte_budget || !spans) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (range_count > FITSBIN_PREFETCH_RANGE_LIMIT) {
-        errno = E2BIG;
-        return -1;
-    }
-    page_size = fb->mmap_page_size;
-    if (!page_size) {
-        long detected = sysconf(_SC_PAGESIZE);
-
-        if (detected <= 0) {
-            errno = EINVAL;
-            return -1;
-        }
-        page_size = (size_t)detected;
-    }
-    if (fitsbin_get_open_file_stat(fb, &source)) {
-        return -1;
-    }
-
-    for (i = 0U; i < range_count; i++) {
-        fitsbin_chunk_t* chunk;
-        size_t chunk_offset;
-        off_t begin;
-        off_t end;
-        off_t aligned_begin;
-        off_t aligned_end;
-
-        if (!ranges[i].data || !ranges[i].size) {
-            errno = EINVAL;
-            return -1;
-        }
-        chunk = fitsbin_find_data_chunk(
-            fb,
-            ranges[i].data,
-            ranges[i].size,
-            &chunk_offset);
-        if (!chunk) {
-            errno = EINVAL;
-            return -1;
-        }
-        if (chunk_offset > (size_t)LLONG_MAX ||
-            chunk->data_file_offset >
-                (off_t)LLONG_MAX - (off_t)chunk_offset) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        begin = chunk->data_file_offset +
-            (off_t)chunk_offset;
-        if (ranges[i].size > (size_t)LLONG_MAX ||
-            begin >
-                (off_t)LLONG_MAX -
-                    (off_t)ranges[i].size) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        end = begin + (off_t)ranges[i].size;
-        aligned_begin =
-            begin - begin % (off_t)page_size;
-        aligned_end = end;
-        if (aligned_end % (off_t)page_size) {
-            off_t padding =
-                (off_t)page_size -
-                aligned_end % (off_t)page_size;
-
-            if (aligned_end > source.st_size - padding) {
-                aligned_end = source.st_size;
-            } else {
-                aligned_end += padding;
-            }
-        }
-        if (aligned_end > source.st_size) {
-            aligned_end = source.st_size;
-        }
-        if (aligned_end <= aligned_begin) {
-            errno = EINVAL;
-            return -1;
-        }
-        spans[accepted].begin = aligned_begin;
-        spans[accepted].end = aligned_end;
-        accepted++;
-    }
-
-    qsort(
-        spans,
-        accepted,
-        sizeof(spans[0]),
-        fitsbin_compare_file_span);
-    merged = 0U;
-    for (i = 0U; i < accepted; i++) {
-        if (merged &&
-            spans[i].begin <= spans[merged - 1U].end) {
-            if (spans[i].end > spans[merged - 1U].end) {
-                spans[merged - 1U].end = spans[i].end;
-            }
-            continue;
-        }
-        spans[merged++] = spans[i];
-    }
-    for (i = 0U; i < merged; i++) {
-        size_t span_bytes =
-            (size_t)(spans[i].end - spans[i].begin);
-
-        if (actual_bytes > byte_budget ||
-            span_bytes > byte_budget - actual_bytes) {
-            errno = E2BIG;
-            return -1;
-        }
-        actual_bytes += span_bytes;
-    }
-    *span_count = merged;
-    *byte_count = actual_bytes;
-    return 0;
-}
-
 int fitsbin_prepare_mapped_spans(
     fitsbin_t* fb,
     const fitsbin_prefetch_range_t* ranges,
     size_t range_count,
     size_t byte_budget,
-    unsigned long long reuse_sequence,
     fitsbin_mapped_span_t* spans,
     size_t span_capacity,
     size_t* span_count,
-    size_t* byte_count,
-    size_t* logical_byte_count,
-    unsigned long long* page_count,
-    size_t* exact_span_count,
-    unsigned long long* reused_page_count,
-    size_t* coalesced_gap_count,
-    size_t* coalesced_gap_bytes) {
+    size_t* byte_count) {
     size_t accepted = 0U;
     size_t merged = 0U;
     size_t coalesced = 0U;
@@ -561,29 +129,15 @@ int fitsbin_prepare_mapped_spans(
     size_t gap_budget = 0U;
     size_t gap_bytes = 0U;
     size_t gap_merges = 0U;
-    size_t logical_bytes = 0U;
-    unsigned long long pages = 0ULL;
     size_t page_size;
     size_t i;
-    size_t original_merged;
-    size_t filtered;
-    unsigned long long reused_pages = 0ULL;
 
-    if (!span_count || !byte_count || !logical_byte_count ||
-        !page_count || !exact_span_count ||
-        !reused_page_count ||
-        !coalesced_gap_count || !coalesced_gap_bytes) {
+    if (!span_count || !byte_count) {
         errno = EINVAL;
         return -1;
     }
     *span_count = 0U;
     *byte_count = 0U;
-    *logical_byte_count = 0U;
-    *page_count = 0ULL;
-    *exact_span_count = 0U;
-    *reused_page_count = 0ULL;
-    *coalesced_gap_count = 0U;
-    *coalesced_gap_bytes = 0U;
     if (!fb || !ranges || !range_count || !byte_budget ||
         !spans || range_count > span_capacity) {
         errno = range_count > span_capacity ? E2BIG : EINVAL;
@@ -612,11 +166,8 @@ int fitsbin_prepare_mapped_spans(
         uintptr_t remainder;
         int resolved;
 
-        if (!ranges[i].data || !ranges[i].size ||
-            ranges[i].size > SIZE_MAX - logical_bytes) {
-            errno = ranges[i].data && ranges[i].size
-                ? EOVERFLOW
-                : EINVAL;
+        if (!ranges[i].data || !ranges[i].size) {
+            errno = EINVAL;
             return -1;
         }
         resolved = fitsbin_resolve_mapped_range(
@@ -670,7 +221,6 @@ int fitsbin_prepare_mapped_spans(
         spans[accepted].begin = begin;
         spans[accepted].end = end;
         accepted++;
-        logical_bytes += ranges[i].size;
     }
 
     qsort(
@@ -700,32 +250,6 @@ int fitsbin_prepare_mapped_spans(
             return -1;
         }
         exact_bytes += span_bytes;
-    }
-    original_merged = merged;
-    filtered = fitsbin_payload_filter_completed_pages(
-        fb,
-        spans,
-        merged,
-        span_capacity,
-        page_size,
-        reuse_sequence,
-        &reused_pages);
-    if (filtered != SIZE_MAX) {
-        merged = filtered;
-        exact_bytes = 0U;
-        for (i = 0U; i < merged; i++) {
-            size_t span_bytes =
-                (size_t)(spans[i].end - spans[i].begin);
-
-            if (exact_bytes > byte_budget ||
-                span_bytes > byte_budget - exact_bytes) {
-                errno = E2BIG;
-                return -1;
-            }
-            exact_bytes += span_bytes;
-        }
-    } else {
-        reused_pages = 0ULL;
     }
     gap_budget = MIN(
         byte_budget - exact_bytes,
@@ -757,19 +281,12 @@ int fitsbin_prepare_mapped_spans(
     for (i = 0U; i < coalesced; i++) {
         size_t span_bytes =
             (size_t)(spans[i].end - spans[i].begin);
-        size_t span_pages = span_bytes / page_size;
-
-        if (span_bytes % page_size) {
-            span_pages++;
-        }
         if (aligned_bytes > byte_budget ||
-            span_bytes > byte_budget - aligned_bytes ||
-            (unsigned long long)span_pages > ULLONG_MAX - pages) {
+            span_bytes > byte_budget - aligned_bytes) {
             errno = E2BIG;
             return -1;
         }
         aligned_bytes += span_bytes;
-        pages += (unsigned long long)span_pages;
     }
     if (coalesced > merged || gap_merges > merged ||
         coalesced + gap_merges != merged ||
@@ -781,12 +298,6 @@ int fitsbin_prepare_mapped_spans(
     }
     *span_count = coalesced;
     *byte_count = aligned_bytes;
-    *logical_byte_count = logical_bytes;
-    *page_count = pages;
-    *exact_span_count = original_merged;
-    *reused_page_count = reused_pages;
-    *coalesced_gap_count = gap_merges;
-    *coalesced_gap_bytes = gap_bytes;
     return 0;
 }
 
@@ -798,10 +309,7 @@ int fitsbin_prepare_mapped_file_spans(
     fitsbin_file_span_t* file_spans,
     size_t file_span_capacity,
     size_t* file_span_count,
-    size_t* byte_count,
-    size_t* exact_span_count,
-    size_t* gap_count,
-    size_t* gap_bytes) {
+    size_t* byte_count) {
     struct stat source;
     size_t accepted = 0U;
     size_t merged = 0U;
@@ -815,16 +323,12 @@ int fitsbin_prepare_mapped_file_spans(
     size_t maximum_gap;
     size_t i;
 
-    if (!file_span_count || !byte_count || !exact_span_count ||
-        !gap_count || !gap_bytes) {
+    if (!file_span_count || !byte_count) {
         errno = EINVAL;
         return -1;
     }
     *file_span_count = 0U;
     *byte_count = 0U;
-    *exact_span_count = 0U;
-    *gap_count = 0U;
-    *gap_bytes = 0U;
     if (!fb || !mapped || !mapped_count || !byte_budget ||
         !file_spans || mapped_count > file_span_capacity) {
         errno = mapped_count > file_span_capacity
@@ -1052,8 +556,5 @@ int fitsbin_prepare_mapped_file_spans(
     }
     *file_span_count = coalesced;
     *byte_count = actual_bytes;
-    *exact_span_count = merged;
-    *gap_count = added_gap_count;
-    *gap_bytes = added_gap_bytes;
     return 0;
 }

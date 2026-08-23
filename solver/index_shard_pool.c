@@ -3,50 +3,19 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
-/*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
- */
-#include <assert.h>
-#include <errno.h>
-#include <limits.h>
-#include <math.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "index_shard_private.h"
-#include "astrometry/bl.h"
 #include "astrometry/errors.h"
 #include "astrometry/log.h"
-#include "astrometry/tic.h"
-#include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
 
 static index_shard_pool_t *index_shard_global_pool = NULL;
 static pthread_mutex_t index_shard_global_pool_mutex =
     PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * SECTION INDEX-SHARD: pool
- *
- * Pool lifecycle and pass submission.
- *
- * The pool is created once per engine job and reused across onefield_run()
- * calls.  Each submitted pass increments generation to wake workers.
- */
-
-// ANCHOR INDEX-SHARD: shared-init
-/*
- * Initialize synchronization primitives for the reusable shared pass state.
- */
 static int index_shard_shared_init(index_shard_thread_state_t *shared) {
   pthread_condattr_t condattr;
 
@@ -56,66 +25,54 @@ static int index_shard_shared_init(index_shard_thread_state_t *shared) {
     return -1;
   }
   if (pthread_cond_init(&shared->queue_cv, NULL)) {
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_queue_mutex;
   }
 
   if (pthread_mutex_init(&shared->result_mutex, NULL)) {
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_queue_cv;
   }
 
   if (pthread_condattr_init(&condattr)) {
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_result_mutex;
   }
   if (pthread_condattr_setclock(
           &condattr,
           CLOCK_MONOTONIC)) {
-    pthread_condattr_destroy(&condattr);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_condattr;
   }
   if (pthread_cond_init(
           &shared->result_cv,
           &condattr)) {
-    pthread_condattr_destroy(&condattr);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_condattr;
   }
   pthread_condattr_destroy(&condattr);
 
   if (pthread_mutex_init(&shared->state_mutex, NULL)) {
-    pthread_cond_destroy(&shared->result_cv);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_result_cv;
   }
 
   if (pthread_mutex_init(&shared->limit_mutex, NULL)) {
-    pthread_mutex_destroy(&shared->state_mutex);
-    pthread_cond_destroy(&shared->result_cv);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_state_mutex;
   }
 
   return 0;
+
+destroy_state_mutex:
+  pthread_mutex_destroy(&shared->state_mutex);
+destroy_result_cv:
+  pthread_cond_destroy(&shared->result_cv);
+  goto destroy_result_mutex;
+destroy_condattr:
+  pthread_condattr_destroy(&condattr);
+destroy_result_mutex:
+  pthread_mutex_destroy(&shared->result_mutex);
+destroy_queue_cv:
+  pthread_cond_destroy(&shared->queue_cv);
+destroy_queue_mutex:
+  pthread_mutex_destroy(&shared->queue_mutex);
+  return -1;
 }
 
-// ANCHOR INDEX-SHARD: shared-destroy
-/*
- * Destroy synchronization primitives after all workers have joined.
- */
 static void index_shard_shared_destroy(index_shard_thread_state_t *shared) {
   index_shard_completion_registry_destroy(shared);
   pthread_cond_destroy(&shared->queue_cv);
@@ -128,8 +85,6 @@ static void index_shard_shared_destroy(index_shard_thread_state_t *shared) {
 
   pthread_mutex_destroy(&shared->limit_mutex);
 }
-
-
 /*
  * Reserve the persistent pool for one submitted pass.
  *
@@ -227,20 +182,20 @@ static void index_shard_context_owner_cvs_destroy(
   }
 }
 
-// ANCHOR INDEX-SHARD: pool-start
 /*
  * Create persistent worker pool.
  *
  * Workers are created once and sleep until the first pass is submitted.
  */
 int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
-  index_shard_pool_t *pool;
+  index_shard_pool_t *pool = NULL;
   int i;
   int tls_status;
+  int threads_started = 0;
   int worker_count;
   int payload_io_lanes;
   int payload_io_width;
-  index_shard_width_plan_t width_plan;
+  size_t producer_width;
 
    // pool already active for this engine job
   if (!index_shard_pthread_enabled(bp)) {
@@ -289,84 +244,49 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     return 0;
   }
 
-  worker_count = index_shard_get_worker_count(bp, 0);
+  worker_count = index_shard_get_worker_count(bp);
 
   pool = calloc(1, sizeof(index_shard_pool_t));
   if (!pool) {
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
     SYSERROR("Failed to allocate index-shard pool");
-    return -1;
+    goto unlock_failure;
   }
 
   pool->owner_bp = bp;
   pool->owner_sp = sp;
   pool->worker_count = worker_count;
-  pool->producer_width = 1U;
-  pool->helper_width = 0U;
   pool->inverse_cache_budget =
       index_shard_inverse_cache_budget();
 
   if (pthread_mutex_init(&pool->inverse_cache_mutex, NULL)) {
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto free_pool;
   }
 
   // initialize shared state before workers can observe pool
   if (pthread_mutex_init(&pool->control_mutex, NULL)) {
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_inverse_mutex;
   }
 
   if (pthread_cond_init(&pool->work_cv, NULL)) {
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_control_mutex;
   }
 
   if (index_shard_shared_init(&pool->shared)) {
-    pthread_cond_destroy(&pool->work_cv);
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_work_cv;
   }
   pool->shared.pool = pool;
   if (index_shard_completion_registry_init(
           &pool->shared, worker_count)) {
-    index_shard_shared_destroy(&pool->shared);
-    pthread_cond_destroy(&pool->work_cv);
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_shared;
   }
 
   pool->threads = calloc((size_t)worker_count, sizeof(pthread_t));
   pool->contexts = calloc((size_t)worker_count,
                           sizeof(index_shard_worker_context_t));
 
-    if (!pool->threads || !pool->contexts) {
-      free(pool->threads);
-      free(pool->contexts);
-
-      index_shard_shared_destroy(&pool->shared);
-
-      pthread_cond_destroy(&pool->work_cv);
-      pthread_mutex_destroy(&pool->control_mutex);
-      pthread_mutex_destroy(&pool->inverse_cache_mutex);
-
-      free(pool);
-
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      return -1;
-    }
+  if (!pool->threads || !pool->contexts) {
+    goto free_worker_storage;
+  }
 
   // worker contexts and owner conditions are stable for pool lifetime.
   for (i = 0; i < worker_count; i++) {
@@ -374,16 +294,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     pool->contexts[i].generation_seen = 0;
     pool->contexts[i].pool = pool;
     if (pthread_cond_init(&pool->contexts[i].owner_cv, NULL)) {
-      index_shard_context_owner_cvs_destroy(pool);
-      free(pool->threads);
-      free(pool->contexts);
-      index_shard_shared_destroy(&pool->shared);
-      pthread_cond_destroy(&pool->work_cv);
-      pthread_mutex_destroy(&pool->control_mutex);
-      pthread_mutex_destroy(&pool->inverse_cache_mutex);
-      free(pool);
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      return -1;
+      goto destroy_owner_cvs;
     }
     pool->contexts[i].owner_cv_ready = TRUE;
   }
@@ -392,26 +303,9 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     if (pthread_create(
             &pool->threads[i], NULL,
             index_shard_worker_main, &pool->contexts[i])) {
-      int j;
-
-      pthread_mutex_lock(&pool->control_mutex);
-      pool->shutdown = TRUE;
-      pthread_cond_broadcast(&pool->work_cv);
-      pthread_mutex_unlock(&pool->control_mutex);
-      for (j = 0; j < i; j++) {
-        pthread_join(pool->threads[j], NULL);
-      }
-      index_shard_context_owner_cvs_destroy(pool);
-      free(pool->threads);
-      free(pool->contexts);
-      index_shard_shared_destroy(&pool->shared);
-      pthread_cond_destroy(&pool->work_cv);
-      pthread_mutex_destroy(&pool->control_mutex);
-      pthread_mutex_destroy(&pool->inverse_cache_mutex);
-      free(pool);
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      return -1;
+      goto stop_threads;
     }
+    threads_started++;
   }
 
   pthread_mutex_lock(&pool->control_mutex);
@@ -428,19 +322,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   if (tls_status) {
     logerr("[index-shard] worker TLS startup failed status=%i\n",
            tls_status);
-    for (i = 0; i < worker_count; i++) {
-      pthread_join(pool->threads[i], NULL);
-    }
-    free(pool->threads);
-    index_shard_context_owner_cvs_destroy(pool);
-    free(pool->contexts);
-    index_shard_shared_destroy(&pool->shared);
-    pthread_cond_destroy(&pool->work_cv);
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto join_threads;
   }
 
   /*
@@ -472,32 +354,28 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
 
   index_shard_global_pool = pool;
   payload_io_width = fitsbin_payload_io_service_width();
-  if (index_shard_config_plan_widths(
-          worker_count,
-          payload_io_width,
-          pool->payload_completion_registered,
-          FALSE,
-          &width_plan)) {
+  producer_width = index_shard_config_producer_width(
+      worker_count,
+      payload_io_width,
+      pool->payload_completion_registered,
+      FALSE);
+  if (!producer_width) {
     logerr("[index-shard] invalid compute/delivery width plan "
            "workers=%i payload_io_width=%i detached=%i\n",
            worker_count,
            payload_io_width,
            pool->payload_completion_registered ? 1 : 0);
-    pool->helper_width = worker_count > 1 ? 1U : 0U;
-    pool->producer_width =
-        (size_t)worker_count - pool->helper_width;
-  } else {
-    /*
-     * Detached completion does not reserve a compute lane. Every worker may
-     * own outer work while it is immediately available, then join published
-     * staged work after the outer queue is exhausted.
-     */
-    pool->producer_width = width_plan.producer_width;
-    pool->helper_width = width_plan.helper_width;
+    producer_width =
+        worker_count > 1 ? (size_t)worker_count - 1U : 1U;
   }
+  /*
+   * Detached completion does not reserve a compute lane. Every worker may
+   * own outer work. A completed owner may execute one READY foreign package
+   * before claiming again; otherwise outer admission remains the priority.
+   */
   fitsbin_payload_io_configure_workers(
       pool->payload_completion_registered
-          ? (int)pool->producer_width
+          ? (int)producer_width
           : worker_count);
 
   logverb("[index-shard] workers=%i mode=pthread "
@@ -505,15 +383,42 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
           "payload_io_width=%i inverse_cache_budget=%zu\n",
           worker_count,
           worker_count,
-          pool->producer_width,
-          pool->helper_width,
+          producer_width,
+          (size_t)worker_count - producer_width,
           payload_io_width,
           pool->inverse_cache_budget);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
   return 0;
+
+stop_threads:
+  pthread_mutex_lock(&pool->control_mutex);
+  pool->shutdown = TRUE;
+  pthread_cond_broadcast(&pool->work_cv);
+  pthread_mutex_unlock(&pool->control_mutex);
+join_threads:
+  for (i = 0; i < threads_started; i++) {
+    pthread_join(pool->threads[i], NULL);
+  }
+destroy_owner_cvs:
+  index_shard_context_owner_cvs_destroy(pool);
+free_worker_storage:
+  free(pool->threads);
+  free(pool->contexts);
+destroy_shared:
+  index_shard_shared_destroy(&pool->shared);
+destroy_work_cv:
+  pthread_cond_destroy(&pool->work_cv);
+destroy_control_mutex:
+  pthread_mutex_destroy(&pool->control_mutex);
+destroy_inverse_mutex:
+  pthread_mutex_destroy(&pool->inverse_cache_mutex);
+free_pool:
+  free(pool);
+unlock_failure:
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+  return -1;
 }
-// ANCHOR INDEX-SHARD: pool-stop
 /*
  * Stop the pool belonging to bp and join all workers.
  *
@@ -623,7 +528,6 @@ void index_shard_pool_stop(onefield_t *bp) {
   free(pool);
 }
 
-// ANCHOR INDEX-SHARD: pool-active
 /*
  * Return true only when the compatibility pool belongs to bp and remains
  * available for a new pass reservation.

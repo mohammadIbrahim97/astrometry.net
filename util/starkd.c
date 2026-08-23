@@ -15,6 +15,7 @@
 #include "kdtree_fits_io.h"
 #include "starutil.h"
 #include "fitsbin.h"
+#include "fitsbin_internal.h"
 #include "fitstable.h"
 #include "errors.h"
 #include "tic.h"

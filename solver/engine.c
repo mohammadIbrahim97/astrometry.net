@@ -30,7 +30,6 @@
 #include "an-bool.h"
 #include "anqfits.h"
 #include "astrometry/index_shard.h"
-#include "astrometry/index_residency.h"
 #include "bl.h"
 #include "engine.h"
 #include "errors.h"
@@ -203,7 +202,7 @@ int engine_add_index(engine_t* engine, char* path) {
 
     t0 = timenow();
     /*
-     * Ordinary registration is always metadata-only. Legacy grouped mode
+     * Ordinary registration is always metadata-only. Grouped mode
      * still loads all selected filename-owned indexes together inside
      * onefield; it no longer needs every configured payload resident before
      * scale and sky selection.
@@ -466,20 +465,15 @@ int engine_run_job(engine_t* engine, job_t* job) {
     int rtn = 0;
     double app_min_default;
     double app_max_default;
-    double engine_wall_start = monotonic_seconds();
-    double pool_start_seconds = 0.0;
-    double pool_stop_seconds = 0.0;
     anbool index_shard_pool_started = FALSE;
     anbool legacy_grouped =
         engine->inparallel && !job->index_shard_workers_controlled;
-    index_residency_t* residency = NULL;
     engine_pass_cursor_t pass_cursor;
     engine_pass_t pass;
 
     if (onefield_is_run_obsolete(bp, sp)) {
         goto finish;
     }
-    // SECTION INDEX-SHARD: engine-lifecycle
     bp->time_total_start = monotonic_seconds();
     bp->cpu_total_start = get_cpu_usage();
     bp->indexes_inparallel = legacy_grouped;
@@ -501,19 +495,13 @@ int engine_run_job(engine_t* engine, job_t* job) {
         goto finish;
     }
 
-    residency = engine_index_residency_begin(engine, bp);
-
     if (index_shard_pthread_enabled(bp) && !legacy_grouped) {
-        double pool_wall_start = monotonic_seconds();
-
         if (index_shard_pool_start(bp, sp)) {
             ERROR("Failed to start parallel solver pool");
             rtn = -1;
             goto finish;
         }
 
-        pool_start_seconds =
-            monotonic_seconds() - pool_wall_start;
         index_shard_pool_started = TRUE;
     }
 
@@ -707,59 +695,13 @@ int engine_run_job(engine_t* engine, job_t* job) {
     logverb("AB scale constraints: %i\n", sp->num_abscale_skipped);
 
  finish:
-   // SECTION INDEX-SHARD: engine-lifecycle
    if (index_shard_pool_started) {
-     double pool_wall_start = monotonic_seconds();
-
      index_shard_pool_stop(bp);
-     pool_stop_seconds =
-         monotonic_seconds() - pool_wall_start;
-   }
-   if (residency) {
-     (void)index_residency_quiesce(residency);
    }
    onefield_job_field_cache_end(bp);
-   if (residency) {
-     index_unbind_residency_service(residency);
-   }
-
-   logverb("[engine-profile] pool_start=%.6f pool_stop=%.6f "
-           "engine_total=%.6f solver_failed=%i\n",
-           pool_start_seconds,
-           pool_stop_seconds,
-           monotonic_seconds() - engine_wall_start,
-           bp->solver_failed ? 1 : 0);
 
    solver_cleanup(sp);
    onefield_cleanup(bp);
-   if (residency) {
-     index_residency_stats_t stats;
-
-     if (!index_residency_get_stats(residency, &stats)) {
-       logverb(
-           "[index-residency] copied_files=%llu copied_bytes=%llu "
-           "hits=%llu deduplicated=%llu waits=%llu wait_ms=%.3f "
-           "source_leases=%llu source_requeues=%llu "
-           "cancellations=%llu "
-           "peak_bytes=%zu ready_bytes=%zu live_handles=%zu "
-           "failures=%llu source_changes=%llu\n",
-           (unsigned long long)stats.files_copied,
-           (unsigned long long)stats.bytes_copied,
-           (unsigned long long)stats.cache_hits,
-           (unsigned long long)stats.loading_deduplications,
-           (unsigned long long)stats.wait_count,
-           (double)stats.wait_nanoseconds / 1000000.0,
-           (unsigned long long)stats.source_leases,
-           (unsigned long long)stats.source_requeues,
-           (unsigned long long)stats.cancelled_entries,
-           stats.peak_resident_bytes,
-           stats.ready_bytes,
-           stats.live_handles,
-           (unsigned long long)stats.copy_failures,
-           (unsigned long long)stats.source_changes);
-     }
-     (void)index_residency_stop(residency);
-   }
    return rtn;
 }
 

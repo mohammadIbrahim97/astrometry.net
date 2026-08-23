@@ -77,7 +77,7 @@ int engine_resolve_index_shard_workers(engine_t *engine,
         source = "solve-field";
     } else {
         /*
-         * Retain the legacy environment override for existing measurement
+         * Retain the environment override for existing measurement
          * harnesses. New production commands should use the per-job
          * solve-field option, whose AXY header has higher precedence.
          */

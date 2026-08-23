@@ -43,14 +43,11 @@ static void check_width_plan(int workers,
                              int exact_demand,
                              size_t expected_producers,
                              size_t expected_helpers) {
-  index_shard_width_plan_t plan = { SIZE_MAX, SIZE_MAX };
+  size_t producer_width = index_shard_config_producer_width(
+      workers, io_width, detached, exact_demand);
 
-  CHECK(index_shard_config_plan_widths(
-      workers, io_width, detached, exact_demand, &plan) == 0);
-  CHECK(plan.producer_width == expected_producers);
-  CHECK(plan.helper_width == expected_helpers);
-  CHECK(plan.producer_width + plan.helper_width ==
-        (size_t)workers);
+  CHECK(producer_width == expected_producers);
+  CHECK((size_t)workers - producer_width == expected_helpers);
 }
 
 int main(void) {
@@ -89,29 +86,24 @@ int main(void) {
   CHECK(index_shard_config_resolve_workers(4, 8) == 4);
   CHECK(index_shard_config_resolve_workers(9, 8) == -1);
 
-  CHECK(index_shard_config_effective_workers(8, 0) == 8);
-  CHECK(index_shard_config_effective_workers(8, 3) == 8);
-  CHECK(index_shard_config_effective_workers(1, 9) == 1);
-  CHECK(index_shard_config_effective_workers(0, 9) == 1);
+  CHECK(index_shard_config_effective_workers(8) == 8);
+  CHECK(index_shard_config_effective_workers(1) == 1);
+  CHECK(index_shard_config_effective_workers(0) == 1);
 
   CHECK(index_shard_config_exact_demand_pass(
-      1, 4, 1, 1, 349U, 0U, 0));
+      1, 4, 1, 349U, 0U));
   CHECK(!index_shard_config_exact_demand_pass(
-      0, 4, 1, 1, 349U, 0U, 0));
+      0, 4, 1, 349U, 0U));
   CHECK(!index_shard_config_exact_demand_pass(
-      1, 0, 1, 1, 349U, 0U, 0));
+      1, 0, 1, 349U, 0U));
   CHECK(!index_shard_config_exact_demand_pass(
-      1, 4, 0, 1, 349U, 0U, 0));
+      1, 4, 0, 349U, 0U));
   CHECK(!index_shard_config_exact_demand_pass(
-      1, 4, 1, 0, 349U, 0U, 0));
+      1, 4, 1, 0U, 0U));
   CHECK(!index_shard_config_exact_demand_pass(
-      1, 4, 1, 1, 0U, 0U, 0));
+      1, 4, 1, 349U, 1U));
   CHECK(!index_shard_config_exact_demand_pass(
-      1, 4, 1, 1, 349U, 1U, 0));
-  CHECK(!index_shard_config_exact_demand_pass(
-      1, 4, 1, 1, 349U, 0U, 1));
-  CHECK(!index_shard_config_exact_demand_pass(
-      2, 4, 1, 1, 349U, 0U, 0));
+      2, 4, 1, 349U, 0U));
 
   check_width_plan(1, 0, 0, 0, 1U, 0U);
   check_width_plan(2, 1, 1, 0, 2U, 0U);
@@ -126,24 +118,12 @@ int main(void) {
   check_width_plan(8, 6, 1, 1, 6U, 2U);
   check_width_plan(8, 8, 1, 1, 8U, 0U);
   check_width_plan(4, 0, 0, 0, 3U, 1U);
-  {
-    index_shard_width_plan_t invalid_plan = { 9U, 9U };
-
-    CHECK(index_shard_config_plan_widths(
-        0, 1, 1, 0, &invalid_plan) != 0);
-    CHECK(index_shard_config_plan_widths(
-        4, -1, 1, 0, &invalid_plan) != 0);
-    CHECK(index_shard_config_plan_widths(
-        4, 1, 1, 0, NULL) != 0);
-    CHECK(index_shard_config_plan_widths(
-        4, 0, 1, 1, &invalid_plan) != 0);
-    CHECK(index_shard_config_plan_widths(
-        4, 2, 0, 1, &invalid_plan) != 0);
-    CHECK(index_shard_config_plan_widths(
-        4, 2, 1, 2, &invalid_plan) != 0);
-    CHECK(index_shard_config_plan_widths(
-        4, 2, 2, 0, &invalid_plan) != 0);
-  }
+  CHECK(index_shard_config_producer_width(0, 1, 1, 0) == 0U);
+  CHECK(index_shard_config_producer_width(4, -1, 1, 0) == 0U);
+  CHECK(index_shard_config_producer_width(4, 0, 1, 1) == 0U);
+  CHECK(index_shard_config_producer_width(4, 2, 0, 1) == 0U);
+  CHECK(index_shard_config_producer_width(4, 2, 1, 2) == 0U);
+  CHECK(index_shard_config_producer_width(4, 2, 2, 0) == 0U);
 
   CHECK(detected_available >= 1);
   if (expected_available) {

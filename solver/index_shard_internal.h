@@ -147,26 +147,7 @@ anbool index_shard_worker_context_active(void);
  */
 anbool index_shard_worker_stop_requested(void);
 
-/*
- * Generic bounded helper work.
- *
- * Input bytes are immutable until index_shard_helper_run() returns. Output
- * ranges are pairwise disjoint, do not alias any input, and are invalid when
- * the group returns TASK_FAILED or STOPPED. Inputs may point into explicitly
- * immutable, index-free package arenas whose lifetime covers the group. No
- * range may point to an immutable package arena. No range may point to
- * mutable owner state, an index_t, a solver, a callback, or a reducer. A task
- * may borrow a const read-only payload view when the
- * outer owner retains its source lease until the synchronous group is fully
- * quiescent. execute() must be reentrant and thread-safe and must not mutate
- * global state or retain any task or source pointer after it returns.
- *
- * A staged task owner may call index_shard_helper_run() only from its typed
- * owner callback. This publishes one same-pool synchronous child group while
- * the staged task retains every input lifetime. Recursive helper publication
- * and calls from staged prepare/submit/poll/foreign-execute callbacks remain
- * unavailable.
- */
+/* Shared return values for bounded staged-package callbacks and runs. */
 typedef enum index_shard_helper_run_status {
   INDEX_SHARD_HELPER_FATAL = -3,
   INDEX_SHARD_HELPER_TASK_FAILED = -2,
@@ -183,108 +164,11 @@ typedef enum index_shard_helper_task_status {
 
 #define INDEX_SHARD_HELPER_MAX_TASKS 64U
 
-typedef index_shard_helper_task_status_t
-(*index_shard_helper_execute_fn)(
-    const void *input,
-    size_t input_bytes,
-    void *output,
-    size_t output_bytes);
-
-typedef struct index_shard_helper_ops {
-  const char *name;
-  index_shard_helper_execute_fn execute;
-} index_shard_helper_ops_t;
-
-typedef struct index_shard_helper_task {
-  const void *input;
-  size_t input_bytes;
-  void *output;
-  size_t output_bytes;
-  unsigned long long work_units;
-
-  /* Scheduler-owned while index_shard_helper_run() is active. */
-  unsigned char scheduler_state;
-  int execute_status;
-} index_shard_helper_task_t;
-
-typedef enum index_shard_helper_retire_status {
-  INDEX_SHARD_HELPER_RETIRE_ERROR = -1,
-  INDEX_SHARD_HELPER_RETIRE_OK = 0,
-  INDEX_SHARD_HELPER_RETIRE_STOPPED = 1
-} index_shard_helper_retire_status_t;
-
-/*
- * Called only by the outer owner, never by a foreign helper. Completed tasks
- * retire in increasing task_index order while later tasks may still execute.
- */
-typedef index_shard_helper_retire_status_t
-(*index_shard_helper_retire_fn)(
-    const index_shard_helper_task_t *task,
-    size_t task_index,
-    void *owner_context);
-
-typedef struct index_shard_helper_run_stats {
-  size_t owner_tasks;
-  size_t foreign_tasks;
-  size_t max_concurrent_tasks;
-  unsigned long long owner_work_units;
-  unsigned long long foreign_work_units;
-} index_shard_helper_run_stats_t;
-
-/*
- * Return an advisory count of workers that are outer-idle. The value may
- * become stale immediately after return and must never be used as a
- * correctness predicate.
- */
-size_t index_shard_helper_available_workers(void);
-
-/*
- * Acquire an owner-local preparation permit before constructing an expensive
- * helper package. The returned worker count is an admission snapshot, not a
- * worker reservation. A successful permit is consumed by helper_run() or
- * must be released explicitly on every native-fallback path.
- */
-size_t index_shard_helper_prepare_reserve(void);
-void index_shard_helper_prepare_cancel(void);
-
-/*
- * Publish one synchronous, fixed helper group from the current outer owner.
- * Task zero is reserved for that owner. The call returns only after every
- * task has completed and the stack-backed group is no longer published.
- * Foreign admission reservations remain pool-accounted until claimed,
- * cancelled, yielded to the owner, or released at group quiescence.
- * UNAVAILABLE publishes nothing and permits the native inline path. STOPPED
- * and TASK_FAILED invalidate every output. FATAL has already requested pool
- * fatal state and must be propagated by the caller.
- */
-index_shard_helper_run_status_t
-index_shard_helper_run(
-    const index_shard_helper_ops_t *ops,
-    index_shard_helper_task_t *tasks,
-    size_t task_count,
-    index_shard_helper_run_stats_t *stats);
-
-/*
- * Ordered continuation form of index_shard_helper_run(). The owner retires a
- * completed canonical prefix before claiming more local work. READY work is
- * never abandoned while the owner waits for a later completion. Once retire()
- * mutates owner state, a later task failure is terminal for that packet group;
- * callers must not replay the group through a native fallback.
- */
-index_shard_helper_run_status_t
-index_shard_helper_run_ordered(
-    const index_shard_helper_ops_t *ops,
-    index_shard_helper_task_t *tasks,
-    size_t task_count,
-    index_shard_helper_retire_fn retire,
-    void *owner_context,
-    index_shard_helper_run_stats_t *stats);
-
 /*
  * Persistent staged helper work.
  *
- * Unlike the synchronous helper task above, one logical staged task may
- * release its compute claim while a payload ticket is pending. The outer
+ * One logical staged task may release its compute claim while a payload
+ * ticket is pending. The outer
  * owner still waits for the complete group, retains every borrowed input and
  * mapping until quiescence, and alone retires results in task order.
  *
@@ -377,8 +261,6 @@ typedef struct index_shard_staged_ops {
   index_shard_staged_cancel_fn cancel;
   index_shard_staged_execute_fn execute;
   index_shard_staged_execute_fn owner;
-  /* Safe to collect a notified terminal ticket on its delivery lane. */
-  anbool terminal_poll_inline_safe;
 } index_shard_staged_ops_t;
 
 typedef struct index_shard_staged_task {
@@ -386,18 +268,10 @@ typedef struct index_shard_staged_task {
   size_t input_bytes;
   void *output;
   size_t output_bytes;
-  unsigned long long work_units;
 
   /* Scheduler-owned while index_shard_staged_run_ordered() is active. */
   unsigned char scheduler_state;
-  unsigned char cancel_sent;
-  unsigned char completion_pending;
-  int callback_status;
-  unsigned long long scheduler_epoch;
   unsigned long long completion_id;
-  double scheduler_submit_seconds;
-  double scheduler_ready_seconds;
-  double scheduler_result_seconds;
 } index_shard_staged_task_t;
 
 typedef enum index_shard_staged_retire_status {
@@ -418,29 +292,8 @@ typedef index_shard_staged_retire_status_t
     void *owner_context);
 
 typedef struct index_shard_staged_run_stats {
-  size_t owner_claims;
-  size_t foreign_claims;
-  size_t owner_compute_executes;
   size_t foreign_compute_executes;
-  size_t max_concurrent_claims;
   size_t max_compute_running;
-  size_t io_submitted;
-  size_t io_completed;
-  size_t max_io_submitted;
-  size_t max_compute_ready;
-  size_t max_reorder_ready;
-  size_t prepare_claims;
-  size_t submit_claims;
-  size_t poll_claims;
-  size_t execute_claims;
-  size_t owner_claims_executed;
-  double submit_to_ready_seconds;
-  double ready_dwell_seconds;
-  double execute_seconds;
-  double result_to_retire_seconds;
-  double retire_seconds;
-  unsigned long long owner_work_units;
-  unsigned long long foreign_work_units;
 } index_shard_staged_run_stats_t;
 
 /*
