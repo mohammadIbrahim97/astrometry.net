@@ -854,29 +854,37 @@ int onefield_parameters_are_okay(onefield_t* bp, solver_t* sp) {
 }
 
 int onefield_is_run_obsolete(onefield_t* bp, solver_t* sp) {
-  if (bp->single_field_solved)
-    return 1;
+  (void)sp;
 
-  if (bp->cancelled)
+  if (bp->single_field_solved) {
     return 1;
+  }
 
-  if (bp->hit_total_cpulimit || bp->hit_total_timelimit)
+  if (bp->cancelled) {
     return 1;
+  }
+
+  if (bp->hit_total_cpulimit || bp->hit_total_timelimit) {
+    return 1;
+  }
   // If we're just solving one field, check to see if it's already
   // solved before doing a bunch of work and spewing tons of output.
   if ((il_size(bp->fieldlist) == 1) && bp->solved_in) {
-    if (is_field_solved(bp, il_get(bp->fieldlist, 0)))
+    if (is_field_solved(bp, il_get(bp->fieldlist, 0))) {
+      bp->single_field_solved = TRUE;
       return 1;
     }
-    // Early check to see if this job was cancelled.
-    if (bp->cancelfname) {
-        if (file_exists(bp->cancelfname)) {
-            logerr("Run cancelled.\n");
-            return 1;
-        }
+  }
+  // Early check to see if this job was cancelled.
+  if (bp->cancelfname) {
+    if (file_exists(bp->cancelfname)) {
+      bp->cancelled = TRUE;
+      logerr("Run cancelled.\n");
+      return 1;
     }
+  }
 
-    return 0;
+  return 0;
 }
 
 static void load_and_parse_wcsfiles(onefield_t* bp) {
@@ -1398,6 +1406,7 @@ static anbool is_field_solved(onefield_t* bp, int fieldnum) {
 }
 
 void onefield_internal_solved_field(onefield_t* bp, int fieldnum) {
+    bp->any_field_solved = TRUE;
     if (bp->solved_fields_pending) {
         il_insert_unique_ascending(bp->solved_fields_pending, fieldnum);
     }

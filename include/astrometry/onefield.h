@@ -138,6 +138,8 @@ struct onefield_params {
     size_t engine_scale_index;
 
     anbool single_field_solved;
+    /* Monotonic across engine pass cleanup for the terminal job result. */
+    anbool any_field_solved;
 
     /* A solver execution error is distinct from a scientifically unsolved field. */
     anbool solver_failed;

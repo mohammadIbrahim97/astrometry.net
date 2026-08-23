@@ -459,7 +459,68 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
     return rtn;
 }
 
-int engine_run_job(engine_t* engine, job_t* job) {
+const char* engine_job_outcome_string(engine_job_outcome_t outcome) {
+    static const char* names[] = {
+        "UNSOLVED",
+        "SOLVED",
+        "WALL_LIMIT",
+        "CPU_LIMIT",
+        "CANCELLED",
+        "ERROR"
+    };
+    int value = (int)outcome;
+
+    if (value < 0 || value >= (int)(sizeof(names) / sizeof(names[0]))) {
+        return "ERROR";
+    }
+    return names[value];
+}
+
+void engine_job_result_from_onefield(engine_job_result_t* result,
+                                     int engine_rc,
+                                     const onefield_t* bp) {
+    if (!result) {
+        return;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->engine_rc = engine_rc;
+    if (!bp) {
+        result->execution_error = TRUE;
+        result->outcome = ENGINE_JOB_OUTCOME_ERROR;
+        return;
+    }
+
+    result->solved =
+        (bp->any_field_solved ||
+         bp->single_field_solved ||
+         (bp->solved_fields_pending &&
+          il_size(bp->solved_fields_pending) > 0)) ? TRUE : FALSE;
+    result->cancelled = bp->cancelled ? TRUE : FALSE;
+    result->wall_limit =
+        (bp->hit_timelimit || bp->hit_total_timelimit) ? TRUE : FALSE;
+    result->cpu_limit =
+        (bp->hit_cpulimit || bp->hit_total_cpulimit) ? TRUE : FALSE;
+    result->execution_error =
+        (engine_rc != 0 || bp->solver_failed) ? TRUE : FALSE;
+
+    if (result->execution_error) {
+        result->outcome = ENGINE_JOB_OUTCOME_ERROR;
+    } else if (result->solved) {
+        result->outcome = ENGINE_JOB_OUTCOME_SOLVED;
+    } else if (result->cancelled) {
+        result->outcome = ENGINE_JOB_OUTCOME_CANCELLED;
+    } else if (result->wall_limit) {
+        result->outcome = ENGINE_JOB_OUTCOME_WALL_LIMIT;
+    } else if (result->cpu_limit) {
+        result->outcome = ENGINE_JOB_OUTCOME_CPU_LIMIT;
+    } else {
+        result->outcome = ENGINE_JOB_OUTCOME_UNSOLVED;
+    }
+}
+
+int engine_run_job_with_result(engine_t* engine, job_t* job,
+                               engine_job_result_t* result) {
     onefield_t* bp = &(job->bp);
     solver_t* sp = &(bp->solver);
 
@@ -739,9 +800,14 @@ int engine_run_job(engine_t* engine, job_t* job) {
    }
    onefield_job_field_cache_end(bp);
 
+   engine_job_result_from_onefield(result, rtn, bp);
    solver_cleanup(sp);
    onefield_cleanup(bp);
    return rtn;
+}
+
+int engine_run_job(engine_t* engine, job_t* job) {
+    return engine_run_job_with_result(engine, job, NULL);
 }
 
 engine_t* engine_new() {

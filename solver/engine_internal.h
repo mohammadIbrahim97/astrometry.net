@@ -52,4 +52,8 @@ void engine_limit_policy_resolve(double job_wall_seconds,
                                  double config_cpu_seconds,
                                  engine_limit_policy_t* policy);
 
+void engine_job_result_from_onefield(engine_job_result_t* result,
+                                     int engine_rc,
+                                     const onefield_t* bp);
+
 #endif

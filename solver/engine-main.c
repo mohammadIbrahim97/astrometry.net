@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -66,6 +68,8 @@ static an_option_t myopts[] = {
      "send log message to stderr"},
     {'f', "inputs-from", required_argument, "file",
      "read input filenames from the given file, \"-\" for stdin"},
+    {'R', "job-status-fd", required_argument, "fd",
+     "write one PROI26_JOB_STATUS_V2 record after each streamed job"},
     {'i', "index", required_argument, "file(s)",
      "use the given index files (in addition to any specified in the config file); put in quotes to use wildcards, eg: \" -i 'index-*.fits' \""},
     {'I', "index-dir", required_argument, "directory",
@@ -77,6 +81,31 @@ static an_option_t myopts[] = {
     {'j', "job-id", required_argument, "jobid",
      "IGNORED; purely to allow process to contain the job id!"},
 };
+
+static int publish_job_status(FILE* stream,
+                              unsigned long long* sequence,
+                              const engine_job_result_t* result) {
+    if (!stream || !sequence || !result) {
+        errno = EINVAL;
+        return -1;
+    }
+    (*sequence)++;
+    if (fprintf(stream,
+                "PROI26_JOB_STATUS_V2\t%llu\t%i\t%s\t%i\t%i\t"
+                "%i\t%i\t%i\n",
+                *sequence,
+                result->engine_rc,
+                engine_job_outcome_string(result->outcome),
+                result->solved ? 1 : 0,
+                result->cancelled ? 1 : 0,
+                result->wall_limit ? 1 : 0,
+                result->cpu_limit ? 1 : 0,
+                result->execution_error ? 1 : 0) < 0 ||
+        fflush(stream)) {
+        return -1;
+    }
+    return 0;
+}
 
 static void print_help(const char* progname, bl* opts) {
     printf("Usage:   %s [options] <augmented xylist (axy) file(s)>\n", progname);
@@ -114,6 +143,8 @@ int main(int argc, char** args) {
     FILE* fin = NULL;
     int exit_status = 0;
     anbool fromstdin = FALSE;
+    FILE* job_status_stream = NULL;
+    unsigned long long job_sequence = 0ULL;
 
     bl* opts = opts_from_array(myopts, sizeof(myopts)/sizeof(an_option_t), NULL);
     sl* index_files = sl_new(4);
@@ -128,6 +159,24 @@ int main(int argc, char** args) {
         if (c == -1)
             break;
         switch (c) {
+	case 'R': {
+	    char* end = NULL;
+	    long fd;
+
+	    errno = 0;
+	    fd = strtol(optarg, &end, 10);
+	    if (errno == ERANGE || end == optarg || *end != '\0' ||
+	        fd < 3 || fd > INT_MAX) {
+	        logerr("Invalid job-status file descriptor: %s\n", optarg);
+	        exit(-1);
+	    }
+	    job_status_stream = fdopen((int)fd, "w");
+	    if (!job_status_stream) {
+	        SYSERROR("Failed to open job-status file descriptor %ld", fd);
+	        exit(-1);
+	    }
+	    break;
+	}
 	case 'j':
 	    break;
         case 'D':
@@ -321,14 +370,23 @@ int main(int argc, char** args) {
     while (1) {
         char* jobfn;
         job_t* job;
+        engine_job_result_t job_result;
         struct timeval tv1, tv2;
+        int job_status;
 
         if (infn) {
             // Read name of next input file to be read.
             logverb("\nWaiting for next input filename...\n");
             jobfn = read_string_terminated(fin, "\n\r\0", 3, FALSE);
-            if (strlen(jobfn) == 0)
+            if (!jobfn) {
+                ERROR("Failed to read next streamed input filename");
+                exit_status = 1;
                 break;
+            }
+            if (strlen(jobfn) == 0) {
+                free(jobfn);
+                break;
+            }
         } else {
             if (i == argc)
                 break;
@@ -340,7 +398,26 @@ int main(int argc, char** args) {
         job = engine_read_job_file(engine, jobfn);
         if (!job) {
             ERROR("Failed to read job file \"%s\"", jobfn);
-            exit(-1);
+            if (infn) {
+                free(jobfn);
+            }
+            memset(&job_result, 0, sizeof(job_result));
+            job_result.engine_rc = -1;
+            job_result.outcome = ENGINE_JOB_OUTCOME_ERROR;
+            job_result.execution_error = TRUE;
+            exit_status = 1;
+            if (job_status_stream) {
+                if (publish_job_status(
+                        job_status_stream, &job_sequence, &job_result)) {
+                    SYSERROR("Failed to publish streamed job status");
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if (infn) {
+            free(jobfn);
         }
 
 	if (basedir) {
@@ -348,7 +425,8 @@ int main(int argc, char** args) {
             job_set_output_base_dir(job, basedir);
 	}
 
-        if (engine_run_job(engine, job)) {
+        job_status = engine_run_job_with_result(engine, job, &job_result);
+        if (job_status) {
             logerr("Failed to run_job()\n");
             exit_status = 1;
         }
@@ -356,6 +434,14 @@ int main(int argc, char** args) {
         job_free(job);
         gettimeofday(&tv2, NULL);
         logverb("Spent %g seconds on this field.\n", millis_between(&tv1, &tv2)/1000.0);
+        if (job_status_stream) {
+            if (publish_job_status(
+                    job_status_stream, &job_sequence, &job_result)) {
+                SYSERROR("Failed to publish streamed job status");
+                exit_status = 1;
+                break;
+            }
+        }
     }
 
     engine_free(engine);
@@ -365,6 +451,10 @@ int main(int argc, char** args) {
 
     if (fin && !fromstdin)
         fclose(fin);
+    if (job_status_stream && fclose(job_status_stream)) {
+        SYSERROR("Failed to close streamed job status");
+        exit_status = 1;
+    }
 
     return exit_status;
 }

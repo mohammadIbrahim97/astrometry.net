@@ -69,6 +69,30 @@ struct job_t {
 };
 typedef struct job_t job_t;
 
+typedef enum engine_job_outcome {
+    ENGINE_JOB_OUTCOME_UNSOLVED = 0,
+    ENGINE_JOB_OUTCOME_SOLVED,
+    ENGINE_JOB_OUTCOME_WALL_LIMIT,
+    ENGINE_JOB_OUTCOME_CPU_LIMIT,
+    ENGINE_JOB_OUTCOME_CANCELLED,
+    ENGINE_JOB_OUTCOME_ERROR
+} engine_job_outcome_t;
+
+/*
+ * Pointer-free snapshot of one completed engine job.  The stop flags retain
+ * overlapping observations while outcome applies the authoritative terminal
+ * precedence used by the streamed protocol.
+ */
+typedef struct engine_job_result {
+    int engine_rc;
+    engine_job_outcome_t outcome;
+    anbool solved;
+    anbool cancelled;
+    anbool wall_limit;
+    anbool cpu_limit;
+    anbool execution_error;
+} engine_job_result_t;
+
 engine_t* engine_new();
 void engine_add_search_path(engine_t* engine, const char* path);
 char* engine_find_index(engine_t*, const char* name);
@@ -79,6 +103,9 @@ int engine_autoindex_search_paths(engine_t* engine);
 int engine_parse_config_file_stream(engine_t* engine, FILE* fconf);
 int engine_parse_config_file(engine_t* engine, const char* fn);
 int engine_run_job(engine_t* engine, job_t* job);
+int engine_run_job_with_result(engine_t* engine, job_t* job,
+                               engine_job_result_t* result);
+const char* engine_job_outcome_string(engine_job_outcome_t outcome);
 void engine_free(engine_t* engine);
 
 job_t* engine_read_job_file(engine_t* engine, const char* jobfn);
