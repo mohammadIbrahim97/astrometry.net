@@ -8,6 +8,9 @@
 
 #include "solver.h"
 
+void solver_profile_accumulate(
+    solver_profile_t* total,
+    const solver_profile_t* profile);
 void solver_profile_report(const solver_t* solver);
 
 #endif

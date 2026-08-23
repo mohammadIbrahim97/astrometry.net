@@ -15,6 +15,8 @@
 #include "astrometry/bl.h"
 #include "astrometry/keywords.h"
 
+struct stat;
+
 extern uint32_t ENDIAN_DETECTOR;
 
 void QSORT_R(void* base, size_t nmembers, size_t member_size,
@@ -28,6 +30,10 @@ void QSORT_R(void* base, size_t nmembers, size_t member_size,
 #define QSORT_COMPARISON_FUNCTION(func, thunk, v1, v2) func(thunk, v1, v2)
 
 int copy_file(const char* infn, const char* outfn);
+
+anbool stat_file_identity_equal(
+    const struct stat* first,
+    const struct stat* second);
 
 int pad_fid(FILE* fid, size_t len, char pad);
 int pad_file(char* filename, size_t len, char pad);

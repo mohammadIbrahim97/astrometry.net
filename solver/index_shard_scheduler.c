@@ -3,32 +3,22 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
-/*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
- */
-#include <assert.h>
-#include <errno.h>
-#include <limits.h>
-#include <math.h>
 #include <pthread.h>
-#include <sched.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "index_shard_private.h"
-#include "astrometry/bl.h"
-#include "astrometry/errors.h"
 #include "astrometry/log.h"
-#include "astrometry/tic.h"
 #include "astrometry/fitsbin.h"
-#include "astrometry/fitsioutils.h"
+
+/* queue_mutex must be held. */
+static anbool index_shard_outer_claimable_locked(
+    const index_shard_thread_state_t *shared) {
+  return shared && shared->producer_width &&
+      shared->outer_running < shared->producer_width &&
+      shared->canonical_scan_cursor < shared->nindexes;
+}
+
 /* queue_mutex must be held. */
 static anbool index_shard_queue_work_available_locked(
     const index_shard_thread_state_t *shared) {
@@ -37,9 +27,7 @@ static anbool index_shard_queue_work_available_locked(
   if (!shared || !shared->pool) {
     return FALSE;
   }
-  if (shared->outer_states && shared->outer_unclaimed &&
-      shared->producer_width &&
-      shared->outer_running < shared->producer_width) {
+  if (index_shard_outer_claimable_locked(shared)) {
     return TRUE;
   }
   for (owner_worker = 0;
@@ -49,13 +37,8 @@ static anbool index_shard_queue_work_available_locked(
         &shared->pool->contexts[owner_worker];
     const index_shard_staged_group_t *staged =
         owner->published_staged_group;
-    const index_shard_helper_group_t *helper =
-        owner->published_helper_group;
     uint64_t io_ready;
 
-    if (helper && helper->ready_count) {
-      return TRUE;
-    }
     if (!staged) {
       continue;
     }
@@ -76,24 +59,104 @@ static anbool index_shard_queue_work_available_locked(
   return FALSE;
 }
 
+static size_t index_shard_ready_count(uint64_t mask) {
+  size_t count = 0U;
+
+  while (mask) {
+    mask &= mask - UINT64_C(1);
+    count++;
+  }
+  return count;
+}
+
+/* queue_mutex must be held. */
+static anbool index_shard_group_compute_executable_locked(
+    const index_shard_staged_group_t *group) {
+  return group && !group->cancelling && !group->task_failed &&
+      !group->internal_error && !group->stop_seen;
+}
+
+/*
+ * queue_mutex must be held. Owners wait on private condition variables while
+ * their published groups are waiting for delivery. Wake one such owner when
+ * READY compute exceeds the workers already routed to it. The awakened owner
+ * still claims through the normal global selector, so task and result order do
+ * not change.
+ */
+static void index_shard_owner_helper_signal_locked(
+    index_shard_thread_state_t *shared) {
+  size_t ready_count = 0U;
+  size_t routed_count;
+  int owner_worker;
+
+  if (!shared || !shared->pool) {
+    return;
+  }
+  routed_count = shared->queue_waiters ? 1U : 0U;
+  for (owner_worker = 0;
+       owner_worker < shared->worker_count;
+       owner_worker++) {
+    index_shard_worker_context_t *owner =
+        &shared->pool->contexts[owner_worker];
+    index_shard_staged_group_t *group =
+        owner->published_staged_group;
+    size_t group_ready;
+
+    if (!index_shard_group_compute_executable_locked(group)) {
+      continue;
+    }
+    group_ready = index_shard_ready_count(
+        group->compute_ready_mask);
+    if (ready_count > SIZE_MAX - group_ready) {
+      ready_count = SIZE_MAX;
+    } else {
+      ready_count += group_ready;
+    }
+    if (owner->owner_wake_pending ||
+        (group_ready && owner->owner_cv_ready &&
+         owner->owner_waiting)) {
+      if (routed_count != SIZE_MAX) {
+        routed_count++;
+      }
+    }
+  }
+  if (ready_count <= routed_count) {
+    return;
+  }
+
+  for (owner_worker = 0;
+       owner_worker < shared->worker_count;
+       owner_worker++) {
+    index_shard_worker_context_t *owner =
+        &shared->pool->contexts[owner_worker];
+    index_shard_staged_group_t *group =
+        owner->published_staged_group;
+
+    if (!owner->owner_cv_ready || !owner->owner_waiting ||
+        owner->owner_wake_pending ||
+        (index_shard_group_compute_executable_locked(group) &&
+         group->compute_ready_mask)) {
+      continue;
+    }
+    owner->owner_wake_pending = TRUE;
+    pthread_cond_signal(&owner->owner_cv);
+    return;
+  }
+}
+
 /* queue_mutex must be held. */
 void index_shard_queue_signal_locked(
     index_shard_thread_state_t *shared) {
-  if (!shared || !shared->queue_waiters) {
+  if (!shared) {
     return;
   }
   if (!index_shard_queue_work_available_locked(shared)) {
-    if (shared->observability_enabled) {
-      index_shard_observability_increment(
-          &shared->queue_signals_no_work);
-    }
     return;
   }
-  if (shared->observability_enabled) {
-    index_shard_observability_increment(
-        &shared->queue_signals);
+  if (shared->queue_waiters) {
+    pthread_cond_signal(&shared->queue_cv);
   }
-  pthread_cond_signal(&shared->queue_cv);
+  index_shard_owner_helper_signal_locked(shared);
 }
 
 /* queue_mutex must be held. */
@@ -111,17 +174,9 @@ void index_shard_owner_signal_locked(
     return;
   }
   if (owner->owner_wake_pending) {
-    if (shared->observability_enabled) {
-      index_shard_observability_increment(
-          &shared->owner_signals_coalesced);
-    }
     return;
   }
   owner->owner_wake_pending = TRUE;
-  if (shared->observability_enabled) {
-    index_shard_observability_increment(
-        &shared->owner_signals);
-  }
   pthread_cond_signal(&owner->owner_cv);
 }
 
@@ -146,10 +201,6 @@ void index_shard_queue_broadcast_locked(
     return;
   }
   if (shared->queue_waiters) {
-    if (shared->observability_enabled) {
-      index_shard_observability_increment(
-          &shared->queue_broadcasts);
-    }
     pthread_cond_broadcast(&shared->queue_cv);
   }
   if (!shared->pool) {
@@ -168,15 +219,10 @@ void index_shard_queue_broadcast_locked(
       continue;
     }
     owner->owner_wake_pending = TRUE;
-    if (shared->observability_enabled) {
-      index_shard_observability_increment(
-          &shared->owner_broadcasts);
-    }
     pthread_cond_broadcast(&owner->owner_cv);
   }
 }
 
-// ANCHOR INDEX-SHARD: wake-pass-waiters
 void index_shard_wake_pass_waiters(index_shard_thread_state_t *shared) {
   pthread_mutex_lock(&shared->result_mutex);
   pthread_cond_broadcast(&shared->result_cv);
@@ -190,119 +236,118 @@ void index_shard_wake_queue_waiters(
   pthread_mutex_unlock(&shared->queue_mutex);
 }
 
-const char *index_shard_terminal_cause_name(
-    index_shard_terminal_cause_t cause) {
-  switch (cause) {
-  case INDEX_SHARD_TERMINAL_NONE:
-    return "none";
-  case INDEX_SHARD_TERMINAL_WINNER:
-    return "winner";
-  case INDEX_SHARD_TERMINAL_WALL_LIMIT:
-    return "wall-limit";
-  case INDEX_SHARD_TERMINAL_CPU_LIMIT:
-    return "cpu-limit";
-  case INDEX_SHARD_TERMINAL_CANCELLED:
-    return "cancelled";
-  case INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY:
-    return "global-integrity";
+/* queue_mutex must be held. */
+static int index_shard_ready_select_locked(
+    index_shard_worker_context_t *worker,
+    index_shard_thread_state_t *shared,
+    anbool allow_owner,
+    index_shard_inner_claim_t *claim) {
+  if (!worker || !shared || !claim) {
+    return -1;
   }
-  return "invalid";
+  memset(claim, 0, sizeof(*claim));
+  return index_shard_staged_select_locked(
+      worker, shared, INDEX_SHARD_STAGED_SELECT_COMPUTE,
+      allow_owner, !allow_owner, claim);
+}
+
+/* queue_mutex must be held. */
+static int index_shard_delivery_select_locked(
+    index_shard_worker_context_t *worker,
+    index_shard_thread_state_t *shared,
+    anbool allow_owner,
+    index_shard_inner_claim_t *claim) {
+  int rc;
+
+  if (!worker || !shared || !claim) {
+    return -1;
+  }
+  memset(claim, 0, sizeof(*claim));
+  rc = index_shard_staged_select_locked(
+      worker, shared, INDEX_SHARD_STAGED_SELECT_IO,
+      allow_owner, !allow_owner, claim);
+  if (rc <= 0) {
+    return rc;
+  }
+  rc = index_shard_staged_select_locked(
+      worker, shared, INDEX_SHARD_STAGED_SELECT_SUBMIT,
+      allow_owner, !allow_owner, claim);
+  if (rc <= 0) {
+    return rc;
+  }
+  return index_shard_staged_select_locked(
+      worker, shared, INDEX_SHARD_STAGED_SELECT_PREPARE,
+      allow_owner, !allow_owner, claim);
 }
 
 /*
- * SECTION INDEX-SHARD: queue
+ * Owner loops use the same READY-first protocol without passing through
+ * outer admission. No callback runs while queue_mutex is held.
  */
-// ANCHOR INDEX-SHARD: claim-one
-/*
- * Claim one shard task.
- *
- * Invariant:
- *   - each index_order is claimed at most once
- *   - stop/fatal prevents new claims
- *
- * Each participating worker owns at most one synchronous task, so the worker
- * count itself is the concurrency bound; no separate task-credit condition is
- * needed.
- */
-void index_shard_worker_cleanup_pass(
-    index_shard_worker_context_t *ctx,
-    index_shard_thread_state_t *shared);
+int index_shard_inner_select_locked(
+    index_shard_worker_context_t *worker,
+    index_shard_thread_state_t *shared,
+    anbool allow_owner,
+    index_shard_inner_claim_t *claim) {
+  int rc = index_shard_ready_select_locked(
+      worker, shared, allow_owner, claim);
 
-static void index_shard_advance_canonical_cursor_locked(
-    index_shard_thread_state_t *shared) {
-  while (shared->canonical_scan_cursor < shared->nindexes &&
-         shared->outer_states[shared->canonical_scan_cursor] !=
-             INDEX_SHARD_OUTER_UNCLAIMED) {
-    shared->canonical_scan_cursor++;
+  if (rc <= 0) {
+    return rc;
   }
+  return index_shard_delivery_select_locked(
+      worker, shared, allow_owner, claim);
 }
 
+/*
+ * queue_mutex must be held. Advancing canonical_scan_cursor assigns each
+ * outer index at most once and outer_running bounds concurrent owners.
+ */
 int index_shard_claim_outer_locked(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     size_t candidate,
-    size_t *index_order,
-    fitsbin_mmap_advice_t *mmap_advice) {
+    size_t *index_order) {
   if (candidate >= shared->nindexes ||
-      shared->outer_states[candidate] !=
-          INDEX_SHARD_OUTER_UNCLAIMED ||
-      !shared->outer_unclaimed ||
+      candidate != shared->canonical_scan_cursor ||
       shared->outer_running >= shared->producer_width) {
     return -1;
   }
-  shared->outer_states[candidate] =
-      INDEX_SHARD_OUTER_RUNNING;
   worker->ready_before_outer_eligible = FALSE;
-  shared->outer_unclaimed--;
   shared->outer_running++;
-  shared->outer_claims++;
+  shared->canonical_scan_cursor++;
   *index_order = candidate;
-  *mmap_advice = shared->mmap_advice;
-  if (candidate == shared->canonical_scan_cursor) {
-    index_shard_advance_canonical_cursor_locked(shared);
-  }
-
   if (index_shard_trace_enabled()) {
     logmsg("[index-shard] claim index_order=%zu lane=producer "
            "worker=%i owners=%zu producer_width=%zu "
-           "outer_unclaimed=%zu payload=%s "
-           "wall_since_pass=%.6f\n",
+           "outer_unclaimed=%zu payload=%s\n",
            candidate,
            worker->worker_id,
            shared->outer_running,
            shared->producer_width,
-           shared->outer_unclaimed,
-           fitsbin_mmap_advice_name(*mmap_advice),
-           monotonic_seconds() - shared->pass_wall_start);
+           shared->nindexes - shared->canonical_scan_cursor,
+           fitsbin_mmap_advice_name(FITSBIN_MMAP_ADVICE_RANDOM));
   }
-  /*
-   * A targeted publication may wake a worker that consumes the canonical
-   * outer slot before looking at already-published inner work. Hand off one
-   * additional wake so that outer-first priority cannot strand that work.
-   */
+  /* Another worker may still execute READY work or fill outer capacity. */
   index_shard_queue_signal_locked(shared);
   return 0;
 }
 
 /*
  * Select work from the current band without transferring index ownership.
- *
- * A worker that just completed one outer task may execute one already-ready
- * foreign staged computation before opening another cold index. The handoff
- * is consumed before any callback runs, so the next selection restores
- * canonical outer priority. All other inner work remains eligible only when
- * no outer task is immediately claimable. The reducer remains the only
- * authority for master result mutation.
+ * Outer admission normally takes priority so inner work cannot leave owner
+ * capacity unused. After completing an outer task, a worker may execute one
+ * already-READY foreign package before claiming another index. The reducer
+ * remains the only authority for master result mutation.
  */
 index_shard_work_selection_t
 index_shard_select_work(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     size_t *index_order,
-    fitsbin_mmap_advice_t *mmap_advice,
     index_shard_inner_claim_t *inner_claim) {
-  if (!worker || !shared || !index_order || !mmap_advice || !inner_claim ||
-      !shared->outer_states || !shared->producer_width) {
+  if (!worker || !shared || !index_order || !inner_claim ||
+      !shared->producer_width) {
     return INDEX_SHARD_WORK_ERROR;
   }
   if (worker->worker_id < 0 ||
@@ -312,52 +357,46 @@ index_shard_select_work(
 
   pthread_mutex_lock(&shared->queue_mutex);
   while (1) {
-    index_shard_pass_state_snapshot_t state;
     size_t candidate;
     int inner_selection;
 
-    index_shard_pass_state_snapshot(shared, &state);
-    if (state.stop_requested || state.fatal_error ||
-        state.solved_published) {
+    /* Linearize every claim before or after terminal publication. */
+    pthread_mutex_lock(&shared->state_mutex);
+    if (shared->terminal_cause != INDEX_SHARD_TERMINAL_NONE) {
+      pthread_mutex_unlock(&shared->state_mutex);
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_DONE;
     }
 
     if (worker->ready_before_outer_eligible &&
-        index_shard_helper_outer_claimable_locked(shared)) {
+        index_shard_outer_claimable_locked(shared)) {
       worker->ready_before_outer_eligible = FALSE;
-      inner_selection = index_shard_staged_select_locked(
-          worker,
-          shared,
-          INDEX_SHARD_STAGED_SELECT_COMPUTE,
-          FALSE,
-          TRUE,
-          &inner_claim->staged);
+      inner_selection = index_shard_ready_select_locked(
+          worker, shared, FALSE, inner_claim);
       if (inner_selection < 0) {
+        pthread_mutex_unlock(&shared->state_mutex);
         pthread_mutex_unlock(&shared->queue_mutex);
         return INDEX_SHARD_WORK_ERROR;
       }
       if (!inner_selection) {
-        inner_claim->kind = INDEX_SHARD_INNER_CLAIM_STAGED;
-        shared->staged_ready_before_outer_claims++;
+        pthread_mutex_unlock(&shared->state_mutex);
         pthread_mutex_unlock(&shared->queue_mutex);
-        return INDEX_SHARD_WORK_HELPER;
+        return INDEX_SHARD_WORK_INNER;
       }
     }
 
-    index_shard_advance_canonical_cursor_locked(shared);
     candidate = shared->canonical_scan_cursor;
-    if (candidate < shared->nindexes &&
-        shared->outer_running < shared->producer_width) {
+    if (index_shard_outer_claimable_locked(shared)) {
       if (index_shard_claim_outer_locked(
               worker,
               shared,
               candidate,
-              index_order,
-              mmap_advice)) {
+              index_order)) {
+        pthread_mutex_unlock(&shared->state_mutex);
         pthread_mutex_unlock(&shared->queue_mutex);
         return INDEX_SHARD_WORK_ERROR;
       }
+      pthread_mutex_unlock(&shared->state_mutex);
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_OUTER;
     }
@@ -365,43 +404,25 @@ index_shard_select_work(
     inner_selection = index_shard_inner_select_locked(
         worker, shared, FALSE, inner_claim);
     if (inner_selection < 0) {
+      pthread_mutex_unlock(&shared->state_mutex);
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_ERROR;
     }
     if (!inner_selection) {
+      pthread_mutex_unlock(&shared->state_mutex);
       pthread_mutex_unlock(&shared->queue_mutex);
-      return INDEX_SHARD_WORK_HELPER;
+      return INDEX_SHARD_WORK_INNER;
     }
 
     if (!shared->outer_running) {
+      pthread_mutex_unlock(&shared->state_mutex);
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_DONE;
     }
-    if (worker->local_context_ready) {
-      /*
-       * No new outer task can become claimable for this worker in the
-       * current band. Release its index-local context before it waits for
-       * helper packages from the remaining owners.
-       */
-      pthread_mutex_unlock(&shared->queue_mutex);
-      index_shard_worker_cleanup_pass(worker, shared);
-      pthread_mutex_lock(&shared->queue_mutex);
-      continue;
-    }
+    pthread_mutex_unlock(&shared->state_mutex);
     shared->queue_waiters++;
-    if (shared->observability_enabled) {
-      double wait_start = monotonic_seconds();
-
-      index_shard_observability_increment(
-          &shared->queue_wait_calls);
-      inner_selection = pthread_cond_wait(
-          &shared->queue_cv, &shared->queue_mutex);
-      shared->queue_wait_seconds +=
-          monotonic_seconds() - wait_start;
-    } else {
-      inner_selection = pthread_cond_wait(
-          &shared->queue_cv, &shared->queue_mutex);
-    }
+    inner_selection = pthread_cond_wait(
+        &shared->queue_cv, &shared->queue_mutex);
     if (!shared->queue_waiters) {
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_ERROR;

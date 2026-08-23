@@ -17,6 +17,7 @@
 #include "ioutils.h"
 #include "errors.h"
 #include "fitsbin.h"
+#include "../util/fitsbin_internal.h"
 #include "tic.h"
 #include "log.h"
 

@@ -14,14 +14,14 @@ usage() {
   echo "    Path to the directory containing the indices for the solver."
   echo "  --index-base-name <index-base-name>"
   echo "    Common part of the names of the index files inside <index-dir>."
-  echo "    For example, if you have several index file that are named index_05.fits,"
+  echo "    For example, if you have several index files named index_05.fits,"
   echo "    index_06.fits, index_07.fits, etc, this option's argument should be \"index_\"."
   echo "    These numbers must have two digits, and the file extension is assumed to be .fits."
   echo ""
   echo "Optional options:"
   echo "  --source-extractor-config <path>"
   echo "    Path to the configuration file for source-extractor."
-  echo "    If this option is given, astromtry will use source-extractor;"
+  echo "    If this option is given, astrometry will use source-extractor;"
   echo "    otherwise, it will use image2xy."
   echo "  --time-limit <seconds>"
   echo "    Total time limit for the solver. Does not include source extraction."
@@ -42,7 +42,7 @@ usage() {
   echo "    Any file with a blur score above this number will be excluded."
   echo "    Will have no effect unless --blur-score-path is also present."
   echo "    Default: $DEFAULT_BLUR_THRESHOLD."
-  echo "  --filter <regex>"
+  echo "  --regex <regex>"
   echo "    Only files that appear in the input directory and match the given"
   echo "    regex pattern will be handled."
   echo "    For example, to only handle incoming .fits files, pass '.*.fits'."
@@ -56,7 +56,7 @@ rounded_index_scale() {
   # (subsection: Index scale)
   exact=$(echo "2*l(8*$1)/l(2)" | bc -l)
 
-  # This is not exact rounding (+0.5), but instead aplies a slight bias
+  # This is not exact rounding (+0.5), but instead applies a slight bias
   # towards lower index scales, as those, while having a larger file size,
   # seem to be checked more quickly by the solver
   rounded=$(echo "($exact+0.4)/1" | bc)
@@ -70,8 +70,73 @@ clean() {
       -exec rm {} \;
 }
 
+file_is_stable() {
+  first_state=$(stat -Lc "%d:%i:%s:%y" -- "$1" 2>/dev/null) || return 1
+  sleep 0.1
+  second_state=$(stat -Lc "%d:%i:%s:%y" -- "$1" 2>/dev/null) || return 1
+  [[ "$first_state" == "$second_state" ]]
+}
+
+stop_child() {
+  signal="$1"
+  if [[ -z $child_pid ]]; then
+    return 0
+  fi
+
+  kill "-$signal" "$child_pid" 2>/dev/null || true
+  kill "-$signal" -- "-$child_group" 2>/dev/null || true
+  for ((attempt=0; attempt<50; attempt++)); do
+    if ! kill -0 "$child_pid" 2>/dev/null && \
+        ! kill -0 -- "-$child_group" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+  done
+  if kill -0 "$child_pid" 2>/dev/null || \
+      kill -0 -- "-$child_group" 2>/dev/null; then
+    kill -KILL -- "-$child_group" 2>/dev/null || true
+    kill -KILL "$child_pid" 2>/dev/null || true
+  fi
+  wait "$child_pid" 2>/dev/null || true
+  for ((attempt=0; attempt<50; attempt++)); do
+    if ! kill -0 -- "-$child_group" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+  done
+  if kill -0 -- "-$child_group" 2>/dev/null; then
+    echo "ERROR: Child process group $child_group did not stop." >&2
+    return 1
+  fi
+  child_pid=
+  child_group=
+}
+
+handle_signal() {
+  if [[ -n $launching_child ]]; then
+    pending_signal="$1"
+    pending_status="$2"
+    return 0
+  fi
+  signal="$1"
+  status="$2"
+  trap - HUP INT TERM
+  stop_child "$signal"
+  exit "$status"
+}
+
+cleanup() {
+  if ! stop_child TERM; then
+    echo "WARNING: Retaining temporary directory '$tmp_dir' for the running child." >&2
+    return
+  fi
+  if [[ -n $tmp_dir ]]; then
+    rm -rf -- "$tmp_dir"
+  fi
+}
+
 # This requires GNU getopt. On Mac OS X and FreeBSD, you have to install this separately.
-args=$(getopt -o hi:v --long help:,input-directory:,input-dir:,index-dir:,index-directory:,index-base-name:,\
+args=$(getopt -o hi:v --long help,input-directory:,input-dir:,index-dir:,index-directory:,index-base-name:,\
 source-extractor-config:,time-limit:,scale-low:,scale-high:,blur-score-path:,blur-threshold:,regex:,verbose \
 -n "$0" -- "$@")
 
@@ -132,7 +197,7 @@ while true; do
       time_limit=$2
       shift 2 ;;
     --scale-low )
-      # Again, sanity checks are done ltaer
+      # Again, sanity checks are done later
       if ! [[ "$2" =~ $NUMREG ]] ; then
         echo "ERROR: Lower scale bound (--scale-low) needs to be a number."
         usage; exit 255
@@ -149,7 +214,7 @@ while true; do
     --blur-score-path )
       blur_score_path="$(realpath -m "$2")"
       if ! [ -f "$blur_score_path" ]; then
-        echo "ERROR: Blur score executable at \"$blur_score_path doesn't exist."
+        echo "ERROR: Blur score executable at \"$blur_score_path\" doesn't exist."
         usage; exit 255
       fi
       shift 2 ;;
@@ -184,6 +249,13 @@ if [[ -z "$index_base_name" ]]; then
   usage; exit 255
 fi
 
+for required_command in bc find inotifywait mktemp seq setsid solve-field stat; do
+  if ! command -v "$required_command" 1>/dev/null 2>/dev/null; then
+    echo "ERROR: Required command '$required_command' was not found."
+    exit 255
+  fi
+done
+
 if [[ -n $scale_low ]] && [[ -n $scale_high ]]; then
   if (( $(echo "$scale_low > $scale_high" | bc) )); then
     echo "ERROR: --scale-low must not be greater than --scale-high."
@@ -192,18 +264,18 @@ if [[ -n $scale_low ]] && [[ -n $scale_high ]]; then
 fi
 
 
-whole_command="solve-field -p"
+whole_command=(solve-field -p)
 
 # Find out whether a parallelized build is being used
-if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
+if solve-field --wall-limit 0 1>/dev/null 2>/dev/null; then
   if [ $verbose ]; then
     echo "solve-field recognized --wall-limit, which means this version supports parallelization."
   fi
-  whole_command="$whole_command --wall-limit $time_limit"
+  whole_command+=(--wall-limit "$time_limit")
 else
-  if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
-    echo "WARNING: Using versison of solve-field without parallelization."
-    whole_command="$whole_command --cpulimit $time_limit"
+  if solve-field --cpulimit 0 1>/dev/null 2>/dev/null; then
+    echo "WARNING: Using version of solve-field without parallelization."
+    whole_command+=(--cpulimit "$time_limit")
   else
     echo "ERROR: solve-field recognized neither --wall-limit nor --cpulimit."
     echo "  Is your executable broken?"
@@ -214,17 +286,17 @@ fi
 min_index_scale=0
 max_index_scale=19
 if [[ -n $scale_low ]]; then
-  whole_command="$whole_command --scale-low $scale_low"
+  whole_command+=(--scale-low "$scale_low")
   # shellcheck disable=SC2086 # Values are numeric
   min_index_scale=$(("$(rounded_index_scale $scale_low)"-1))
 fi
 if [[ -n $scale_high ]]; then
-  whole_command="$whole_command --scale-high $scale_high"
+  whole_command+=(--scale-high "$scale_high")
   # shellcheck disable=SC2086
   max_index_scale=$(("$(rounded_index_scale $scale_high)"+1))
 fi
 if [ $verbose ]; then
-  echo "Index scales form $min_index_scale to $max_index_scale will be used."
+  echo "Index scales from $min_index_scale to $max_index_scale will be used."
 fi
 
 indices_found=0
@@ -232,7 +304,7 @@ for i in $(seq -f "%02g" $min_index_scale $max_index_scale); do
   filename="$index_dir/$index_base_name$i.fits"
   if [[ -f $filename ]]; then
     indices_found=1
-    whole_command="$whole_command --index-file $filename"
+    whole_command+=(--index-file "$filename")
     if [ $verbose ]; then
       echo "Found index file $filename."
     fi
@@ -248,16 +320,36 @@ if [ $indices_found -eq 0 ]; then
 fi
 
 if [[ -n $source_extractor_config ]]; then
-  whole_command="$whole_command --use-source-extractor --source-extractor-config $source_extractor_config"
-  whole_command="$whole_command --x-column X_IMAGE --y-column Y_IMAGE --sort-column MAG_AUTO --sort-ascending"
+  whole_command+=(
+    --use-source-extractor
+    --source-extractor-config "$source_extractor_config"
+    --x-column X_IMAGE
+    --y-column Y_IMAGE
+    --sort-column MAG_AUTO
+    --sort-ascending
+  )
 fi
 
-tmp_dir=$(mktemp -d)
-whole_command="$whole_command --dir $tmp_dir"
-trap 'rm -rf -- "$tmp_dir"' EXIT
+tmp_dir=
+child_pid=
+child_group=
+launching_child=
+pending_signal=
+pending_status=
+trap 'handle_signal HUP 129' HUP
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+trap cleanup EXIT
+tmp_dir=$(mktemp -d) || exit 255
+whole_command+=(--dir "$tmp_dir")
+solve_stdout="$tmp_dir/solve-field.stdout"
+solve_stderr="$tmp_dir/solve-field.stderr"
+watch_stdout="$tmp_dir/inotifywait.stdout"
 
 if [ $verbose ]; then
-  echo "Whole command is: $whole_command"
+  printf "Whole command is:"
+  printf " %q" "${whole_command[@]}"
+  printf "\n"
 fi
 
 # -----------------------------------------------------------------------------
@@ -269,12 +361,54 @@ while true; do
     if [ $verbose ]; then
       echo "Waiting for new files..."
     fi
-    while read -r _ _ file; do
-      if [ $verbose ]; then
-        echo "New file appeared: '$file'"
-      fi
-      latest="$input_dir/$file"
-    done < <(inotifywait "$input_dir" -e create -e moved_to --include "$regex")
+    : > "$watch_stdout"
+    launching_child="set"
+    setsid inotifywait -q -t 1 "$input_dir" -e close_write -e moved_to \
+        --include "$regex" --format "%f" >"$watch_stdout" &
+    child_pid=$!
+    child_group=$child_pid
+    launching_child=
+    if [[ -n $pending_signal ]]; then
+      saved_signal="$pending_signal"
+      saved_status="$pending_status"
+      pending_signal=
+      pending_status=
+      handle_signal "$saved_signal" "$saved_status"
+    fi
+    wait "$child_pid"
+    watch_status=$?
+    if kill -0 -- "-$child_group" 2>/dev/null; then
+      stop_child TERM
+      watch_status=125
+    else
+      child_pid=
+      child_group=
+    fi
+    event="$(<"$watch_stdout")"
+    if [[ $watch_status -eq 2 ]]; then
+      continue
+    elif [[ $watch_status -ne 0 ]]; then
+      echo "WARNING: Could not watch '$input_dir'; retrying..." >&2
+      sleep 1
+      continue
+    fi
+    file="$event"
+    if [ $verbose ]; then
+      echo "New file appeared: '$file'"
+    fi
+    latest="$input_dir/$file"
+  fi
+
+  if [[ -z $latest || ! -f $latest || -L $latest ]]; then
+    echo "WARNING: Ignoring an unavailable or unsafe input path: '$latest'."
+    last="$latest"
+    continue
+  fi
+  if ! file_is_stable "$latest"; then
+    if [ $verbose ]; then
+      echo "Waiting for '$latest' to become stable..."
+    fi
+    continue
   fi
 
   latest_base="$(basename "$latest")"
@@ -284,8 +418,11 @@ while true; do
   if [ -z "$blur_score_path" ]; then
     solve_file=1
   else
-    bs="$($blur_score_path "$latest")"
-    if (( $(echo "$bs > $blur_threshold" | bc ) )); then
+    blur_status=0
+    bs="$("$blur_score_path" "$latest")" || blur_status=$?
+    if [[ $blur_status -ne 0 || ! $bs =~ $NUMREG ]]; then
+      echo "WARNING: Could not calculate a valid blur score for $latest_base; skipping it."
+    elif (( $(echo "$bs > $blur_threshold" | bc ) )); then
       if [ $verbose ]; then
         echo "Skipping $latest_base because of blur score: Calculated $bs, threshold is $blur_threshold"
       fi
@@ -296,11 +433,49 @@ while true; do
 
   if [ $solve_file ]; then
     echo "Calculating..."
-    output="$(eval "$whole_command $latest 2>/dev/null")"
-    if [ -f "$tmp_dir/$noext_base.solved" ]; then
+    clean "$tmp_dir" "$noext_base"
+    : > "$solve_stdout"
+    : > "$solve_stderr"
+    launching_child="set"
+    setsid "${whole_command[@]}" "$latest" >"$solve_stdout" 2>"$solve_stderr" &
+    child_pid=$!
+    child_group=$child_pid
+    launching_child=
+    if [[ -n $pending_signal ]]; then
+      saved_signal="$pending_signal"
+      saved_status="$pending_status"
+      pending_signal=
+      pending_status=
+      handle_signal "$saved_signal" "$saved_status"
+    fi
+    wait "$child_pid"
+    solve_status=$?
+    if kill -0 -- "-$child_group" 2>/dev/null; then
+      stop_child TERM
+      solve_status=125
+    else
+      child_pid=
+      child_group=
+    fi
+    output="$(<"$solve_stdout")"
+    if [[ $solve_status -ne 0 ]]; then
+      echo "Could not solve $latest: solve-field exited with status $solve_status."
+      if [ $verbose ]; then
+        echo "Output from solve-field:"
+        echo "$output"
+        if [[ -s $solve_stderr ]]; then
+          echo "Errors from solve-field:" >&2
+          cat "$solve_stderr" >&2
+        fi
+      fi
+    elif [ -f "$tmp_dir/$noext_base.solved" ]; then
       echo "$output" | grep "Field center: (RA,Dec) ="
       distline="$(echo "$output" | grep -n -m 1 "brightest distractors are" | cut -d: -f1)"
-      echo "$output" | tail -n +$distline
+      if [[ -n $distline ]]; then
+        echo "$output" | tail -n +"$distline"
+      elif [ $verbose ]; then
+        echo "$output"
+      fi
     else
       echo "Could not solve $latest."
       if [ $verbose ]; then

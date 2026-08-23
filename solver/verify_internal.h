@@ -30,18 +30,11 @@ typedef struct verify_s {
 } verify_t;
 
 /*
- * verify.o is also linked into legacy tools that do not include
- * index_shard.o. Weak references keep those tools on the original inline
- * path while the solver engine supplies the strong helper scheduler.
+ * verify.o is also linked into tools without the parallel shard
+ * runtime. Weak references keep those tools on the original inline path
+ * while the solver engine supplies the strong helper scheduler.
  */
 #if defined(__GNUC__) && !defined(_WIN32)
-extern size_t index_shard_helper_available_workers(void)
-    __attribute__((weak));
-extern index_shard_helper_run_status_t index_shard_helper_run(
-    const index_shard_helper_ops_t* ops,
-    index_shard_helper_task_t* tasks,
-    size_t task_count,
-    index_shard_helper_run_stats_t* stats) __attribute__((weak));
 extern anbool index_shard_worker_stop_requested(void)
     __attribute__((weak));
 
@@ -94,15 +87,6 @@ double verify_internal_star_lists(verify_t* v,
 
 /* Exact transient bound for the NN implementation above. */
 size_t verify_internal_score_workspace_bytes(int npoints);
-
-anbool verify_internal_filter_stars_in_field_parallel(
-    const sip_t* sip,
-    const tan_t* tan,
-    const double* xyz,
-    int npoints,
-    double** p_xy,
-    int** p_inbounds,
-    int* p_ngood);
 
 void verify_internal_set_null_mo(MatchObj* mo);
 

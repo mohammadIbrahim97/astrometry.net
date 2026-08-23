@@ -3,45 +3,21 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
-/*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
- */
 #include <assert.h>
 #include <errno.h>
-#include <limits.h>
-#include <math.h>
 #include <pthread.h>
-#include <sched.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "index_shard_private.h"
-#include "astrometry/bl.h"
-#include "astrometry/errors.h"
 #include "astrometry/log.h"
 #include "astrometry/tic.h"
-#include "astrometry/fitsbin.h"
-#include "astrometry/fitsioutils.h"
 
 static pthread_key_t index_shard_tls_key;
 static pthread_once_t index_shard_tls_once = PTHREAD_ONCE_INIT;
 static int index_shard_tls_key_status = EAGAIN;
 
 /*
- * SECTION INDEX-SHARD: tls - thread logical singleton
- *
- * TLS links a running worker callback back to its pool state.
- *
- * solve_fields()/solver_run() call into onefield callbacks.  Those callbacks
- * receive only local onefield_t, so TLS is used to check the global shard stop
- * state and set local_bp->solver.quit_now.
+ * Solver callbacks receive only local onefield state. TLS links them to the
+ * worker context for cooperative global-stop polling.
  */
 static void index_shard_make_tls_key(void) {
   index_shard_tls_key_status =
@@ -91,12 +67,7 @@ anbool index_shard_worker_stop_requested(void) {
       __ATOMIC_ACQUIRE) != 0;
 }
 
-/*
- * SECTION INDEX-SHARD: configuration
- *
- * The engine resolves config, environment, and per-job overrides before
- * engine_run_job(). Hot execution paths consume the immutable job value only.
- */
+/* The engine resolves one immutable worker count before engine_run_job(). */
 anbool index_shard_pthread_enabled(const onefield_t *bp) {
   return bp && bp->index_shard_workers > 1;
 }
@@ -109,52 +80,60 @@ anbool index_shard_trace_enabled(void) {
   return log_get_level() >= LOG_ALL;
 }
 
-int index_shard_get_worker_count(const onefield_t *bp,
-                                        size_t nindexes) {
-  (void)nindexes;
-
+int index_shard_get_worker_count(const onefield_t *bp) {
   if (!bp) {
     return 1;
   }
 
   return index_shard_config_effective_workers(
-      bp->index_shard_workers,
-      0);
+      bp->index_shard_workers);
+}
+
+/*
+ * Take one synchronized snapshot of pass termination state.
+ *
+ * A caller may already hold queue_mutex or result_mutex. No path may acquire
+ * either lock while holding state_mutex.
+ */
+void index_shard_pass_state_snapshot(
+    index_shard_thread_state_t *shared,
+    index_shard_pass_state_snapshot_t *snapshot) {
+  assert(shared);
+  assert(snapshot);
+
+  pthread_mutex_lock(&shared->state_mutex);
+  snapshot->winner_selected = shared->winner_selected;
+  snapshot->solved_published = shared->solved_published;
+  snapshot->master_committed = shared->master_committed;
+  snapshot->terminal_cause = shared->terminal_cause;
+  snapshot->selected_index_order = shared->selected_index_order;
+  snapshot->selected_candidate_sequence =
+      shared->selected_candidate_sequence;
+  snapshot->task_local_failures = shared->task_local_failures;
+  snapshot->global_integrity_failures =
+      shared->global_integrity_failures;
+  pthread_mutex_unlock(&shared->state_mutex);
 }
 
 /* state_mutex must be held. */
-int index_shard_publish_terminal_locked(
+void index_shard_publish_terminal_locked(
     index_shard_thread_state_t *shared,
     index_shard_terminal_cause_t cause) {
-  int changed = FALSE;
-
   assert(shared);
   if (cause == INDEX_SHARD_TERMINAL_NONE) {
-    return FALSE;
+    return;
   }
 
   if (cause == INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY) {
-    changed = !shared->fatal_error ||
-        shared->terminal_cause != cause;
-    if (shared->terminal_cause == INDEX_SHARD_TERMINAL_NONE) {
-      shared->first_stop_wall_since_pass =
-          monotonic_seconds() - shared->pass_wall_start;
-    }
     shared->terminal_cause = cause;
-    shared->fatal_error = TRUE;
-    shared->stop_requested = TRUE;
-    return changed;
+    return;
   }
 
   if (shared->terminal_cause != INDEX_SHARD_TERMINAL_NONE) {
-    return FALSE;
+    return;
   }
 
   shared->terminal_cause = cause;
-  shared->first_stop_wall_since_pass =
-      monotonic_seconds() - shared->pass_wall_start;
-  shared->stop_requested = TRUE;
-  return TRUE;
 }
 
 void index_shard_publish_worker_stop(
@@ -167,25 +146,18 @@ void index_shard_publish_worker_stop(
   index_shard_wake_queue_waiters(shared);
 }
 
-// ANCHOR INDEX-SHARD: request-fatal-stop
 /*
  * Publish a hard worker/module failure and stop the current pass.
  */
 void index_shard_request_fatal_stop(index_shard_thread_state_t *shared) {
-  int stopped;
-
   pthread_mutex_lock(&shared->state_mutex);
-  (void)index_shard_publish_terminal_locked(
+  index_shard_publish_terminal_locked(
       shared, INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY);
-  stopped = shared->stop_requested;
   pthread_mutex_unlock(&shared->state_mutex);
 
-  if (stopped) {
-    index_shard_publish_worker_stop(shared);
-  }
+  index_shard_publish_worker_stop(shared);
 }
 
-// ANCHOR INDEX-SHARD: publish-committed-solve
 /*
  * Publish that the reducer committed a valid solved result.
  *
@@ -198,12 +170,11 @@ void index_shard_publish_committed_solve(
 
   pthread_mutex_lock(&shared->state_mutex);
   valid = shared->winner_selected &&
-      shared->terminal_cause == INDEX_SHARD_TERMINAL_WINNER &&
-      !shared->fatal_error;
+      shared->terminal_cause == INDEX_SHARD_TERMINAL_WINNER;
   if (valid) {
     shared->solved_published = TRUE;
   } else {
-    (void)index_shard_publish_terminal_locked(
+    index_shard_publish_terminal_locked(
         shared, INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY);
   }
   pthread_mutex_unlock(&shared->state_mutex);
@@ -227,7 +198,6 @@ void index_shard_mark_master_committed(
   pthread_mutex_unlock(&shared->state_mutex);
 }
 
-// ANCHOR INDEX-SHARD: master-limit-state
 int index_shard_master_limit_or_cancel_requested(
     index_shard_thread_state_t *shared,
     anbool *hit_total_cpulimit,
@@ -257,11 +227,10 @@ int index_shard_master_limit_or_cancel_requested(
   return stop;
 }
 
-// ANCHOR INDEX-SHARD: master-stop-check
 /*
  * Read-only stop predicate used by workers before expensive work.
  *
- * First-valid selection is mirrored through stop_requested. Workers therefore
+ * First-valid selection is recorded as a terminal cause. Workers therefore
  * do not read master bp->single_field_solved concurrently with the reducer.
  */
 int index_shard_master_stop_requested(index_shard_thread_state_t *shared) {
@@ -269,7 +238,7 @@ int index_shard_master_stop_requested(index_shard_thread_state_t *shared) {
 
   index_shard_pass_state_snapshot(shared, &state);
 
-  if (state.stop_requested || state.fatal_error || state.solved_published) {
+  if (state.terminal_cause != INDEX_SHARD_TERMINAL_NONE) {
     return TRUE;
   }
 
@@ -353,7 +322,6 @@ index_shard_sample_terminal_locked(
 
   return cause;
 }
-// ANCHOR INDEX-SHARD: global-limits
 /*
  * Process-wide elapsed-time and CPU-budget checks.
  *
@@ -382,7 +350,7 @@ int index_shard_check_global_limits(index_shard_thread_state_t *shared) {
   cause = index_shard_sample_terminal_locked(
       shared, NULL, &elapsed, &report);
   if (cause != INDEX_SHARD_TERMINAL_NONE) {
-    (void)index_shard_publish_terminal_locked(shared, cause);
+    index_shard_publish_terminal_locked(shared, cause);
   }
   pthread_mutex_unlock(&shared->limit_mutex);
   pthread_mutex_unlock(&shared->state_mutex);
@@ -408,7 +376,6 @@ int index_shard_check_global_limits(index_shard_thread_state_t *shared) {
   return TRUE;
 }
 
-// ANCHOR INDEX-SHARD: callback-poll
 /*
  * Called from onefield callbacks/timer paths while solver_run() is active.
  *
@@ -420,14 +387,16 @@ void index_shard_poll_from_callback(onefield_t *bp) {
   // local solver should unwind normally through existing quit path
   index_shard_worker_context_t *ctx = index_shard_get_tls();
 
-  if (!ctx || !ctx->pool)
+  if (!ctx || !ctx->pool) {
     return;
+  }
 
   if (index_shard_check_global_limits(&ctx->pool->shared)) {
     bp->solver.quit_now = TRUE;
     return;
   }
 
-  if (index_shard_master_stop_requested(&ctx->pool->shared))
+  if (index_shard_master_stop_requested(&ctx->pool->shared)) {
     bp->solver.quit_now = TRUE;
+  }
 }

@@ -12,7 +12,6 @@
 #include "index.h"
 #include "bl-sort.h"
 #include "log.h"
-#include "onefield_test_private.h"
 #include "test_solver_private.h"
 
 static int compare_n(const void* v1, const void* v2, int N) {
@@ -195,7 +194,6 @@ int main(int argc, char** args) {
     test_solver_geometry_cache_deep_admission();
     test_solver_ab_counter_boundaries();
     test_solver_ab_descriptor_partition_count();
-    assert(!onefield_job_index_cache_test_handoff_state());
     test_solver_zero_initialized_payload_fd_is_unowned();
     test_solver_index_close_fds_failure_state();
     return 0;

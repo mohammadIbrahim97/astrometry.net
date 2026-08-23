@@ -172,11 +172,7 @@ void test_solver_geometry_cache_deep_admission(void) {
     solver_set_field(solver, starxy);
     solver_preprocess_field(solver);
 
-    /*
-     * The former per-pair per-star payload crossed the 64 MiB cache budget
-     * around this field size. The triangular transform table is O(n^2) and
-     * must remain admitted for the same later-band field.
-     */
+    /* Require geometry preparation for a later-band-sized field. */
     assert(solver_prepare_field_geometry(solver));
     assert(solver->field_geometry);
 

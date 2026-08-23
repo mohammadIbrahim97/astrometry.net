@@ -82,7 +82,7 @@ static anbool verify_nn_cell_coord(double value, double cellsize,
     scaled = value / cellsize;
     /*
      * Beyond 2^52, adjacent double-precision cell coordinates are no longer
-     * reliable.  The legacy KD implementation remains exact for that case.
+     * reliable.  The KD implementation remains exact for that case.
      */
     if (!isfinite(scaled) || fabs(scaled) > 0x1p52) {
         return FALSE;
@@ -433,9 +433,6 @@ static void verify_nn_cleanup(verify_nn_t* nn) {
     kdtree_free(nn->tree);
     nn->tree = NULL;
 }
-
-
-
 static double verify_logd_at(double distractor, int mu, int NR,
                              double logbg) {
     return log(distractor + (1.0-distractor)*mu / (double)NR) + logbg;
@@ -745,8 +742,6 @@ double verify_internal_star_lists(verify_t* v,
                      logp, logodds);
                      }
                      */
-
-
                 } else {
                     // old match was better: this match becomes a distractor.
                     debug2("  Conflict: not upgrading.\n"); //  logprob was %.1f, now %.1f.\n", oldfg, logfg);
@@ -896,8 +891,6 @@ fail:
     }
     return -LARGE_VAL;
 }
-
-
 static size_t verify_score_add_bytes(size_t total,
                                      size_t count,
                                      size_t element_size) {

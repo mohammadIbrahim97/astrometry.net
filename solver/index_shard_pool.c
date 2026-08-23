@@ -3,50 +3,20 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
-/*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
- */
-#include <assert.h>
-#include <errno.h>
-#include <limits.h>
-#include <math.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "index_shard_private.h"
-#include "astrometry/bl.h"
 #include "astrometry/errors.h"
 #include "astrometry/log.h"
-#include "astrometry/tic.h"
-#include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
 
 static index_shard_pool_t *index_shard_global_pool = NULL;
 static pthread_mutex_t index_shard_global_pool_mutex =
     PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * SECTION INDEX-SHARD: pool
- *
- * Pool lifecycle and pass submission.
- *
- * The pool is created once per engine job and reused across onefield_run()
- * calls.  Each submitted pass increments generation to wake workers.
- */
-
-// ANCHOR INDEX-SHARD: shared-init
-/*
- * Initialize synchronization primitives for the reusable shared pass state.
- */
 static int index_shard_shared_init(index_shard_thread_state_t *shared) {
   pthread_condattr_t condattr;
 
@@ -56,66 +26,54 @@ static int index_shard_shared_init(index_shard_thread_state_t *shared) {
     return -1;
   }
   if (pthread_cond_init(&shared->queue_cv, NULL)) {
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_queue_mutex;
   }
 
   if (pthread_mutex_init(&shared->result_mutex, NULL)) {
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_queue_cv;
   }
 
   if (pthread_condattr_init(&condattr)) {
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_result_mutex;
   }
   if (pthread_condattr_setclock(
           &condattr,
           CLOCK_MONOTONIC)) {
-    pthread_condattr_destroy(&condattr);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_condattr;
   }
   if (pthread_cond_init(
           &shared->result_cv,
           &condattr)) {
-    pthread_condattr_destroy(&condattr);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_condattr;
   }
   pthread_condattr_destroy(&condattr);
 
   if (pthread_mutex_init(&shared->state_mutex, NULL)) {
-    pthread_cond_destroy(&shared->result_cv);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_result_cv;
   }
 
   if (pthread_mutex_init(&shared->limit_mutex, NULL)) {
-    pthread_mutex_destroy(&shared->state_mutex);
-    pthread_cond_destroy(&shared->result_cv);
-    pthread_mutex_destroy(&shared->result_mutex);
-    pthread_cond_destroy(&shared->queue_cv);
-    pthread_mutex_destroy(&shared->queue_mutex);
-    return -1;
+    goto destroy_state_mutex;
   }
 
   return 0;
+
+destroy_state_mutex:
+  pthread_mutex_destroy(&shared->state_mutex);
+destroy_result_cv:
+  pthread_cond_destroy(&shared->result_cv);
+  goto destroy_result_mutex;
+destroy_condattr:
+  pthread_condattr_destroy(&condattr);
+destroy_result_mutex:
+  pthread_mutex_destroy(&shared->result_mutex);
+destroy_queue_cv:
+  pthread_cond_destroy(&shared->queue_cv);
+destroy_queue_mutex:
+  pthread_mutex_destroy(&shared->queue_mutex);
+  return -1;
 }
 
-// ANCHOR INDEX-SHARD: shared-destroy
-/*
- * Destroy synchronization primitives after all workers have joined.
- */
 static void index_shard_shared_destroy(index_shard_thread_state_t *shared) {
   index_shard_completion_registry_destroy(shared);
   pthread_cond_destroy(&shared->queue_cv);
@@ -129,7 +87,257 @@ static void index_shard_shared_destroy(index_shard_thread_state_t *shared) {
   pthread_mutex_destroy(&shared->limit_mutex);
 }
 
+/*
+ * Clear every pointer borrowed from a submitted pass.  The caller holds
+ * control_mutex and has already established worker/callback quiescence.
+ */
+static void index_shard_clear_pass_state_locked(
+    index_shard_pool_t *pool) {
+  index_shard_thread_state_t *shared = &pool->shared;
 
+  pthread_mutex_lock(&shared->queue_mutex);
+  pthread_mutex_lock(&shared->result_mutex);
+  pthread_mutex_lock(&shared->state_mutex);
+  pthread_mutex_lock(&shared->limit_mutex);
+
+  shared->bp = NULL;
+  shared->hooks = NULL;
+  shared->worker_view = NULL;
+  shared->results = NULL;
+  shared->nindexes = 0U;
+  shared->canonical_scan_cursor = 0U;
+  shared->outer_running = 0U;
+  shared->producer_width = 0U;
+  shared->active_workers = 0;
+  shared->worker_count = 0;
+
+  pthread_mutex_unlock(&shared->limit_mutex);
+  pthread_mutex_unlock(&shared->state_mutex);
+  pthread_mutex_unlock(&shared->result_mutex);
+  pthread_mutex_unlock(&shared->queue_mutex);
+}
+
+static int index_shard_pass_quiescent_locked(
+    index_shard_pool_t *pool) {
+  index_shard_thread_state_t *shared = &pool->shared;
+  int i;
+  int quiescent = TRUE;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  pthread_mutex_lock(&shared->result_mutex);
+
+  if (shared->active_workers || shared->outer_running ||
+      shared->queue_waiters || shared->staged_groups_active ||
+      shared->staged_tickets_active ||
+      shared->staged_source_leases ||
+      shared->staged_submit_callbacks_active ||
+      shared->completion_active) {
+    quiescent = FALSE;
+  }
+  if (!shared->active_workers) {
+    for (i = 0; i < pool->worker_count; i++) {
+      if (pool->contexts[i].published_staged_group ||
+          pool->contexts[i].owner_waiting ||
+          pool->contexts[i].owner_wake_pending ||
+          pool->contexts[i].current_outer_active) {
+        quiescent = FALSE;
+        break;
+      }
+    }
+  }
+
+  pthread_mutex_unlock(&shared->result_mutex);
+  pthread_mutex_unlock(&shared->queue_mutex);
+  return quiescent;
+}
+
+#define INDEX_SHARD_RELEASE_RECHECK_NANOSECONDS 100000000L
+
+static void index_shard_release_recheck_deadline(
+    struct timespec *deadline) {
+  clock_gettime(CLOCK_MONOTONIC, deadline);
+  deadline->tv_nsec += INDEX_SHARD_RELEASE_RECHECK_NANOSECONDS;
+  if (deadline->tv_nsec >= 1000000000L) {
+    deadline->tv_sec++;
+    deadline->tv_nsec -= 1000000000L;
+  }
+}
+
+/*
+ * A poisoned early release remains synchronous. Workers retain every borrowed
+ * pass pointer while they cooperatively unwind. Once the shard counters are
+ * zero, the provider fence closes the smaller interval in which a completion
+ * callback has acquired pool as its opaque pointer but has not entered it yet.
+ * No pool mutex may be held across that provider wait because the callback
+ * acquires shared->queue_mutex.
+ */
+static int index_shard_wait_pass_quiescent(
+    index_shard_pool_t *pool) {
+  index_shard_thread_state_t *shared = &pool->shared;
+  int notifier_status = 0;
+  int reported = FALSE;
+
+  while (1) {
+    pthread_mutex_lock(&shared->result_mutex);
+    while (shared->active_workers > 0) {
+      pthread_cond_wait(&shared->result_cv, &shared->result_mutex);
+    }
+    pthread_mutex_unlock(&shared->result_mutex);
+
+    if (!notifier_status && pool->payload_completion_registered &&
+        fitsbin_payload_io_wait_completion_notifier_idle(
+            index_shard_staged_completion_notify, pool)) {
+      logerr("[index-shard] payload completion notifier fence failed\n");
+      notifier_status = -1;
+      pthread_mutex_lock(&pool->control_mutex);
+      pool->poisoned = TRUE;
+      pthread_mutex_unlock(&pool->control_mutex);
+    }
+
+    pthread_mutex_lock(&pool->control_mutex);
+    if (index_shard_pass_quiescent_locked(pool)) {
+      pthread_mutex_unlock(&pool->control_mutex);
+      return notifier_status;
+    }
+    pool->poisoned = TRUE;
+    pthread_mutex_unlock(&pool->control_mutex);
+
+    if (!reported) {
+      logerr("[index-shard] waiting for poisoned pass drain\n");
+      reported = TRUE;
+    }
+    index_shard_request_fatal_stop(shared);
+
+    pthread_mutex_lock(&shared->result_mutex);
+    if (!shared->active_workers) {
+      struct timespec deadline;
+
+      index_shard_release_recheck_deadline(&deadline);
+      (void)pthread_cond_timedwait(
+          &shared->result_cv,
+          &shared->result_mutex,
+          &deadline);
+    }
+    pthread_mutex_unlock(&shared->result_mutex);
+  }
+}
+
+/*
+ * Bind one job to the process pool.  Width is fixed at pool creation; a later
+ * incompatible job fails before any of its state is published.
+ */
+int index_shard_pool_bind_job(index_shard_pool_t *pool,
+                              onefield_t *bp,
+                              solver_t *sp) {
+  int worker_count;
+
+  if (!pool || !bp || !sp) {
+    return -1;
+  }
+  worker_count = index_shard_get_worker_count(bp);
+
+  pthread_mutex_lock(&index_shard_global_pool_mutex);
+  if (index_shard_global_pool != pool) {
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return -1;
+  }
+  pthread_mutex_lock(&pool->control_mutex);
+
+  if (pool->shutdown || pool->stopping || pool->poisoned ||
+      pool->job_active || pool->pass_active ||
+      pool->owner_bp || pool->owner_sp ||
+      worker_count != pool->worker_count ||
+      !index_shard_pass_quiescent_locked(pool)) {
+    pthread_mutex_unlock(&pool->control_mutex);
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return -1;
+  }
+
+  pool->owner_bp = bp;
+  pool->owner_sp = sp;
+  pool->job_active = TRUE;
+  pool->job_generation++;
+
+  pthread_mutex_unlock(&pool->control_mutex);
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+  return 0;
+}
+
+int index_shard_pool_job_width_compatible(
+    const index_shard_pool_t *pool,
+    const onefield_t *bp) {
+  if (!pool || !bp) {
+    return FALSE;
+  }
+  return pool->worker_count == index_shard_get_worker_count(bp);
+}
+
+/*
+ * End a sequential job only after its final pass has released all borrowed
+ * state.  Retained inverse permutations are flushed here to preserve the old
+ * per-job cache boundary while the worker threads and payload service persist.
+ */
+int index_shard_pool_unbind_job(index_shard_pool_t *pool,
+                                onefield_t *bp,
+                                solver_t *sp) {
+  int rc = 0;
+
+  if (!pool || !bp || !sp) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&index_shard_global_pool_mutex);
+  if (index_shard_global_pool != pool) {
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return -1;
+  }
+  pthread_mutex_lock(&pool->control_mutex);
+
+  if (!pool->job_active || pool->owner_bp != bp ||
+      pool->owner_sp != sp || pool->pass_active ||
+      !index_shard_pass_quiescent_locked(pool)) {
+    logerr("[index-shard] job unbind lifecycle conflict\n");
+    pool->poisoned = TRUE;
+    rc = -1;
+  } else if (pool->shared.bp || pool->shared.hooks ||
+             pool->shared.worker_view || pool->shared.results) {
+    logerr("[index-shard] job unbind found borrowed pass pointers\n");
+    pool->poisoned = TRUE;
+    rc = -1;
+  } else {
+    pthread_mutex_lock(&pool->inverse_cache_mutex);
+    index_shard_inverse_cache_destroy(pool);
+    pthread_mutex_unlock(&pool->inverse_cache_mutex);
+    pool->owner_bp = NULL;
+    pool->owner_sp = NULL;
+    pool->job_active = FALSE;
+  }
+
+  pthread_mutex_unlock(&pool->control_mutex);
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+  return rc;
+}
+
+void index_shard_pool_poison(index_shard_pool_t *pool) {
+  if (!pool) {
+    return;
+  }
+  pthread_mutex_lock(&pool->control_mutex);
+  pool->poisoned = TRUE;
+  pthread_mutex_unlock(&pool->control_mutex);
+}
+
+int index_shard_pool_is_poisoned(index_shard_pool_t *pool) {
+  int poisoned;
+
+  if (!pool) {
+    return FALSE;
+  }
+  pthread_mutex_lock(&pool->control_mutex);
+  poisoned = pool->poisoned;
+  pthread_mutex_unlock(&pool->control_mutex);
+  return poisoned;
+}
 /*
  * Reserve the persistent pool for one submitted pass.
  *
@@ -161,14 +369,16 @@ index_shard_pool_acquire_pass(onefield_t *bp,
     return INDEX_SHARD_POOL_ACQUIRE_UNAVAILABLE;
   }
 
-  if (pool->owner_bp != bp || pool->owner_sp != sp) {
+  if (!pool->job_active ||
+      pool->owner_bp != bp || pool->owner_sp != sp) {
     pthread_mutex_unlock(&index_shard_global_pool_mutex);
     return INDEX_SHARD_POOL_ACQUIRE_CONFLICT;
   }
 
   pthread_mutex_lock(&pool->control_mutex);
 
-  if (pool->shutdown || pool->stopping || pool->pass_active) {
+  if (pool->shutdown || pool->stopping || pool->poisoned ||
+      pool->pass_active) {
     pthread_mutex_unlock(&pool->control_mutex);
     pthread_mutex_unlock(&index_shard_global_pool_mutex);
     return INDEX_SHARD_POOL_ACQUIRE_CONFLICT;
@@ -187,26 +397,56 @@ index_shard_pool_acquire_pass(onefield_t *bp,
  * Release one pass reservation after all caller-side work that dereferences
  * the pool has completed.
  */
-void index_shard_pool_release_pass(index_shard_pool_t *pool) {
+int index_shard_pool_release_pass(index_shard_pool_t *pool) {
+  int quiescent = TRUE;
+  int release_started = FALSE;
+  int rc = 0;
+
   if (!pool) {
-    return;
+    return -1;
   }
 
   pthread_mutex_lock(&pool->control_mutex);
 
-  if (!pool->pass_active) {
-    logerr("[index-shard] pass release requested with no active pass\n");
+  if (!pool->pass_active || pool->pass_releasing) {
+    logerr("[index-shard] pass release requested outside active ownership\n");
+    pool->poisoned = TRUE;
+    rc = -1;
   } else {
-    pool->pass_active = FALSE;
+    pool->pass_releasing = TRUE;
+    release_started = TRUE;
+    quiescent = index_shard_pass_quiescent_locked(pool);
+    if (!quiescent) {
+      logerr("[index-shard] pass release before quiescence\n");
+      pool->poisoned = TRUE;
+      rc = -1;
+    }
   }
+  pthread_cond_broadcast(&pool->work_cv);
+  pthread_mutex_unlock(&pool->control_mutex);
+
+  if (!release_started) {
+    return rc;
+  }
+  if (!quiescent) {
+    index_shard_request_fatal_stop(&pool->shared);
+  }
+  if (index_shard_wait_pass_quiescent(pool)) {
+    rc = -1;
+  }
+
+  pthread_mutex_lock(&pool->control_mutex);
+  index_shard_clear_pass_state_locked(pool);
+  pool->pass_active = FALSE;
+  pool->pass_releasing = FALSE;
 
   /*
    * pool_stop() may be waiting for pass_active to become false. Worker waiters
    * also use work_cv, but they re-check their generation predicate in a loop.
    */
   pthread_cond_broadcast(&pool->work_cv);
-
   pthread_mutex_unlock(&pool->control_mutex);
+  return rc;
 }
 
 static void index_shard_context_owner_cvs_destroy(
@@ -227,28 +467,28 @@ static void index_shard_context_owner_cvs_destroy(
   }
 }
 
-// ANCHOR INDEX-SHARD: pool-start
 /*
- * Create persistent worker pool.
- *
- * Workers are created once and sleep until the first pass is submitted.
+ * Create the process-lifetime worker pool.  No job pointers are retained by
+ * this operation; bind_job() publishes them only after creation succeeds.
  */
-int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
-  index_shard_pool_t *pool;
+int index_shard_pool_create(const onefield_t *config_bp,
+                            index_shard_pool_t **pool_out) {
+  index_shard_pool_t *pool = NULL;
   int i;
   int tls_status;
+  int threads_started = 0;
   int worker_count;
   int payload_io_lanes;
   int payload_io_width;
-  index_shard_width_plan_t width_plan;
+  size_t producer_width;
 
-   // pool already active for this engine job
-  if (!index_shard_pthread_enabled(bp)) {
-    return 0;
+  if (!pool_out) {
+    return -1;
   }
+  *pool_out = NULL;
 
-  if (!bp || !sp) {
-    ERROR("Cannot start index-shard pool without owner state");
+  if (!config_bp || !index_shard_pthread_enabled(config_bp)) {
+    ERROR("Cannot create index-shard pool without parallel configuration");
     return -1;
   }
 
@@ -265,108 +505,52 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   pthread_mutex_lock(&index_shard_global_pool_mutex);
 
   if (index_shard_global_pool) {
-    int reusable;
-
-    pool = index_shard_global_pool;
-
-    if (pool->owner_bp != bp || pool->owner_sp != sp) {
-      logerr("[index-shard] global pool already belongs to another engine job\n");
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      return -1;
-    }
-
-    pthread_mutex_lock(&pool->control_mutex);
-    reusable = !pool->shutdown && !pool->stopping;
-    pthread_mutex_unlock(&pool->control_mutex);
-
+    logerr("[index-shard] process pool already exists\n");
     pthread_mutex_unlock(&index_shard_global_pool_mutex);
-
-    if (!reusable) {
-      logerr("[index-shard] owner pool is stopping or shut down\n");
-      return -1;
-    }
-
-    return 0;
-  }
-
-  worker_count = index_shard_get_worker_count(bp, 0);
-
-  pool = calloc(1, sizeof(index_shard_pool_t));
-  if (!pool) {
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    SYSERROR("Failed to allocate index-shard pool");
     return -1;
   }
 
-  pool->owner_bp = bp;
-  pool->owner_sp = sp;
+  worker_count = index_shard_get_worker_count(config_bp);
+
+  pool = calloc(1, sizeof(index_shard_pool_t));
+  if (!pool) {
+    SYSERROR("Failed to allocate index-shard pool");
+    goto unlock_failure;
+  }
+
   pool->worker_count = worker_count;
-  pool->producer_width = 1U;
-  pool->helper_width = 0U;
   pool->inverse_cache_budget =
       index_shard_inverse_cache_budget();
 
   if (pthread_mutex_init(&pool->inverse_cache_mutex, NULL)) {
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto free_pool;
   }
 
   // initialize shared state before workers can observe pool
   if (pthread_mutex_init(&pool->control_mutex, NULL)) {
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_inverse_mutex;
   }
 
   if (pthread_cond_init(&pool->work_cv, NULL)) {
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_control_mutex;
   }
 
   if (index_shard_shared_init(&pool->shared)) {
-    pthread_cond_destroy(&pool->work_cv);
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_work_cv;
   }
   pool->shared.pool = pool;
   if (index_shard_completion_registry_init(
           &pool->shared, worker_count)) {
-    index_shard_shared_destroy(&pool->shared);
-    pthread_cond_destroy(&pool->work_cv);
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto destroy_shared;
   }
 
   pool->threads = calloc((size_t)worker_count, sizeof(pthread_t));
   pool->contexts = calloc((size_t)worker_count,
                           sizeof(index_shard_worker_context_t));
 
-    if (!pool->threads || !pool->contexts) {
-      free(pool->threads);
-      free(pool->contexts);
-
-      index_shard_shared_destroy(&pool->shared);
-
-      pthread_cond_destroy(&pool->work_cv);
-      pthread_mutex_destroy(&pool->control_mutex);
-      pthread_mutex_destroy(&pool->inverse_cache_mutex);
-
-      free(pool);
-
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      return -1;
-    }
+  if (!pool->threads || !pool->contexts) {
+    goto free_worker_storage;
+  }
 
   // worker contexts and owner conditions are stable for pool lifetime.
   for (i = 0; i < worker_count; i++) {
@@ -374,16 +558,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     pool->contexts[i].generation_seen = 0;
     pool->contexts[i].pool = pool;
     if (pthread_cond_init(&pool->contexts[i].owner_cv, NULL)) {
-      index_shard_context_owner_cvs_destroy(pool);
-      free(pool->threads);
-      free(pool->contexts);
-      index_shard_shared_destroy(&pool->shared);
-      pthread_cond_destroy(&pool->work_cv);
-      pthread_mutex_destroy(&pool->control_mutex);
-      pthread_mutex_destroy(&pool->inverse_cache_mutex);
-      free(pool);
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      return -1;
+      goto destroy_owner_cvs;
     }
     pool->contexts[i].owner_cv_ready = TRUE;
   }
@@ -392,26 +567,9 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     if (pthread_create(
             &pool->threads[i], NULL,
             index_shard_worker_main, &pool->contexts[i])) {
-      int j;
-
-      pthread_mutex_lock(&pool->control_mutex);
-      pool->shutdown = TRUE;
-      pthread_cond_broadcast(&pool->work_cv);
-      pthread_mutex_unlock(&pool->control_mutex);
-      for (j = 0; j < i; j++) {
-        pthread_join(pool->threads[j], NULL);
-      }
-      index_shard_context_owner_cvs_destroy(pool);
-      free(pool->threads);
-      free(pool->contexts);
-      index_shard_shared_destroy(&pool->shared);
-      pthread_cond_destroy(&pool->work_cv);
-      pthread_mutex_destroy(&pool->control_mutex);
-      pthread_mutex_destroy(&pool->inverse_cache_mutex);
-      free(pool);
-      pthread_mutex_unlock(&index_shard_global_pool_mutex);
-      return -1;
+      goto stop_threads;
     }
+    threads_started++;
   }
 
   pthread_mutex_lock(&pool->control_mutex);
@@ -428,19 +586,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   if (tls_status) {
     logerr("[index-shard] worker TLS startup failed status=%i\n",
            tls_status);
-    for (i = 0; i < worker_count; i++) {
-      pthread_join(pool->threads[i], NULL);
-    }
-    free(pool->threads);
-    index_shard_context_owner_cvs_destroy(pool);
-    free(pool->contexts);
-    index_shard_shared_destroy(&pool->shared);
-    pthread_cond_destroy(&pool->work_cv);
-    pthread_mutex_destroy(&pool->control_mutex);
-    pthread_mutex_destroy(&pool->inverse_cache_mutex);
-    free(pool);
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return -1;
+    goto join_threads;
   }
 
   /*
@@ -471,33 +617,30 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   }
 
   index_shard_global_pool = pool;
+  *pool_out = pool;
   payload_io_width = fitsbin_payload_io_service_width();
-  if (index_shard_config_plan_widths(
-          worker_count,
-          payload_io_width,
-          pool->payload_completion_registered,
-          FALSE,
-          &width_plan)) {
+  producer_width = index_shard_config_producer_width(
+      worker_count,
+      payload_io_width,
+      pool->payload_completion_registered,
+      FALSE);
+  if (!producer_width) {
     logerr("[index-shard] invalid compute/delivery width plan "
            "workers=%i payload_io_width=%i detached=%i\n",
            worker_count,
            payload_io_width,
            pool->payload_completion_registered ? 1 : 0);
-    pool->helper_width = worker_count > 1 ? 1U : 0U;
-    pool->producer_width =
-        (size_t)worker_count - pool->helper_width;
-  } else {
-    /*
-     * Detached completion does not reserve a compute lane. Every worker may
-     * own outer work while it is immediately available, then join published
-     * staged work after the outer queue is exhausted.
-     */
-    pool->producer_width = width_plan.producer_width;
-    pool->helper_width = width_plan.helper_width;
+    producer_width =
+        worker_count > 1 ? (size_t)worker_count - 1U : 1U;
   }
+  /*
+   * Detached completion does not reserve a compute lane. Every worker may
+   * own outer work. A completed owner may execute one READY foreign package
+   * before claiming again; otherwise outer admission remains the priority.
+   */
   fitsbin_payload_io_configure_workers(
       pool->payload_completion_registered
-          ? (int)pool->producer_width
+          ? (int)producer_width
           : worker_count);
 
   logverb("[index-shard] workers=%i mode=pthread "
@@ -505,39 +648,57 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
           "payload_io_width=%i inverse_cache_budget=%zu\n",
           worker_count,
           worker_count,
-          pool->producer_width,
-          pool->helper_width,
+          producer_width,
+          (size_t)worker_count - producer_width,
           payload_io_width,
           pool->inverse_cache_budget);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
   return 0;
+
+stop_threads:
+  pthread_mutex_lock(&pool->control_mutex);
+  pool->shutdown = TRUE;
+  pthread_cond_broadcast(&pool->work_cv);
+  pthread_mutex_unlock(&pool->control_mutex);
+join_threads:
+  for (i = 0; i < threads_started; i++) {
+    pthread_join(pool->threads[i], NULL);
+  }
+destroy_owner_cvs:
+  index_shard_context_owner_cvs_destroy(pool);
+free_worker_storage:
+  free(pool->threads);
+  free(pool->contexts);
+destroy_shared:
+  index_shard_shared_destroy(&pool->shared);
+destroy_work_cv:
+  pthread_cond_destroy(&pool->work_cv);
+destroy_control_mutex:
+  pthread_mutex_destroy(&pool->control_mutex);
+destroy_inverse_mutex:
+  pthread_mutex_destroy(&pool->inverse_cache_mutex);
+free_pool:
+  free(pool);
+unlock_failure:
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+  return -1;
 }
-// ANCHOR INDEX-SHARD: pool-stop
-/*
- * Stop the pool belonging to bp and join all workers.
- *
- * New passes are rejected as soon as stopping is published. If one pass is
- * already active, shutdown waits for that pass reservation to be released.
- */
-void index_shard_pool_stop(onefield_t *bp) {
-  index_shard_pool_t *pool;
+/* Stop one explicitly owned pool and join all process-lifetime workers. */
+int index_shard_pool_destroy(index_shard_pool_t *pool) {
   int i;
   int notifier_clear_failed = FALSE;
 
-  pthread_mutex_lock(&index_shard_global_pool_mutex);
-
-  pool = index_shard_global_pool;
-
   if (!pool) {
-    pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return;
+    return 0;
   }
 
-  if (pool->owner_bp != bp) {
-    logerr("[index-shard] refusing to stop pool owned by another engine job\n");
+  pthread_mutex_lock(&index_shard_global_pool_mutex);
+
+  if (index_shard_global_pool != pool) {
+    logerr("[index-shard] refusing to destroy an unregistered pool\n");
     pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return;
+    return -1;
   }
 
   pthread_mutex_lock(&pool->control_mutex);
@@ -545,10 +706,11 @@ void index_shard_pool_stop(onefield_t *bp) {
   if (pool->stopping) {
     pthread_mutex_unlock(&pool->control_mutex);
     pthread_mutex_unlock(&index_shard_global_pool_mutex);
-    return;
+    return -1;
   }
 
   pool->stopping = TRUE;
+  pool->poisoned = TRUE;
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
 
   while (pool->pass_active) {
@@ -591,7 +753,7 @@ void index_shard_pool_stop(onefield_t *bp) {
      */
     logerr("[index-shard] retaining stopped pool after notifier "
            "teardown failure\n");
-    return;
+    return -1;
   }
   free(pool->threads);
   index_shard_context_owner_cvs_destroy(pool);
@@ -621,9 +783,82 @@ void index_shard_pool_stop(onefield_t *bp) {
   logverb("[index-shard] pthread-pool stop\n");
 
   free(pool);
+  return 0;
 }
 
-// ANCHOR INDEX-SHARD: pool-active
+/*
+ * Compatibility entry points for focused onefield tests.  Production engine
+ * code owns the returned pool explicitly and binds each sequential job.
+ */
+int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
+  index_shard_pool_t *pool;
+  int created = FALSE;
+  int already_bound = FALSE;
+
+  if (!index_shard_pthread_enabled(bp)) {
+    return 0;
+  }
+  if (!bp || !sp) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&index_shard_global_pool_mutex);
+  pool = index_shard_global_pool;
+  if (pool) {
+    pthread_mutex_lock(&pool->control_mutex);
+    already_bound = pool->owner_bp == bp &&
+        pool->owner_sp == sp && pool->job_active &&
+        !pool->shutdown && !pool->stopping && !pool->poisoned;
+    pthread_mutex_unlock(&pool->control_mutex);
+  }
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+
+  if (already_bound) {
+    return 0;
+  }
+  if (!pool) {
+    if (index_shard_pool_create(bp, &pool)) {
+      return -1;
+    }
+    created = TRUE;
+  }
+  if (index_shard_pool_bind_job(pool, bp, sp)) {
+    if (created) {
+      (void)index_shard_pool_destroy(pool);
+    }
+    return -1;
+  }
+  return 0;
+}
+
+void index_shard_pool_stop(onefield_t *bp) {
+  index_shard_pool_t *pool;
+  solver_t *sp = NULL;
+
+  pthread_mutex_lock(&index_shard_global_pool_mutex);
+  pool = index_shard_global_pool;
+  if (pool) {
+    pthread_mutex_lock(&pool->control_mutex);
+    if (pool->owner_bp == bp && pool->job_active) {
+      sp = pool->owner_sp;
+    }
+    pthread_mutex_unlock(&pool->control_mutex);
+  }
+  pthread_mutex_unlock(&index_shard_global_pool_mutex);
+
+  if (!pool) {
+    return;
+  }
+  if (!sp) {
+    logerr("[index-shard] refusing to stop pool owned by another job\n");
+    return;
+  }
+  if (index_shard_pool_unbind_job(pool, bp, sp)) {
+    index_shard_pool_poison(pool);
+  }
+  (void)index_shard_pool_destroy(pool);
+}
+
 /*
  * Return true only when the compatibility pool belongs to bp and remains
  * available for a new pass reservation.
@@ -636,9 +871,9 @@ int index_shard_pool_active(onefield_t *bp) {
 
   pool = index_shard_global_pool;
 
-  if (pool && pool->owner_bp == bp) {
+  if (pool && pool->job_active && pool->owner_bp == bp) {
     pthread_mutex_lock(&pool->control_mutex);
-    active = !pool->shutdown && !pool->stopping;
+    active = !pool->shutdown && !pool->stopping && !pool->poisoned;
     pthread_mutex_unlock(&pool->control_mutex);
   }
 

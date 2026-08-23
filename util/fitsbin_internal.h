@@ -20,19 +20,120 @@
 #error "A thread-local storage implementation is required"
 #endif
 
-#define FITSBIN_PREFETCH_RANGE_LIMIT \
-    FITSBIN_MMAP_PREFETCH_RANGE_LIMIT
-#define FITSBIN_PREFETCH_COPY_CHUNK (16U * 1024U)
-#define FITSBIN_PAYLOAD_POPULATE_TOTAL_BUDGET \
-    (16U * 1024U * 1024U)
+#define FITSBIN_PREFETCH_RANGE_LIMIT 640U
 #define FITSBIN_PAYLOAD_IO_MAX_LANES 4
-#define FITSBIN_PAYLOAD_IO_MAX_JOBS 24U
+#define FITSBIN_PAYLOAD_IO_MAX_JOBS 23U
 #define FITSBIN_PAYLOAD_IO_MAX_BYTES \
-    (64U * 1024U * 1024U)
-#define FITSBIN_PAYLOAD_IO_PRIORITY_COUNT 3U
-#define FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_JOBS 1U
-#define FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_BYTES \
-    (FITSBIN_PAYLOAD_IO_MAX_BYTES / 4U)
+    (48U * 1024U * 1024U)
+
+typedef struct fitsbin_prefetch_range {
+    const void* data;
+    size_t size;
+} fitsbin_prefetch_range_t;
+
+int fitsbin_configure_index_mmap(fitsbin_t* fb);
+int fitsbin_close_payload_fd(fitsbin_t* fb);
+int fitsbin_resolve_mapped_range(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    const void** map_base,
+    size_t* map_size,
+    const void** range_start,
+    size_t* range_size);
+int fitsbin_set_mmap_range_advice(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    fitsbin_mmap_advice_t advice);
+int fitsbin_read_chunk_header(
+    fitsbin_t* fb,
+    fitsbin_chunk_t* chunk);
+int fitsbin_get_open_file_stat(
+    const fitsbin_t* fb,
+    struct stat* file_stat);
+const char* fitsbin_mmap_advice_name(
+    fitsbin_mmap_advice_t advice);
+fitsbin_mmap_advice_t fitsbin_get_mmap_advice(
+    const fitsbin_t* fb);
+fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
+    const fitsbin_t* fb,
+    const fitsbin_chunk_t* chunk);
+void fitsbin_mmap_set_thread_advice(
+    fitsbin_mmap_advice_t advice);
+void fitsbin_mmap_clear_thread_advice(void);
+fitsbin_mmap_advice_t fitsbin_mmap_current_advice(void);
+int fitsbin_set_mmap_advice(
+    fitsbin_t* fb,
+    fitsbin_mmap_advice_t advice,
+    anbool reapply_existing);
+
+typedef struct fitsbin_payload_io_ticket
+    fitsbin_payload_io_ticket_t;
+
+typedef anbool (*fitsbin_payload_io_cancel_check_fn)(void* opaque);
+typedef int (*fitsbin_payload_io_plan_fn)(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count);
+
+typedef enum fitsbin_payload_io_submit_status {
+    FITSBIN_PAYLOAD_IO_SUBMIT_ERROR = -1,
+    FITSBIN_PAYLOAD_IO_SUBMIT_UNAVAILABLE = 0,
+    FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED = 1,
+    FITSBIN_PAYLOAD_IO_SUBMIT_READY = 2
+} fitsbin_payload_io_submit_status_t;
+
+typedef void (*fitsbin_payload_io_completion_notify_fn)(
+    void* opaque,
+    unsigned long long completion_id);
+
+void fitsbin_payload_io_configure_workers(int worker_count);
+int fitsbin_payload_io_service_start(int lane_count);
+void fitsbin_payload_io_service_stop(void);
+int fitsbin_payload_io_service_width(void);
+int fitsbin_payload_io_mapped_population_supported(void);
+int fitsbin_payload_io_set_completion_notifier(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
+/*
+ * The caller has stopped publishing tickets for this notifier pair and has
+ * collected every ticket it registered. Wait until callbacks already acquired
+ * by the provider have returned without unregistering the notifier.
+ */
+int fitsbin_payload_io_wait_completion_notifier_idle(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
+int fitsbin_payload_io_clear_completion_notifier(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
+
+/* Tickets borrow their source and mappings until terminal collection. */
+int fitsbin_prefetch_ranges_submit(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_payload_io_ticket_t** ticket);
+int fitsbin_prefetch_ranges_planned_submit(
+    fitsbin_t* fb,
+    fitsbin_payload_io_plan_fn plan,
+    void* plan_opaque,
+    size_t byte_budget,
+    fitsbin_payload_io_ticket_t** ticket);
+int fitsbin_payload_io_ticket_poll_and_destroy(
+    fitsbin_payload_io_ticket_t** ticket_io,
+    int* result_out);
+int fitsbin_payload_io_ticket_drain_and_destroy(
+    fitsbin_payload_io_ticket_t** ticket_io,
+    int* result_out);
+int fitsbin_payload_io_ticket_cancel_async(
+    fitsbin_payload_io_ticket_t* ticket);
+unsigned long long fitsbin_payload_io_ticket_completion_id(
+    const fitsbin_payload_io_ticket_t* ticket);
 
 /*
  * Join only a one-page hole inside one exact mapping, and spend no more than
@@ -50,22 +151,6 @@
 #define FITSBIN_PAYLOAD_QUEUE_COALESCE_GAP_PAGES 2U
 #define FITSBIN_PAYLOAD_QUEUE_COALESCE_BUDGET_DIVISOR 8U
 
-/*
- * Internal transport A/B. The parent source is the direct-first comparator.
- * This candidate refuses asynchronous direct tickets only for nonresident
- * sparse payload mappings, which is the production verification-sweep case;
- * the solver then exercises its existing exact mapped-population fallback.
- * Synchronous exact reads and non-sparse direct-ticket callers are unchanged.
- * This is deliberately not a public runtime option.
- */
-#ifndef FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED
-#define FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED 0
-#endif
-#if FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED != 0 && \
-    FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED != 1
-#error "FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED must be 0 or 1"
-#endif
-
 typedef struct fitsbin_file_span {
     off_t begin;
     off_t end;
@@ -78,83 +163,21 @@ typedef struct fitsbin_mapped_span {
     uintptr_t end;
 } fitsbin_mapped_span_t;
 
-typedef struct fitsbin_prepared_pread_range {
-    off_t offset;
-    size_t size;
-    size_t logical_size;
-    void* destination;
-} fitsbin_prepared_pread_range_t;
-
-int fitsbin_compare_prepared_pread_range(
-    const void* left,
-    const void* right);
-anbool fitsbin_prepared_pread_destinations_disjoint(
-    const fitsbin_prepared_pread_range_t* ranges,
-    size_t range_count);
-
+int fitsbin_prefetch_row_budget(
+    const fitsbin_t* fb,
+    size_t row_size,
+    size_t row_count,
+    size_t* byte_budget);
 int fitsbin_payload_fd_get(fitsbin_t* fb);
-fitsbin_chunk_t* fitsbin_find_data_chunk(
-    fitsbin_t* fb,
-    const void* data,
-    size_t size,
-    size_t* chunk_offset);
-int fitsbin_mapped_file_offset(
-    fitsbin_t* fb,
-    const void* data,
-    size_t size,
-    off_t* file_offset);
-void fitsbin_payload_counter_add(
-    unsigned long long* counter,
-    unsigned long long value);
-int fitsbin_pread_all_counted(
-    int fd,
-    void* destination,
-    size_t size,
-    off_t offset,
-    unsigned long long* calls,
-    unsigned long long* bytes);
-int fitsbin_pread_all(
-    int fd,
-    void* destination,
-    size_t size,
-    off_t offset);
-
-int fitsbin_prepare_direct_ranges(
-    fitsbin_t* fb,
-    const fitsbin_pread_range_t* ranges,
-    size_t range_count,
-    size_t byte_budget,
-    fitsbin_prepared_pread_range_t* prepared,
-    size_t* physical_bytes_out,
-    size_t* logical_bytes_out,
-    unsigned long long* page_count_out);
-int fitsbin_compare_mapped_span(
-    const void* left,
-    const void* right);
-int fitsbin_prepare_prefetch_spans(
-    fitsbin_t* fb,
-    const fitsbin_prefetch_range_t* ranges,
-    size_t range_count,
-    size_t byte_budget,
-    fitsbin_file_span_t* spans,
-    size_t* span_count,
-    size_t* byte_count);
 int fitsbin_prepare_mapped_spans(
     fitsbin_t* fb,
     const fitsbin_prefetch_range_t* ranges,
     size_t range_count,
     size_t byte_budget,
-    unsigned long long reuse_sequence,
     fitsbin_mapped_span_t* spans,
     size_t span_capacity,
     size_t* span_count,
-    size_t* byte_count,
-    size_t* logical_byte_count,
-    unsigned long long* page_count,
-    size_t* exact_span_count,
-    unsigned long long* reused_page_count,
-    size_t* coalesced_gap_count,
-    size_t* coalesced_gap_bytes);
+    size_t* byte_count);
 int fitsbin_prepare_mapped_file_spans(
     fitsbin_t* fb,
     const fitsbin_mapped_span_t* mapped,
@@ -163,23 +186,7 @@ int fitsbin_prepare_mapped_file_spans(
     fitsbin_file_span_t* file_spans,
     size_t file_span_capacity,
     size_t* file_span_count,
-    size_t* byte_count,
-    size_t* exact_span_count,
-    size_t* gap_count,
-    size_t* gap_bytes);
-void fitsbin_payload_mark_completed_span(
-    fitsbin_t* fb,
-    const fitsbin_mapped_span_t* span,
-    unsigned long long sequence);
-
-unsigned long long fitsbin_payload_io_sequence_hint(void);
-unsigned long long fitsbin_timespec_delta_nanoseconds(
-    const struct timespec* finish,
-    const struct timespec* start);
-unsigned long long fitsbin_payload_io_acquire(void);
-void fitsbin_payload_io_release(void);
-anbool fitsbin_payload_io_planning_is_active(void);
-int fitsbin_payload_io_capacity_current(void);
+    size_t* byte_count);
 
 void fitsbin_apply_mmap_advice(
     fitsbin_t* fb,

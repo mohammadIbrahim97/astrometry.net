@@ -78,33 +78,6 @@ int fitsbin_get_open_file_stat(
     return 0;
 }
 
-void fitsbin_stat_times(
-    const struct stat* file_stat,
-    time_t* mtime_seconds,
-    long* mtime_nanoseconds,
-    time_t* ctime_seconds,
-    long* ctime_nanoseconds) {
-    if (!file_stat || !mtime_seconds ||
-        !mtime_nanoseconds || !ctime_seconds ||
-        !ctime_nanoseconds) {
-        return;
-    }
-    *mtime_seconds = file_stat->st_mtime;
-    *ctime_seconds = file_stat->st_ctime;
-#if defined(__APPLE__)
-    *mtime_nanoseconds =
-        file_stat->st_mtimespec.tv_nsec;
-    *ctime_nanoseconds =
-        file_stat->st_ctimespec.tv_nsec;
-#elif defined(__linux__) || defined(__FreeBSD__)
-    *mtime_nanoseconds = file_stat->st_mtim.tv_nsec;
-    *ctime_nanoseconds = file_stat->st_ctim.tv_nsec;
-#else
-    *mtime_nanoseconds = 0L;
-    *ctime_nanoseconds = 0L;
-#endif
-}
-
 static int nchunks(fitsbin_t* fb) {
     return bl_size(fb->chunks);
 }
@@ -145,8 +118,6 @@ static anbool in_memory(fitsbin_t* fb) {
 static void free_chunk(fitsbin_chunk_t* chunk) {
     if (!chunk) return;
     free(chunk->tablename_copy);
-    free(chunk->payload_page_sequences);
-    chunk->payload_page_sequences = NULL;
     if (chunk->header)
         qfits_header_destroy(chunk->header);
     if (chunk->map) {

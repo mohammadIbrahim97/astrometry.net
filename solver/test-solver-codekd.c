@@ -35,28 +35,9 @@ int solver_test_candidate_nonresident_zero_submit_falls_back(void) {
         result.submit_status != -1 ||
         !result.results_ready ||
         result.quad_compute_ready ||
-        result.quad_fallback != 1U ||
         !result.quad_delivery_disabled ||
         !result.star_delivery_disabled ||
-        result.quad_submitted ||
-        result.quad_ready ||
-        result.has_delivery_ticket ||
-        result.has_delivery_source) {
-        return -1;
-    }
-    return 0;
-}
-
-int solver_test_verification_packet_bounds(void) {
-    solver_codekd_test_reserve_result_t result;
-
-    memset(&result, 0, sizeof(result));
-    if (solver_codekd_test_run_verification_reserve(&result) ||
-        result.initial_status != SOLVER_CODEKD_TEST_RESERVE_OK ||
-        result.initial_capacity > result.maximum_capacity ||
-        result.oversized_status != SOLVER_CODEKD_TEST_RESERVE_FULL ||
-        result.allocation_failed ||
-        result.final_capacity > result.maximum_capacity) {
+        result.has_delivery_ticket) {
         return -1;
     }
     return 0;

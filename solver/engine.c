@@ -30,7 +30,6 @@
 #include "an-bool.h"
 #include "anqfits.h"
 #include "astrometry/index_shard.h"
-#include "astrometry/index_residency.h"
 #include "bl.h"
 #include "engine.h"
 #include "errors.h"
@@ -49,6 +48,7 @@
 #include "solverutils.h"
 #include "tic.h"
 #include "index_shard_config.h"
+#include "index_shard_private.h"
 #include "engine_internal.h"
 #include "engine_private.h"
 
@@ -203,7 +203,7 @@ int engine_add_index(engine_t* engine, char* path) {
 
     t0 = timenow();
     /*
-     * Ordinary registration is always metadata-only. Legacy grouped mode
+     * Ordinary registration is always metadata-only. Grouped mode
      * still loads all selected filename-owned indexes together inside
      * onefield; it no longer needs every configured payload resident before
      * scale and sky selection.
@@ -459,27 +459,83 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
     return rtn;
 }
 
-int engine_run_job(engine_t* engine, job_t* job) {
+const char* engine_job_outcome_string(engine_job_outcome_t outcome) {
+    static const char* names[] = {
+        "UNSOLVED",
+        "SOLVED",
+        "WALL_LIMIT",
+        "CPU_LIMIT",
+        "CANCELLED",
+        "ERROR"
+    };
+    int value = (int)outcome;
+
+    if (value < 0 || value >= (int)(sizeof(names) / sizeof(names[0]))) {
+        return "ERROR";
+    }
+    return names[value];
+}
+
+void engine_job_result_from_onefield(engine_job_result_t* result,
+                                     int engine_rc,
+                                     const onefield_t* bp) {
+    if (!result) {
+        return;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->engine_rc = engine_rc;
+    if (!bp) {
+        result->execution_error = TRUE;
+        result->outcome = ENGINE_JOB_OUTCOME_ERROR;
+        return;
+    }
+
+    result->solved =
+        (bp->any_field_solved ||
+         bp->single_field_solved ||
+         (bp->solved_fields_pending &&
+          il_size(bp->solved_fields_pending) > 0)) ? TRUE : FALSE;
+    result->cancelled = bp->cancelled ? TRUE : FALSE;
+    result->wall_limit =
+        (bp->hit_timelimit || bp->hit_total_timelimit) ? TRUE : FALSE;
+    result->cpu_limit =
+        (bp->hit_cpulimit || bp->hit_total_cpulimit) ? TRUE : FALSE;
+    result->execution_error =
+        (engine_rc != 0 || bp->solver_failed) ? TRUE : FALSE;
+
+    if (result->execution_error) {
+        result->outcome = ENGINE_JOB_OUTCOME_ERROR;
+    } else if (result->solved) {
+        result->outcome = ENGINE_JOB_OUTCOME_SOLVED;
+    } else if (result->cancelled) {
+        result->outcome = ENGINE_JOB_OUTCOME_CANCELLED;
+    } else if (result->wall_limit) {
+        result->outcome = ENGINE_JOB_OUTCOME_WALL_LIMIT;
+    } else if (result->cpu_limit) {
+        result->outcome = ENGINE_JOB_OUTCOME_CPU_LIMIT;
+    } else {
+        result->outcome = ENGINE_JOB_OUTCOME_UNSOLVED;
+    }
+}
+
+int engine_run_job_with_result(engine_t* engine, job_t* job,
+                               engine_job_result_t* result) {
     onefield_t* bp = &(job->bp);
     solver_t* sp = &(bp->solver);
 
     int rtn = 0;
     double app_min_default;
     double app_max_default;
-    double engine_wall_start = monotonic_seconds();
-    double pool_start_seconds = 0.0;
-    double pool_stop_seconds = 0.0;
-    anbool index_shard_pool_started = FALSE;
+    anbool index_shard_pool_bound = FALSE;
     anbool legacy_grouped =
         engine->inparallel && !job->index_shard_workers_controlled;
-    index_residency_t* residency = NULL;
     engine_pass_cursor_t pass_cursor;
     engine_pass_t pass;
 
     if (onefield_is_run_obsolete(bp, sp)) {
         goto finish;
     }
-    // SECTION INDEX-SHARD: engine-lifecycle
     bp->time_total_start = monotonic_seconds();
     bp->cpu_total_start = get_cpu_usage();
     bp->indexes_inparallel = legacy_grouped;
@@ -501,20 +557,43 @@ int engine_run_job(engine_t* engine, job_t* job) {
         goto finish;
     }
 
-    residency = engine_index_residency_begin(engine, bp);
-
     if (index_shard_pthread_enabled(bp) && !legacy_grouped) {
-        double pool_wall_start = monotonic_seconds();
-
-        if (index_shard_pool_start(bp, sp)) {
-            ERROR("Failed to start parallel solver pool");
+        if (engine->index_shard_pool &&
+            index_shard_pool_is_poisoned(engine->index_shard_pool)) {
+            if (index_shard_pool_destroy(engine->index_shard_pool)) {
+                ERROR("Failed to retire poisoned parallel solver pool");
+                engine->index_shard_pool = NULL;
+                rtn = -1;
+                goto finish;
+            }
+            engine->index_shard_pool = NULL;
+        }
+        if (engine->index_shard_pool &&
+            !index_shard_pool_job_width_compatible(
+                engine->index_shard_pool, bp)) {
+            if (index_shard_pool_destroy(engine->index_shard_pool)) {
+                ERROR("Failed to replace incompatible parallel solver pool");
+                engine->index_shard_pool = NULL;
+                rtn = -1;
+                goto finish;
+            }
+            engine->index_shard_pool = NULL;
+        }
+        if (!engine->index_shard_pool &&
+            index_shard_pool_create(
+                bp, &engine->index_shard_pool)) {
+            ERROR("Failed to create parallel solver pool");
+            rtn = -1;
+            goto finish;
+        }
+        if (index_shard_pool_bind_job(
+                engine->index_shard_pool, bp, sp)) {
+            ERROR("Failed to bind parallel solver pool to job");
             rtn = -1;
             goto finish;
         }
 
-        pool_start_seconds =
-            monotonic_seconds() - pool_wall_start;
-        index_shard_pool_started = TRUE;
+        index_shard_pool_bound = TRUE;
     }
 
     engine_pass_cursor_init(&pass_cursor);
@@ -707,60 +786,28 @@ int engine_run_job(engine_t* engine, job_t* job) {
     logverb("AB scale constraints: %i\n", sp->num_abscale_skipped);
 
  finish:
-   // SECTION INDEX-SHARD: engine-lifecycle
-   if (index_shard_pool_started) {
-     double pool_wall_start = monotonic_seconds();
-
-     index_shard_pool_stop(bp);
-     pool_stop_seconds =
-         monotonic_seconds() - pool_wall_start;
+   if (index_shard_pool_bound) {
+     if (index_shard_pool_unbind_job(
+             engine->index_shard_pool, bp, sp)) {
+       ERROR("Failed to unbind parallel solver pool from job");
+       rtn = -1;
+     }
    }
-   if (residency) {
-     (void)index_residency_quiesce(residency);
+   if (engine->index_shard_pool &&
+       index_shard_pool_is_poisoned(engine->index_shard_pool)) {
+     (void)index_shard_pool_destroy(engine->index_shard_pool);
+     engine->index_shard_pool = NULL;
    }
    onefield_job_field_cache_end(bp);
-   if (residency) {
-     index_unbind_residency_service(residency);
-   }
 
-   logverb("[engine-profile] pool_start=%.6f pool_stop=%.6f "
-           "engine_total=%.6f solver_failed=%i\n",
-           pool_start_seconds,
-           pool_stop_seconds,
-           monotonic_seconds() - engine_wall_start,
-           bp->solver_failed ? 1 : 0);
-
+   engine_job_result_from_onefield(result, rtn, bp);
    solver_cleanup(sp);
    onefield_cleanup(bp);
-   if (residency) {
-     index_residency_stats_t stats;
-
-     if (!index_residency_get_stats(residency, &stats)) {
-       logverb(
-           "[index-residency] copied_files=%llu copied_bytes=%llu "
-           "hits=%llu deduplicated=%llu waits=%llu wait_ms=%.3f "
-           "source_leases=%llu source_requeues=%llu "
-           "cancellations=%llu "
-           "peak_bytes=%zu ready_bytes=%zu live_handles=%zu "
-           "failures=%llu source_changes=%llu\n",
-           (unsigned long long)stats.files_copied,
-           (unsigned long long)stats.bytes_copied,
-           (unsigned long long)stats.cache_hits,
-           (unsigned long long)stats.loading_deduplications,
-           (unsigned long long)stats.wait_count,
-           (double)stats.wait_nanoseconds / 1000000.0,
-           (unsigned long long)stats.source_leases,
-           (unsigned long long)stats.source_requeues,
-           (unsigned long long)stats.cancelled_entries,
-           stats.peak_resident_bytes,
-           stats.ready_bytes,
-           stats.live_handles,
-           (unsigned long long)stats.copy_failures,
-           (unsigned long long)stats.source_changes);
-     }
-     (void)index_residency_stop(residency);
-   }
    return rtn;
+}
+
+int engine_run_job(engine_t* engine, job_t* job) {
+    return engine_run_job_with_result(engine, job, NULL);
 }
 
 engine_t* engine_new() {
@@ -788,6 +835,10 @@ void engine_free(engine_t* engine) {
     int i;
     if (!engine)
         return;
+    if (engine->index_shard_pool) {
+        (void)index_shard_pool_destroy(engine->index_shard_pool);
+        engine->index_shard_pool = NULL;
+    }
     if (engine->free_indexes) {
         for (i=0; i<pl_size(engine->free_indexes); i++) {
             index_t* ind = pl_get(engine->free_indexes, i);

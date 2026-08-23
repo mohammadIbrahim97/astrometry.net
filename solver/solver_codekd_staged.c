@@ -18,6 +18,20 @@
 #include "solver_codekd_internal.h"
 #include "solver_inline_internal.h"
 #include "solver_hypothesis_internal.h"
+
+static anbool solver_codekd_packet_page_plan_valid(
+    const solver_codekd_search_packet_t* packet) {
+    return packet && packet->page_workspace &&
+        packet->state == SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
+        packet->plan_complete &&
+        packet->plan_first < packet->plan_end &&
+        packet->plan_end <= packet->next_descriptor &&
+        packet->next_descriptor <= packet->count &&
+        packet->plan_range_count &&
+        packet->plan_range_count <=
+            packet->page_workspace->sealed_range_capacity;
+}
+
 /*
  * Execute only a fully populated, contiguous descriptor slice. Native CodeKD
  * remains the authoritative query implementation. Page eviction between I/O
@@ -63,13 +77,38 @@ solver_codekd_packet_execute_ready(
     }
     if (packet && more_work &&
         packet->state ==
+            SOLVER_CODEKD_PACKET_VERIFY_PREPARE_COMPUTE_READY) {
+        int prepare_status;
+
+        if (!input || !input->phase ||
+            input_size != sizeof(*input) ||
+            output_size != sizeof(*packet)) {
+            return INDEX_SHARD_HELPER_TASK_ERROR;
+        }
+        prepare_status =
+            solver_codekd_packet_prepare_verification_ready(
+                input, packet);
+        if (prepare_status == 2) {
+            return INDEX_SHARD_HELPER_TASK_STOPPED;
+        }
+        if (prepare_status < 0) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            return INDEX_SHARD_HELPER_TASK_ERROR;
+        }
+        *more_work = prepare_status != 0;
+        return INDEX_SHARD_HELPER_TASK_OK;
+    }
+    if (packet && more_work &&
+        packet->state ==
             SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY) {
         return solver_codekd_packet_score_verification_ready(packet);
     }
     if (packet && more_work &&
         packet->state == SOLVER_CODEKD_PACKET_VERIFY_COMPUTE_READY) {
-        if (!input || input_size != sizeof(*input) ||
+        if (!input || !input->phase ||
+            input_size != sizeof(*input) ||
             output_size != sizeof(*packet) ||
+            packet->phase != input->phase ||
             !packet->verify_plan_complete ||
             packet->verify_plan_first !=
                 packet->candidate_window_offset ||
@@ -81,19 +120,20 @@ solver_codekd_packet_execute_ready(
         packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
         return INDEX_SHARD_HELPER_TASK_OK;
     }
-    if (!input || input_size != sizeof(*input) ||
+    if (!input || !input->phase ||
+        input_size != sizeof(*input) ||
         !packet || output_size != sizeof(*packet) ||
-        !input->tree || packet->tree != input->tree ||
+        packet->phase != input->phase ||
+        !input->phase->tree ||
         !packet->descriptors || !packet->slots ||
         !packet->inds || !packet->sdists ||
         !packet->plan_complete ||
         packet->plan_first >= packet->plan_end ||
         packet->plan_end > packet->count ||
-        packet->sequence != input->descriptor.combination_first ||
+        packet->sequence != input->combination_first ||
         packet->state != SOLVER_CODEKD_PACKET_COMPUTE_READY) {
         return INDEX_SHARD_HELPER_TASK_ERROR;
     }
-    packet->state = SOLVER_CODEKD_PACKET_EXECUTING;
     for (descriptor_index = packet->plan_first;
          descriptor_index < packet->plan_end;
          descriptor_index++) {
@@ -102,27 +142,19 @@ solver_codekd_packet_execute_ready(
         solver_codekd_result_slot_t* slot =
             &packet->slots[descriptor_index];
         kdtree_qres_t* previous_result = query_result;
-        double search_wall_start = 0.0;
 
         if (index_shard_worker_stop_requested()) {
             kdtree_free_query(query_result);
             packet->state = SOLVER_CODEKD_PACKET_STOPPED;
             return INDEX_SHARD_HELPER_TASK_STOPPED;
         }
-        if (packet->detailed) {
-            search_wall_start = monotonic_seconds();
-        }
         query_result = solver_codekd_rangesearch(
-            input->tree,
+            input->phase->tree,
             previous_result,
             descriptor->code,
             descriptor->tol2,
             SOLVER_CODEKD_SEARCH_OPTIONS);
         slot->search_errno = errno;
-        if (packet->detailed) {
-            slot->search_wall_seconds =
-                monotonic_seconds() - search_wall_start;
-        }
         if (!query_result) {
             kdtree_free_query(previous_result);
             query_result = NULL;
@@ -161,17 +193,10 @@ solver_codekd_packet_execute_ready(
     }
 
     kdtree_free_query(query_result);
-    packet->plan_complete = FALSE;
-    packet->plan_first = 0U;
-    packet->plan_end = 0U;
-    packet->plan_range_count = 0U;
-    packet->plan_logical_bytes = 0U;
-    packet->delivery_source = NULL;
+    solver_codekd_packet_reset_page_plan(packet);
     if (query_failed) {
         packet->next_descriptor = packet->count;
         packet->pending_descriptor_plan = FALSE;
-        packet->pending_descriptor_raw_ranges = 0U;
-        packet->pending_descriptor_logical_bytes = 0U;
         packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
         if (packet->hit_count) {
             if (solver_codekd_packet_finish_codekd(packet)) {
@@ -182,11 +207,6 @@ solver_codekd_packet_execute_ready(
                 more_work) {
                 *more_work = TRUE;
             }
-        }
-    } else if (packet->next_descriptor < packet->count) {
-        packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
-        if (more_work) {
-            *more_work = TRUE;
         }
     } else {
         packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
@@ -226,24 +246,16 @@ solver_codekd_packet_staged_prepare(
     if (packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY) {
         if (packet->state ==
                 SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE) {
-            return packet->plan_complete &&
-                    packet->plan_first < packet->plan_end &&
-                    packet->plan_end <= packet->next_descriptor &&
-                    packet->next_descriptor <= packet->count &&
-                    packet->plan_range_count &&
-                    packet->plan_range_count <=
-                        packet->page_workspace->sealed_range_capacity
+            return solver_codekd_packet_page_plan_valid(packet)
                 ? INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY
                 : INDEX_SHARD_STAGED_PREPARE_ERROR;
-        }
-        if (packet->state ==
-                SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER) {
-            return INDEX_SHARD_STAGED_PREPARE_OWNER_READY;
         }
         if (packet->state ==
                 SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY ||
             packet->state ==
                 SOLVER_CODEKD_PACKET_VERIFY_SWEEP_COMPUTE_READY ||
+            packet->state ==
+                SOLVER_CODEKD_PACKET_VERIFY_PREPARE_COMPUTE_READY ||
             packet->state ==
                 SOLVER_CODEKD_PACKET_VERIFY_COMPUTE_READY) {
             return INDEX_SHARD_STAGED_PREPARE_COMPUTE_READY;
@@ -316,15 +328,7 @@ solver_codekd_packet_staged_prepare(
             return INDEX_SHARD_STAGED_PREPARE_STOPPED;
         }
         if (plan_status > 0) {
-            return packet->state ==
-                        SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
-                    packet->plan_complete &&
-                    packet->plan_first < packet->plan_end &&
-                    packet->plan_end <= packet->next_descriptor &&
-                    packet->next_descriptor <= packet->count &&
-                    packet->plan_range_count &&
-                    packet->plan_range_count <=
-                        packet->page_workspace->sealed_range_capacity
+            return solver_codekd_packet_page_plan_valid(packet)
                 ? INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY
                 : INDEX_SHARD_STAGED_PREPARE_ERROR;
         }
@@ -450,7 +454,7 @@ solver_codekd_packet_staged_poll(
     if (status == 2 || status == 3) {
         return INDEX_SHARD_STAGED_IO_FAILED;
     }
-    if (packet->delivery_ticket || packet->delivery_source) {
+    if (packet->delivery_ticket) {
         logerr("[solver] staged payload poll returned terminal "
                "without releasing ticket ownership state=%i\n",
                (int)packet->state);
@@ -509,9 +513,10 @@ solver_codekd_packet_staged_owner(
     size_t input_size,
     void* output_bytes,
     size_t output_size) {
-    const solver_codekd_packet_task_input_t* input = input_bytes;
     solver_codekd_search_packet_t* packet = output_bytes;
-    int prepare_status;
+
+    (void)input_bytes;
+    (void)input_size;
 
     if (!packet || output_size != sizeof(*packet)) {
         return INDEX_SHARD_STAGED_EXECUTE_ERROR;
@@ -523,26 +528,6 @@ solver_codekd_packet_staged_owner(
     }
     if (packet->state == SOLVER_CODEKD_PACKET_DESCRIPTORS_READY) {
         return INDEX_SHARD_STAGED_EXECUTE_MORE;
-    }
-    if (packet->state ==
-            SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER) {
-        if (!input || input_size != sizeof(*input)) {
-            packet->state = SOLVER_CODEKD_PACKET_FAILED;
-            return INDEX_SHARD_STAGED_EXECUTE_ERROR;
-        }
-        prepare_status =
-            solver_codekd_packet_prepare_verification_owner(
-                input, packet);
-        if (prepare_status == 2) {
-            return INDEX_SHARD_STAGED_EXECUTE_STOPPED;
-        }
-        if (prepare_status < 0) {
-            packet->state = SOLVER_CODEKD_PACKET_FAILED;
-            return INDEX_SHARD_STAGED_EXECUTE_ERROR;
-        }
-        return prepare_status
-            ? INDEX_SHARD_STAGED_EXECUTE_MORE
-            : INDEX_SHARD_STAGED_EXECUTE_OK;
     }
     if (packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY) {
         if (solver_codekd_packet_finish_codekd(packet)) {
@@ -563,8 +548,7 @@ const index_shard_staged_ops_t solver_codekd_packet_staged_ops = {
     solver_codekd_packet_staged_poll,
     solver_codekd_packet_staged_cancel,
     solver_codekd_packet_staged_execute,
-    solver_codekd_packet_staged_owner,
-    TRUE
+    solver_codekd_packet_staged_owner
 };
 
 /* Exact native execution used whenever packet admission is unavailable. */
@@ -579,9 +563,6 @@ int solver_codekd_descriptor_execute_owner(
     if (!output || !solver || !query_result || !reduced) {
         return -1;
     }
-    solver->profile.max_batch_hypotheses = MAX(
-        solver->profile.max_batch_hypotheses,
-        output->descriptor_count);
     for (descriptor_index = 0U;
          descriptor_index < output->descriptor_count;
          descriptor_index++) {
@@ -645,10 +626,7 @@ void solver_codekd_packet_begin_result_owner(
         solver,
         descriptor->current_parity);
     solver->profile.codekd_calls++;
-    solver->profile.hypotheses_executed++;
     if (solver->profile.detailed) {
-        solver->profile.codekd_wall_seconds +=
-            slot->search_wall_seconds;
         solver->profile.kd_result_order_hash =
             solver_order_hash_mix(
                 solver->profile.kd_result_order_hash,
@@ -668,12 +646,12 @@ void solver_codekd_packet_resolve_result_range_owner(
     int dimquad,
     int candidate_first,
     int candidate_end,
+    const solver_codekd_phase_context_t* phase,
     solver_candidate_delivery_record_t* prepared,
     size_t prepared_first,
     size_t prepared_quad_count,
     size_t prepared_star_count) {
     double pixvals[DQMAX * 2];
-    double resolve_wall_start = 0.0;
     int j;
 
     if (!solver || !descriptor || !result ||
@@ -693,9 +671,6 @@ void solver_codekd_packet_resolve_result_range_owner(
             j,
             field_gety(solver, descriptor->stars[j]));
     }
-    if (solver->profile.detailed) {
-        resolve_wall_start = monotonic_seconds();
-    }
     resolve_matches_native_range(
         result,
         pixvals,
@@ -706,12 +681,9 @@ void solver_codekd_packet_resolve_result_range_owner(
         descriptor->current_parity,
         candidate_first,
         candidate_end,
+        phase,
         prepared,
         prepared_first,
         prepared_quad_count,
         prepared_star_count);
-    if (solver->profile.detailed) {
-        solver->profile.resolve_wall_seconds +=
-            monotonic_seconds() - resolve_wall_start;
-    }
 }

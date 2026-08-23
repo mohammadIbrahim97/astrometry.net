@@ -9,7 +9,6 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stddef.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -17,6 +16,7 @@
 #include "index_shard_internal.h"
 #include "index_shard_config.h"
 #include "astrometry/fitsbin.h"
+#include "fitsbin_internal.h"
 
 /*
  * Private index-shard ownership contract.
@@ -27,9 +27,6 @@
  * The inverse-cache mutex is independent. A path holding state_mutex must
  * not acquire queue_mutex or result_mutex. queue_mutex is the predicate
  * mutex for queue_cv and every owner_cv; result_mutex owns result_cv.
- */
-/*
- * SECTION INDEX-SHARD: types
  */
 /*
  * Failure scope is determined by the originating operation, never by whether
@@ -57,18 +54,17 @@ typedef enum index_shard_terminal_cause {
   INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY
 } index_shard_terminal_cause_t;
 
-// ANCHOR INDEX-SHARD: result-state
 /*
  * Result produced by exactly one shard task.
  *
- * The worker owns all mutable state until completed[index_order] is published.
- * candidate_ready freezes solutions, solved state, best-match metadata and
- * candidate identity for election before index cleanup. The reducer still
- * waits for full task completion and pass quiescence before transferring the
- * selected MatchObj payload into master bp->solutions.
+ * The worker owns all mutable state until completion_sequence is published.
+ * A nonzero candidate_sequence freezes solutions, solved state, best-match
+ * metadata and candidate identity for election before index cleanup. The
+ * reducer still waits for full task completion and pass quiescence before
+ * transferring the selected MatchObj payload into master bp->solutions.
  *
  * Important:
- *   - solutions is worker-local and immutable after candidate_ready
+ *   - solutions is worker-local and immutable after candidate_sequence
  *   - merged prevents double-free / double-merge
  *   - solved means this shard contains an accepted verified MatchObj
  */
@@ -78,7 +74,6 @@ typedef struct index_shard_result {
   /* Fixed before candidate publication; aggregated only after quiescence. */
   solver_profile_t solver_profile;
 
-  int failed; // classified failure, not normal "did not solve"
   int rc;
   index_shard_failure_class_t failure_class;
 
@@ -87,45 +82,7 @@ typedef struct index_shard_result {
   double best_logodds; // diagnostic + future usefulness hint
   int best_fieldnum;
 
-  /*
-   * solve wall covers solve_one_index() only.
-   *
-   * cpu_seconds is a process-wide CPU delta and is diagnostic only when
-   * pthread workers overlap; it is not exclusive CPU time for this task.
-   */
-  double wall_seconds;
-  float cpu_seconds;
-
-   /*
-   * Full outer-task timing covers local reset, index acquisition, solving,
-   * result analysis, and index release. It excludes queue wait and reducer
-   * wait.
-   */
-  anbool task_started;
   int worker_id;
-  double task_wall_seconds;
-  double task_start_since_pass;
-  double task_finish_since_pass;
-
-  /*
-   * Non-overlapping wall-time attribution inside the outer task.
-   *
-   * solve_seconds is represented by wall_seconds above to preserve the
-   * existing result layout and diagnostics.
-   */
-  double reset_seconds;
-  double acquire_seconds;
-  double analyze_seconds;
-  double release_seconds;
-
-  fitsbin_mmap_advice_t mmap_advice;
-  anbool task_resource_valid;
-  struct rusage task_resource_start;
-  double task_user_seconds;
-  double task_system_seconds;
-  unsigned long long task_major_faults;
-  unsigned long long task_input_blocks;
-  unsigned long long task_voluntary_switches;
 
   anbool hit_total_cpulimit;
   anbool hit_total_timelimit;
@@ -133,13 +90,11 @@ typedef struct index_shard_result {
   anbool cancelled;
 
   size_t index_order; // original candidate index order in onefield pass
-  anbool candidate_ready;
   size_t candidate_sequence;
   size_t completion_sequence;
   int merged;         // reducer already consumed/transferred this result
 } index_shard_result_t;
 
-// ANCHOR INDEX-SHARD: shared-pass-state
 /*
  * Shared state for one submitted onefield_run() pass.
  *
@@ -159,7 +114,6 @@ typedef struct index_shard_result {
  * index_shard_worker_context_t.
  */
 typedef struct index_shard_pool index_shard_pool_t;
-typedef struct index_shard_helper_group index_shard_helper_group_t;
 typedef struct index_shard_staged_group index_shard_staged_group_t;
 
 #define INDEX_SHARD_COMPLETION_SLOT_NONE SIZE_MAX
@@ -194,30 +148,18 @@ typedef struct index_shard_completion_entry {
 typedef struct index_shard_thread_state {
   index_shard_pool_t *pool;          // persistent pool, never task-owned
   onefield_t *bp;                   // master bp, reducer-owned for writes
-  const solver_t *base_sp;          // read-only template for local solvers
   const index_shard_hooks_t *hooks; // bridge back into onefield.c
   const void *worker_view;          // immutable, pass-owned worker snapshot
 
   size_t nindexes;
   size_t canonical_scan_cursor;
-  size_t outer_unclaimed;
   size_t outer_running;
   size_t producer_width;
-  size_t helper_width;
   size_t queue_waiters;
-  size_t helper_groups_active;
-  size_t helper_preparations_active;
-  size_t helper_foreign_reservations;
   size_t staged_groups_active;
   size_t staged_tickets_active;
   /* Logical borrows kept live by the synchronous outer index owner. */
   size_t staged_source_leases;
-  size_t staged_compute_ready;
-  size_t staged_reorder_ready;
-  size_t staged_compute_running_global;
-  size_t staged_max_compute_running;
-  size_t staged_max_compute_running_global;
-  unsigned long long staged_completion_epoch;
   anbool staged_submit_backpressure;
 
   /* O(1) completion routing, bounded by workers times staged-task limit. */
@@ -230,11 +172,7 @@ typedef struct index_shard_thread_state {
   size_t staged_submit_callbacks_active;
   anbool completion_registry_error;
 
-  unsigned char *outer_states;
-
   index_shard_result_t *results;
-  unsigned char *completed; // result slot is visible to reducer
-  size_t results_reduced;
   size_t next_completion_sequence;
 
   size_t next_candidate_sequence;
@@ -251,13 +189,10 @@ typedef struct index_shard_thread_state {
   int worker_count;
   int active_workers; // workers still participating in pass
 
-  int stop_requested;   // cooperative stop, no new claims
-  int fatal_error;      // hard worker/module failure
   int winner_selected;  // first immutable verified result won the pass
   int solved_published; // reducer committed a valid solved result
   int master_committed;
   index_shard_terminal_cause_t terminal_cause;
-  double first_stop_wall_since_pass;
 
   /*
    * Hot solvers read this with an atomic load through worker TLS. The locked
@@ -275,143 +210,9 @@ typedef struct index_shard_thread_state {
 
   int limit_reported; // avoid repeated CPU-limit log spam
 
-  double pass_wall_start;
-  float pass_cpu_start;
-
-  fitsbin_mmap_advice_t mmap_advice;
-  unsigned int mmap_pass_number;
-  unsigned long long mmap_advice_failures;
-
-  struct rusage pass_rusage_start;
-  int pass_rusage_valid;
-
-  unsigned long long reducer_work_calls;
-  double reducer_work_wall_seconds;
-  unsigned long long outer_claims;
-  unsigned long long helper_groups_published;
-  unsigned long long helper_groups_completed;
-  unsigned long long helper_tasks_owner;
-  unsigned long long helper_tasks_foreign;
-  unsigned long long helper_task_failures;
-  unsigned long long helper_owner_wait_calls;
-  double helper_owner_wait_seconds;
-  unsigned long long staged_groups_published;
-  unsigned long long staged_groups_completed;
-  unsigned long long staged_tasks_owner;
-  unsigned long long staged_tasks_foreign;
-  unsigned long long staged_compute_owner;
-  unsigned long long staged_compute_foreign;
-  unsigned long long staged_ready_before_outer_claims;
-  unsigned long long staged_task_failures;
-  unsigned long long staged_io_submitted;
-  unsigned long long staged_io_completed;
-  unsigned long long staged_submit_retries;
-  unsigned long long staged_submit_rearms;
-  unsigned long long staged_submit_handoffs;
-  unsigned long long staged_submit_deferrals;
-  unsigned long long staged_owner_wait_calls;
-  double staged_owner_wait_seconds;
-  size_t staged_max_io_submitted;
-  size_t staged_max_compute_ready;
-  size_t staged_max_reorder_ready;
-  unsigned long long staged_prepare_claims;
-  unsigned long long staged_submit_claims;
-  unsigned long long staged_poll_claims;
-  unsigned long long staged_inline_poll_claims;
-  unsigned long long staged_inline_poll_failures;
-  unsigned long long staged_execute_claims;
-  unsigned long long staged_owner_execute_claims;
-  double staged_submit_to_ready_seconds;
-  double staged_ready_dwell_seconds;
-  double staged_execute_seconds;
-  double staged_result_to_retire_seconds;
-  double staged_retire_seconds;
   unsigned long long task_local_failures;
   unsigned long long global_integrity_failures;
-  unsigned long long late_loser_failures;
-
-  /* Aggregate scheduler observability; updated only while profiling is on. */
-  anbool observability_enabled;
-  unsigned long long queue_broadcasts;
-  unsigned long long queue_signals;
-  unsigned long long queue_signals_no_work;
-  unsigned long long owner_signals;
-  unsigned long long owner_signals_coalesced;
-  unsigned long long owner_broadcasts;
-  unsigned long long queue_wait_calls;
-  double queue_wait_seconds;
-  unsigned long long completion_notifications;
-  unsigned long long completion_groups_scanned;
-  unsigned long long completion_tasks_scanned;
-  unsigned long long completion_matches;
-  unsigned long long completion_registry_registered;
-  unsigned long long completion_registry_removed;
-  unsigned long long completion_registry_early;
-  unsigned long long completion_registry_misses;
-  unsigned long long completion_registry_duplicates;
-  unsigned long long completion_registry_invalid;
-  unsigned long long selection_scans;
-  unsigned long long selection_groups_scanned;
-  unsigned long long selection_tasks_scanned;
-  unsigned long long selection_misses;
-  unsigned long long helper_windows_started;
-  double helper_window_seconds;
-  unsigned long long verification_helper_groups;
-  unsigned long long verification_helper_contexts;
 } index_shard_thread_state_t;
-
-typedef enum index_shard_outer_state {
-  INDEX_SHARD_OUTER_UNCLAIMED = 0,
-  INDEX_SHARD_OUTER_RUNNING = 1,
-  INDEX_SHARD_OUTER_FINISHED = 2
-} index_shard_outer_state_t;
-
-typedef enum index_shard_helper_task_state {
-  INDEX_SHARD_HELPER_TASK_UNUSED = 0,
-  INDEX_SHARD_HELPER_TASK_READY = 1,
-  INDEX_SHARD_HELPER_TASK_RUNNING = 2,
-  INDEX_SHARD_HELPER_TASK_DONE = 3,
-  INDEX_SHARD_HELPER_TASK_RETIRING = 4,
-  INDEX_SHARD_HELPER_TASK_RETIRED = 5
-} index_shard_helper_task_state_t;
-
-/*
- * One bounded synchronous group published from an outer-index owner stack.
- * queue_mutex protects the lane pointer, task states, and every counter.
- */
-struct index_shard_helper_group {
-  const index_shard_helper_ops_t *ops;
-  index_shard_helper_task_t *tasks;
-  size_t task_count;
-  index_shard_helper_retire_fn retire;
-  void *owner_context;
-
-  unsigned long generation;
-  unsigned long long owner_epoch;
-  int owner_worker;
-  size_t owner_index_order;
-
-  size_t next_claim;
-  size_t next_retire;
-  size_t ready_count;
-  size_t running_count;
-  size_t completed_count;
-  size_t foreign_claims;
-  size_t owner_claims;
-  size_t foreign_reserve;
-  size_t foreign_reservations_outstanding;
-  anbool owner_reserve_yielded;
-  size_t max_running;
-  unsigned long long ready_work;
-  unsigned long long foreign_work;
-  unsigned long long owner_work;
-
-  anbool task_failed;
-  anbool stop_seen;
-  anbool internal_error;
-  anbool verification_group;
-  double helper_window_start;
-};
 
 typedef enum index_shard_staged_task_state {
   INDEX_SHARD_STAGED_TASK_UNUSED = 0,
@@ -454,32 +255,9 @@ struct index_shard_staged_group {
   size_t next_retire;
   size_t running_count;
   size_t compute_running;
-  size_t owner_claims;
-  size_t foreign_claims;
-  size_t owner_compute_executes;
   size_t foreign_compute_executes;
-  size_t max_running;
   size_t max_compute_running;
   size_t io_submitted;
-  size_t io_completed;
-  size_t compute_ready;
-  size_t reorder_ready;
-  size_t max_io_submitted;
-  size_t max_compute_ready;
-  size_t max_reorder_ready;
-  size_t prepare_claims;
-  size_t submit_claims;
-  size_t poll_claims;
-  size_t inline_poll_claims;
-  size_t execute_claims;
-  size_t owner_execute_claims;
-  double submit_to_ready_seconds;
-  double ready_dwell_seconds;
-  double execute_seconds;
-  double result_to_retire_seconds;
-  double retire_seconds;
-  unsigned long long owner_work;
-  unsigned long long foreign_work;
 
   size_t completion_registry_entries;
 
@@ -493,7 +271,6 @@ struct index_shard_staged_group {
   uint64_t cancel_sent_mask;
   uint64_t compute_ready_mask;
   uint64_t owner_ready_mask;
-  uint64_t results_ready_mask;
 
   anbool cancelling;
   anbool task_failed;
@@ -502,14 +279,7 @@ struct index_shard_staged_group {
 };
 
 typedef struct index_shard_inverse_cache_entry {
-  char *filename;
-  dev_t device;
-  ino_t inode;
-  off_t file_size;
-  time_t mtime_seconds;
-  long mtime_nanoseconds;
-  time_t ctime_seconds;
-  long ctime_nanoseconds;
+  struct stat file_stat;
   int ndata;
   int ndim;
   u32 treetype;
@@ -522,13 +292,7 @@ typedef struct index_shard_inverse_cache_entry {
 
 typedef struct index_shard_inverse_source {
   const char *filename;
-  dev_t device;
-  ino_t inode;
-  off_t file_size;
-  time_t mtime_seconds;
-  long mtime_nanoseconds;
-  time_t ctime_seconds;
-  long ctime_nanoseconds;
+  struct stat file_stat;
   int ndata;
   int ndim;
   u32 treetype;
@@ -542,16 +306,13 @@ typedef struct index_shard_inverse_lease {
   index_shard_inverse_source_t source;
   anbool source_valid;
   anbool borrowed;
-  anbool initially_empty;
   anbool callbacks_registered;
   anbool active_reserved;
   anbool admission_reserved;
   anbool allocation_completed;
   size_t reserved_bytes;
-  unsigned long generation_seen;
 } index_shard_inverse_lease_t;
 
-// ANCHOR INDEX-SHARD: worker-context-state
 /*
  * Private state for one pthread worker.
  *
@@ -560,7 +321,7 @@ typedef struct index_shard_inverse_lease {
  *
  * Important:
  *   - local_bp must never publish directly into master bp->solutions
- *   - local_context_generation ties local_bp to the active pool generation
+ *   - local_bp is released before the worker acknowledges each generation
  *   - no persistent full index_t cache here in the production path
  */
 typedef struct index_shard_worker_context {
@@ -570,33 +331,11 @@ typedef struct index_shard_worker_context {
 
   onefield_t local_bp; // worker-local onefield copy
   int local_context_ready;
-  unsigned long local_context_generation;
-  double pass_prepare_seconds;
-  double pass_cleanup_seconds;
   anbool current_outer_active;
-  size_t current_index_order;
-  /*
-   * Set after this worker finishes an outer index. The next selection may
-   * consume one foreign COMPUTE_READY staged packet before another outer
-   * claim; it never admits preparation, submission, polling, or owner work.
-   */
   anbool ready_before_outer_eligible;
-  index_shard_helper_group_t *published_helper_group;
-  unsigned long long helper_group_epoch;
+  size_t current_index_order;
   index_shard_staged_group_t *published_staged_group;
   unsigned long long staged_group_epoch;
-  /*
-   * True only while this worker is running the owner callback for its
-   * published staged group. That callback may publish one bounded synchronous
-   * helper group for immutable child computation; recursive publication is
-   * forbidden.
-   */
-  anbool staged_owner_callback_active;
-  index_shard_staged_group_t *staged_owner_callback_group;
-  anbool helper_preparation_active;
-  unsigned long helper_preparation_generation;
-  size_t helper_preparation_index_order;
-  size_t helper_preparation_workers;
 
   /* queue_mutex is the predicate mutex for this owner-only condition. */
   pthread_cond_t owner_cv;
@@ -606,25 +345,19 @@ typedef struct index_shard_worker_context {
 
 } index_shard_worker_context_t;
 
-// ANCHOR INDEX-SHARD: pool-state
 /*
- * Persistent worker pool for one engine job.
+ * Persistent worker pool for one engine process.
  *
- * The pool survives across multiple onefield_run() submissions.  Workers sleep
- * between generations and wake when index_shard_pool_submit() increments
- * generation.
+ * Exactly one job may bind the pool and exactly one pass may be active.  Job
+ * and pass pointers are cleared before their owners can be cleaned up.  Worker
+ * threads sleep between monotonically numbered pass generations.
  */
 typedef enum index_shard_work_selection {
   INDEX_SHARD_WORK_ERROR = -1,
   INDEX_SHARD_WORK_DONE = 0,
   INDEX_SHARD_WORK_OUTER = 1,
-  INDEX_SHARD_WORK_HELPER = 2
+  INDEX_SHARD_WORK_INNER = 2
 } index_shard_work_selection_t;
-
-typedef struct index_shard_helper_claim {
-  index_shard_helper_group_t *group;
-  size_t task_index;
-} index_shard_helper_claim_t;
 
 typedef enum index_shard_staged_claim_kind {
   INDEX_SHARD_STAGED_CLAIM_NONE = 0,
@@ -643,24 +376,11 @@ typedef struct index_shard_staged_claim {
   anbool owner_claim;
   anbool completion_inline;
   anbool submit_credit;
-  unsigned long long observed_completion_epoch;
 } index_shard_staged_claim_t;
 
-typedef enum index_shard_inner_claim_kind {
-  INDEX_SHARD_INNER_CLAIM_NONE = 0,
-  INDEX_SHARD_INNER_CLAIM_HELPER,
-  INDEX_SHARD_INNER_CLAIM_STAGED
-} index_shard_inner_claim_kind_t;
-
-typedef struct index_shard_inner_claim {
-  index_shard_inner_claim_kind_t kind;
-  index_shard_helper_claim_t helper;
-  index_shard_staged_claim_t staged;
-} index_shard_inner_claim_t;
+typedef index_shard_staged_claim_t index_shard_inner_claim_t;
 
 typedef struct index_shard_pass_state_snapshot {
-  int stop_requested;
-  int fatal_error;
   int winner_selected;
   int solved_published;
   int master_committed;
@@ -669,80 +389,7 @@ typedef struct index_shard_pass_state_snapshot {
   size_t selected_candidate_sequence;
   unsigned long long task_local_failures;
   unsigned long long global_integrity_failures;
-  double first_stop_wall_since_pass;
 } index_shard_pass_state_snapshot_t;
-
-typedef struct index_shard_pass_metrics_snapshot {
-  size_t reduced;
-
-  double wall_seconds;
-  float cpu_seconds;
-  double cpu_percent;
-
-  int resource_available;
-  double user_seconds;
-  double system_seconds;
-
-  long minor_faults;
-  long major_faults;
-  long voluntary_context_switches;
-  long involuntary_context_switches;
-  long filesystem_input_blocks;
-  long filesystem_output_blocks;
-} index_shard_pass_metrics_snapshot_t;
-
-typedef struct index_shard_task_profile_snapshot {
-  size_t executed;
-  int quantiles_available;
-
-  double task_p50_seconds;
-  double task_p90_seconds;
-  double task_p99_seconds;
-  double task_max_seconds;
-
-  double max_solve_seconds;
-  size_t max_index_order;
-  int max_worker_id;
-
-  double max_to_p50;
-  double max_pool_percent;
-
-  double serial_tail_seconds;
-  double serial_tail_percent;
-  size_t tail_index_order;
-  int tail_worker_id;
-} index_shard_task_profile_snapshot_t;
-
-typedef struct index_shard_phase_profile_snapshot {
-  size_t executed;
-  int quantiles_available;
-
-  double task_wall_total;
-
-  double reset_total;
-  double acquire_total;
-  double solve_total;
-  double analyze_total;
-  double release_total;
-  double other_total;
-
-  double reset_percent;
-  double acquire_percent;
-  double solve_percent;
-  double analyze_percent;
-  double release_percent;
-  double other_percent;
-
-  double acquire_p50;
-  double acquire_p90;
-  double acquire_p99;
-  double acquire_max;
-
-  double solve_p50;
-  double solve_p90;
-  double solve_p99;
-  double solve_max;
-} index_shard_phase_profile_snapshot_t;
 
 typedef enum index_shard_pool_acquire_status {
   INDEX_SHARD_POOL_ACQUIRE_CONFLICT = -1,
@@ -759,12 +406,11 @@ typedef enum index_shard_staged_select_class {
 
 struct index_shard_pool {
 
+  /* Valid only while job_active is true. */
   onefield_t *owner_bp;
   solver_t *owner_sp;
 
   int worker_count;
-  size_t producer_width;
-  size_t helper_width;
   pthread_t *threads;
   index_shard_worker_context_t *contexts;
 
@@ -788,31 +434,19 @@ struct index_shard_pool {
 
   int shutdown;
   int stopping;
+  int poisoned;
+  int job_active;
   int pass_active;
+  int pass_releasing;
   int payload_io_owned;
   int payload_completion_registered;
   int ready_workers;
   int tls_startup_error;
+  unsigned long job_generation;
   unsigned long generation; // pass submission counter
 
   index_shard_thread_state_t shared;
-
-} ;
-
-
-/* index_shard_pass.c */
-index_shard_solve_status_t
-index_shard_solve_impl(onefield_t *bp,
-                       solver_t *base_sp,
-                       size_t nindexes,
-                       const index_shard_hooks_t *hooks);
-
-/* index_shard.c */
-index_shard_solve_status_t
-index_shard_solve(onefield_t *bp,
-                  solver_t *base_sp,
-                  size_t nindexes,
-                  const index_shard_hooks_t *hooks);
+};
 
 /* index_shard_control.c */
 int index_shard_tls_ensure(void);
@@ -822,9 +456,8 @@ anbool index_shard_worker_context_active(void);
 anbool index_shard_worker_stop_requested(void);
 anbool index_shard_pthread_enabled(const onefield_t *bp);
 anbool index_shard_trace_enabled(void);
-int index_shard_get_worker_count(const onefield_t *bp,
-                                        size_t nindexes);
-int index_shard_publish_terminal_locked(
+int index_shard_get_worker_count(const onefield_t *bp);
+void index_shard_publish_terminal_locked(
     index_shard_thread_state_t *shared,
     index_shard_terminal_cause_t cause);
 void index_shard_publish_worker_stop(
@@ -849,41 +482,12 @@ index_shard_sample_terminal_locked(
 int index_shard_check_global_limits(index_shard_thread_state_t *shared);
 void index_shard_poll_from_callback(onefield_t *bp);
 
-/* index_shard_helper.c */
-anbool index_shard_helper_outer_claimable_locked(
-    const index_shard_thread_state_t *shared);
+/* index_shard_scheduler.c */
 int index_shard_inner_select_locked(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     anbool allow_owner,
     index_shard_inner_claim_t *claim);
-int index_shard_helper_execute_claim(
-    index_shard_thread_state_t *shared,
-    const index_shard_helper_claim_t *claim);
-int index_shard_helper_owner_claim_locked(
-    index_shard_thread_state_t *shared,
-    index_shard_helper_group_t *group,
-    size_t *task_index);
-anbool index_shard_helper_staged_child_allowed(
-    const index_shard_worker_context_t *ctx);
-size_t index_shard_helper_available_workers(void);
-size_t index_shard_helper_prepare_reserve(void);
-void index_shard_helper_prepare_cancel(void);
-index_shard_helper_run_status_t
-index_shard_helper_run(
-    const index_shard_helper_ops_t *ops,
-    index_shard_helper_task_t *tasks,
-    size_t task_count,
-    index_shard_helper_run_stats_t *stats);
-index_shard_helper_run_status_t
-index_shard_helper_run_ordered(
-    const index_shard_helper_ops_t *ops,
-    index_shard_helper_task_t *tasks,
-    size_t task_count,
-    index_shard_helper_retire_fn retire,
-    void *owner_context,
-    index_shard_helper_run_stats_t *stats);
-
 /* index_shard_inverse.c */
 size_t index_shard_inverse_cache_budget(void);
 void index_shard_inverse_cache_attach(
@@ -898,41 +502,35 @@ void index_shard_inverse_cache_destroy(
     index_shard_pool_t *pool);
 
 /* index_shard_pool.c */
+int index_shard_pool_create(
+    const onefield_t *config_bp,
+    index_shard_pool_t **pool_out);
+int index_shard_pool_bind_job(
+    index_shard_pool_t *pool,
+    onefield_t *bp,
+    solver_t *sp);
+int index_shard_pool_job_width_compatible(
+    const index_shard_pool_t *pool,
+    const onefield_t *bp);
+int index_shard_pool_unbind_job(
+    index_shard_pool_t *pool,
+    onefield_t *bp,
+    solver_t *sp);
+int index_shard_pool_destroy(index_shard_pool_t *pool);
+void index_shard_pool_poison(index_shard_pool_t *pool);
+int index_shard_pool_is_poisoned(index_shard_pool_t *pool);
 index_shard_pool_acquire_status_t
 index_shard_pool_acquire_pass(onefield_t *bp,
                               solver_t *sp,
                               index_shard_pool_t **pool_out);
-void index_shard_pool_release_pass(index_shard_pool_t *pool);
+int index_shard_pool_release_pass(index_shard_pool_t *pool);
 int index_shard_pool_start(onefield_t *bp, solver_t *sp);
 void index_shard_pool_stop(onefield_t *bp);
 int index_shard_pool_active(onefield_t *bp);
 
-/* index_shard_profile.c */
+/* index_shard_control.c */
 void index_shard_pass_state_snapshot(index_shard_thread_state_t *shared,
                                             index_shard_pass_state_snapshot_t *snapshot);
-double index_shard_timeval_delta_seconds(
-    const struct timeval *finish,
-    const struct timeval *start);
-long index_shard_nonnegative_long_delta(long finish,
-                                                long start);
-void index_shard_pass_metrics_snapshot(
-    index_shard_thread_state_t *shared,
-    index_shard_pass_metrics_snapshot_t *snapshot);
-void index_shard_task_profile_snapshot(
-    const index_shard_result_t *results,
-    size_t nresults,
-    double pool_wall_seconds,
-    index_shard_task_profile_snapshot_t *snapshot);
-void index_shard_phase_profile_snapshot(
-    const index_shard_result_t *results,
-    size_t nresults,
-    index_shard_phase_profile_snapshot_t *snapshot);
-void index_shard_observability_increment(
-    unsigned long long *counter);
-void index_shard_observability_add(
-    unsigned long long *counter,
-    unsigned long long value);
-
 /* index_shard_reducer.c */
 void index_shard_result_fail(
     index_shard_result_t *result,
@@ -945,10 +543,6 @@ int index_shard_apply_hook_result(
 void index_shard_result_init(index_shard_result_t *result, size_t index_order);
 void index_shard_result_dispose(index_shard_result_t *result,
                                        const index_shard_hooks_t *hooks);
-void index_shard_result_finish_task(
-    index_shard_result_t *result,
-    const index_shard_thread_state_t *shared,
-    double task_wall_start);
 int index_shard_capture_solution_analysis(
     index_shard_thread_state_t *shared,
     index_shard_result_t *result);
@@ -981,28 +575,19 @@ void index_shard_queue_broadcast_locked(
 void index_shard_wake_pass_waiters(index_shard_thread_state_t *shared);
 void index_shard_wake_queue_waiters(
     index_shard_thread_state_t *shared);
-const char *index_shard_terminal_cause_name(
-    index_shard_terminal_cause_t cause);
 int index_shard_claim_outer_locked(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     size_t candidate,
-    size_t *index_order,
-    fitsbin_mmap_advice_t *mmap_advice);
+    size_t *index_order);
 index_shard_work_selection_t
 index_shard_select_work(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     size_t *index_order,
-    fitsbin_mmap_advice_t *mmap_advice,
     index_shard_inner_claim_t *inner_claim);
 
 /* index_shard_staged.c */
-unsigned long long index_shard_helper_task_work(
-    const index_shard_helper_task_t *task);
-int index_shard_helper_add_work(
-    unsigned long long *total,
-    unsigned long long work);
 int index_shard_completion_registry_init(
     index_shard_thread_state_t *shared,
     int worker_count);
@@ -1051,7 +636,6 @@ int index_shard_staged_complete_claim(
     index_shard_thread_state_t *shared,
     const index_shard_staged_claim_t *claim,
     int callback_status,
-    double callback_seconds,
     unsigned long long completion_id);
 int index_shard_inner_execute_claim(
     index_shard_thread_state_t *shared,

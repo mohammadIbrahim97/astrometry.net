@@ -8,10 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
-#include <unistd.h>
 
 #include "starkd.h"
 #include "starkd_internal.h"
+#include "fitsbin_internal.h"
 #include "kdtree.h"
 #include "kdtree_fits_io.h"
 #include "starutil.h"
@@ -23,165 +23,29 @@
 #include "ioutils.h"
 #include "fitsioutils.h"
 
-int startree_prepare_stars(startree_t* s,
-                            const unsigned int* starids,
-                            int nstars) {
-    fitsbin_prefetch_range_t ranges[160];
-    fitsbin_t* fb;
-    size_t row_size;
+typedef struct startree_star_plan {
+    fitsbin_prefetch_range_t* ranges;
+    size_t capacity;
+    size_t count;
     size_t byte_budget;
-    size_t per_range_budget;
-    long detected_page_size;
-    int i;
+} startree_star_plan_t;
 
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || !s->tree->io_is_fitsbin ||
-        !s->tree->data.any || startree_data_count_internal(s) <= 0) {
-        return 0;
-    }
-    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
-        errno = E2BIG;
-        return -1;
-    }
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    fb = s->tree->io;
-    row_size = kdtree_sizeof_data(s->tree) / (size_t)startree_data_count_internal(s);
-    if (!row_size || (size_t)detected_page_size >
-        (SIZE_MAX - row_size) / 2U) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    byte_budget = (size_t)nstars * per_range_budget;
-
-    for (i = 0; i < nstars; i++) {
-        int data_index;
-
-        if (starids[i] >= (unsigned int)startree_data_count_internal(s)) {
-            errno = EINVAL;
-            return -1;
-        }
-        data_index = startree_data_index_internal(s, (int)starids[i]);
-        if (data_index < 0) {
-            return -1;
-        }
-        ranges[i].data = kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
-    }
-    return fitsbin_prefetch_ranges(
-        fb,
-        ranges,
-        (size_t)nstars,
-        byte_budget);
-}
-
-int startree_prefetch_stars(startree_t* s,
-                            const unsigned int* starids,
-                            int nstars) {
-    int status = startree_prepare_stars(
-        s, starids, nstars);
-
-    return status < 0 ? -1 : 0;
-}
-
-int startree_prefetch_stars_submit(
-    startree_t* s,
-    const unsigned int* starids,
-    int nstars,
-    fitsbin_payload_io_ticket_t** ticket) {
-    fitsbin_prefetch_range_t ranges[160];
-    fitsbin_t* fb;
-    size_t row_size;
-    size_t byte_budget;
-    size_t per_range_budget;
-    long detected_page_size;
-    int i;
-
-    if (!ticket) {
-        errno = EINVAL;
-        return -1;
-    }
-    *ticket = NULL;
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || !s->tree->io_is_fitsbin ||
-        !s->tree->data.any || startree_data_count_internal(s) <= 0) {
-        return 0;
-    }
-    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
-        errno = E2BIG;
-        return -1;
-    }
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    row_size = kdtree_sizeof_data(s->tree) / (size_t)startree_data_count_internal(s);
-    if (!row_size || (size_t)detected_page_size >
-        (SIZE_MAX - row_size) / 2U) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    byte_budget = (size_t)nstars * per_range_budget;
-    fb = s->tree->io;
-
-    for (i = 0; i < nstars; i++) {
-        int data_index;
-
-        if (starids[i] >= (unsigned int)startree_data_count_internal(s)) {
-            errno = EINVAL;
-            return -1;
-        }
-        data_index = startree_data_index_internal(s, (int)starids[i]);
-        if (data_index < 0) {
-            return -1;
-        }
-        ranges[i].data = kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
-    }
-    return fitsbin_prefetch_ranges_submit(
-        fb,
-        ranges,
-        (size_t)nstars,
-        byte_budget,
-        ticket);
-}
-
-int startree_prefetch_stars_ready_submit(
+static int startree_plan_stars(
     const startree_t* s,
     const unsigned int* starids,
     int nstars,
-    fitsbin_payload_io_ticket_t** ticket) {
-    fitsbin_prefetch_range_t
-        ranges[FITSBIN_MMAP_PREFETCH_RANGE_LIMIT];
-    fitsbin_t* fb;
+    startree_star_plan_t* plan) {
     size_t row_size;
-    size_t byte_budget;
-    size_t per_range_budget;
-    long detected_page_size;
     int ndata;
     int i;
 
-    if (!ticket) {
+    if (!plan || !plan->ranges || !plan->capacity ||
+        !s) {
         errno = EINVAL;
         return -1;
     }
-    *ticket = NULL;
+    plan->count = 0U;
+    plan->byte_budget = 0U;
     if (!s || !s->tree || !starids || nstars <= 0 ||
         !s->tree->io || !s->tree->io_is_fitsbin ||
         !s->tree->data.any) {
@@ -191,7 +55,7 @@ int startree_prefetch_stars_ready_submit(
     if (ndata <= 0) {
         return 0;
     }
-    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
+    if ((size_t)nstars > plan->capacity) {
         errno = E2BIG;
         return -1;
     }
@@ -199,26 +63,14 @@ int startree_prefetch_stars_ready_submit(
         errno = EAGAIN;
         return 0;
     }
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
     row_size = kdtree_sizeof_data(s->tree) / (size_t)ndata;
-    if (!row_size || (size_t)detected_page_size >
-        (SIZE_MAX - row_size) / 2U) {
-        errno = EOVERFLOW;
+    if (fitsbin_prefetch_row_budget(
+            s->tree->io,
+            row_size,
+            (size_t)nstars,
+            &plan->byte_budget)) {
         return -1;
     }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    byte_budget = (size_t)nstars * per_range_budget;
-    fb = s->tree->io;
-
     for (i = 0; i < nstars; i++) {
         unsigned int starid = starids[i];
         int data_index;
@@ -234,14 +86,41 @@ int startree_prefetch_stars_ready_submit(
             errno = EINVAL;
             return -1;
         }
-        ranges[i].data = kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
+        plan->ranges[i].data =
+            kdtree_get_data(s->tree, data_index);
+        plan->ranges[i].size = row_size;
+    }
+    plan->count = (size_t)nstars;
+    return 1;
+}
+
+int startree_prefetch_stars_ready_submit(
+    const startree_t* s,
+    const unsigned int* starids,
+    int nstars,
+    fitsbin_payload_io_ticket_t** ticket) {
+    fitsbin_prefetch_range_t
+        ranges[FITSBIN_PREFETCH_RANGE_LIMIT];
+    startree_star_plan_t plan = {
+        .ranges = ranges,
+        .capacity = sizeof(ranges) / sizeof(ranges[0]),
+    };
+    int status;
+
+    if (!ticket) {
+        errno = EINVAL;
+        return -1;
+    }
+    *ticket = NULL;
+    status = startree_plan_stars(s, starids, nstars, &plan);
+    if (status <= 0) {
+        return status;
     }
     return fitsbin_prefetch_ranges_submit(
-        fb,
-        ranges,
-        (size_t)nstars,
-        byte_budget,
+        s->tree->io,
+        plan.ranges,
+        plan.count,
+        plan.byte_budget,
         ticket);
 }
 
@@ -274,90 +153,4 @@ int startree_get_ready(
     }
     kdtree_copy_data_double(s->tree, data_index, 1, posn);
     return 0;
-}
-
-#define STARTREE_MAPPED_ADVICE_RANGE_LIMIT 256U
-
-int startree_advise_rows(startree_t* s,
-                         const unsigned int* starids,
-                         int nstars) {
-    fitsbin_prefetch_range_t
-        ranges[STARTREE_MAPPED_ADVICE_RANGE_LIMIT];
-    fitsbin_t* fb;
-    size_t accepted;
-    size_t byte_budget;
-    size_t per_range_budget;
-    size_t row_size;
-    long detected_page_size;
-    int advised;
-    int ndata;
-    size_t i;
-
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || !s->tree->io_is_fitsbin ||
-        !s->tree->data.any) {
-        return 0;
-    }
-    ndata = startree_data_count_internal(s);
-    if (ndata <= 0) {
-        return 0;
-    }
-
-    /*
-     * Advice must not turn into a compulsory full PERM sweep. The normal
-     * data lookup remains responsible for constructing the inverse mapping
-     * when it is genuinely needed.
-     */
-    if (s->tree->perm && !s->inverse_perm) {
-        return 0;
-    }
-    row_size =
-        kdtree_sizeof_data(s->tree) / (size_t)ndata;
-    if (!row_size) {
-        return 0;
-    }
-    accepted = MIN(
-        (size_t)nstars,
-        (size_t)STARTREE_MAPPED_ADVICE_RANGE_LIMIT);
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0 ||
-        (size_t)detected_page_size >
-            (SIZE_MAX - row_size) / 2U) {
-        return 0;
-    }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if (accepted > SIZE_MAX / per_range_budget) {
-        return 0;
-    }
-    byte_budget = accepted * per_range_budget;
-    fb = s->tree->io;
-
-    /*
-     * Populate only a fixed canonical lookahead. Later rows retain the base
-     * mapping policy and are consumed by the original loop on demand.
-     */
-    for (i = 0U; i < accepted; i++) {
-        unsigned int starid = starids[i];
-        int data_index;
-
-        if (starid >= (unsigned int)ndata) {
-            return -1;
-        }
-        data_index = s->inverse_perm
-            ? s->inverse_perm[starid]
-            : (int)starid;
-        if (data_index < 0 || data_index >= ndata) {
-            return -1;
-        }
-        ranges[i].data =
-            kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
-    }
-    advised = fitsbin_advise_mapped_ranges(
-        fb,
-        ranges,
-        accepted,
-        byte_budget);
-    return advised;
 }

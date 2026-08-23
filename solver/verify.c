@@ -524,11 +524,8 @@ void verify_get_index_stars(const double* fieldcenter, double fieldr2,
     }
 
     // Find index stars within the rectangular field.
-    if (!verify_internal_filter_stars_in_field_parallel(
-            sip, tan, indxyz, N, indexpix, &inbounds, &NI)) {
-        inbounds = sip_filter_stars_in_field(
-            sip, tan, indxyz, NULL, N, indexpix, NULL, &NI);
-    }
+    inbounds = sip_filter_stars_in_field(
+        sip, tan, indxyz, NULL, N, indexpix, NULL, &NI);
     // Apply the permutation now, so that "indexpix" and "starid" stay in sync:
     // indexpix is already in the "inbounds" ordering.
     permutation_apply(inbounds, NI, starid, starid, sizeof(int));
@@ -769,7 +766,7 @@ static int verify_uniformize_field_checked(
     }
 
     /*
-     * Make the same round-robin sweeps as the legacy nested loops, but keep
+     * Make the same round-robin sweeps as the native nested loops, but keep
      * only non-empty bins in the active list. The old maxcount * nbins scan
      * repeatedly visited empty/exhausted bins and dominated deep verification
      * when a field occupied only a small part of a fine grid.
@@ -1178,14 +1175,14 @@ void verify_count_hits(int* theta, int besti, int* p_nmatch, int* p_nconflict, i
 }
 
 
-static void verify_hit_original(const startree_t* skdt, int index_cutnside,
-                                MatchObj* mo, const sip_t* sip,
-                                const verify_field_t* vf,
-                                double pix2, double distractors,
-                                double fieldW, double fieldH,
-                                double logbail, double logaccept,
-                                double logstoplooking,
-                                anbool do_gamma, anbool fake_match) {
+void verify_hit(const startree_t* skdt, int index_cutnside,
+                MatchObj* mo, const sip_t* sip,
+                const verify_field_t* vf,
+                double pix2, double distractors,
+                double fieldW, double fieldH,
+                double logbail, double logaccept,
+                double logstoplooking,
+                anbool do_gamma, anbool fake_match) {
     int i,j;
     double* fieldcenter;
     double fieldr2;
@@ -1207,6 +1204,20 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
     assert(isfinite(logaccept));
     assert(isfinite(logbail));
 
+    fieldr2 = square(mo->radius);
+    debug("Field center %g,%g,%g, radius2 %g\n",
+          mo->center[0], mo->center[1], mo->center[2], fieldr2);
+    if (log_get_level() >= LOG_VERB) {
+        double ra;
+        double dec;
+        double r;
+
+        xyzarr2radecdeg(mo->center, &ra, &dec);
+        r = distsq2deg(fieldr2);
+        debug("Field center RA,Dec %g,%g, radius %g deg\n",
+              ra, dec, r);
+    }
+
     memset(v, 0, sizeof(verify_t));
 
     if (sip)
@@ -1218,7 +1229,6 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
 
     // center and radius of the field in xyz space:
     fieldcenter = mo->center;
-    fieldr2 = square(mo->radius);
 
     // find index stars and project them into pixel coordinates.
     /*
@@ -1466,34 +1476,6 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
     verify_internal_set_null_mo(mo);
     // uh oh, spaghetti-code-oh!
     goto cleanup;
-}
-
-void verify_hit(const startree_t* skdt, int index_cutnside, MatchObj* mo,
-                const sip_t* sip, const verify_field_t* vf,
-                double pix2, double distractors,
-                double fieldW, double fieldH,
-                double logbail, double logaccept, double logstoplooking,
-                anbool do_gamma, anbool fake_match) {
-    double fieldr2;
-
-    fieldr2 = square(mo->radius);
-    debug("Field center %g,%g,%g, radius2 %g\n",
-          mo->center[0], mo->center[1], mo->center[2], fieldr2);
-    if (log_get_level() >= LOG_VERB) {
-        double ra;
-        double dec;
-        double r;
-
-        xyzarr2radecdeg(mo->center, &ra, &dec);
-        r = distsq2deg(fieldr2);
-        debug("Field center RA,Dec %g,%g, radius %g deg\n",
-              ra, dec, r);
-    }
-
-    verify_hit_original(skdt, index_cutnside, mo, sip, vf,
-                        pix2, distractors, fieldW, fieldH,
-                        logbail, logaccept, logstoplooking,
-                        do_gamma, fake_match);
 }
 
 // Free the things we added to this mo.

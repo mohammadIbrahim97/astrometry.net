@@ -251,7 +251,6 @@ int main(int argc, char** args) {
     testit(flatwanted, Nwanted, 5, compare_quint, TRUE);
     free(flatwanted);
 
-    assert(!solver_test_verification_packet_bounds());
     assert(!solver_test_candidate_nonresident_zero_submit_falls_back());
     assert(!solver_test_candidate_rolling_windows());
 

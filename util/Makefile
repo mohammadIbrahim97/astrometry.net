@@ -51,7 +51,7 @@ ANFILES_OBJ :=
 ANUTILS_DEPS :=
 
 ifndef NO_QFITS
-ANFILES_OBJ += multiindex.o index.o index_residency.o indexset.o \
+ANFILES_OBJ += multiindex.o index.o indexset.o \
 	codekd.o starkd.o starkd_payload.o rdlist.o xylist.o \
 	starxy.o qidxfile.o quadfile.o scamp.o scamp-catalog.o \
 	tabsort.o wcs-xy2rd.o wcs-rd2xy.o matchfile.o
@@ -128,7 +128,7 @@ ANUTILS_H := an-bool.h an-endian.h an-opts.h an-thread-pthreads.h \
 	bl-sort.h  bt.h cairoutils.h \
 	codekd.h errors.h fitsbin.h fitsfile.h fitsioutils.h \
 	fitstable.h os-features-config.h os-features.h gslutils.h \
-	healpix-utils.h healpix.h index.h index_residency.h intmap.h ioutils.h \
+	healpix-utils.h healpix.h index.h intmap.h ioutils.h \
 	fileutils.h \
 	keywords.h log.h \
 	mathutil.h permutedsort.h qidxfile.h quadfile.h rdlist.h scamp-catalog.h \
@@ -355,17 +355,17 @@ ALL_TEST_FILES = test_bl test_bt test_endian test_fitstable test_xylist \
 	test_anwcs test_sip-utils test_errors test_multiindex \
 	test_convolve_image test_qsort_r test_wcs test_big_tables \
 	test_dfind test_ctmf test_dsmooth test_dcen3x3 test_simplexy \
-	test_fit_wcs test_matchfile test_index_metadata test_index_residency
+	test_fit_wcs test_matchfile test_index_metadata
 
 # test_quadfile -- takes a long time!
 
 FITSBIN_PAYLOAD_TEST_OBJS := test_fitsbin_payload_common.o \
-	test_fitsbin_payload_sync.o test_fitsbin_payload_async.o \
+	test_fitsbin_payload_async.o \
 	test_fitsbin_payload_mapped.o test_fitsbin_payload_ticket.o
 ALL_TEST_EXTRA_OBJS = $(FITSBIN_PAYLOAD_TEST_OBJS)
 ALL_OBJ += $(FITSBIN_PAYLOAD_TEST_OBJS)
 ALL_TEST_LIBS = $(ANFILES_SLIB)
-ALL_TEST_EXTRA_LDFLAGS = -Wl,--wrap=pread64 -Wl,--wrap=readahead
+ALL_TEST_EXTRA_LDFLAGS = -Wl,--wrap=readahead -Wl,--wrap=madvise
 
 include $(COMMON)/makefile.tests
 
@@ -373,7 +373,7 @@ test_fitsbin_payload_io: test_fitsbin_payload_io-main.o \
 	test_fitsbin_payload_io.o $(FITSBIN_PAYLOAD_TEST_OBJS) \
 	$(COMMON)/cutest.o $(ALL_TEST_LIBS)
 	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) \
-		-Wl,--wrap=pread64 -Wl,--wrap=readahead $^ $(LDLIBS)
+		-Wl,--wrap=readahead -Wl,--wrap=madvise $^ $(LDLIBS)
 
 DEP_OBJ += $(ALL_TEST_FILES_O) $(FITSBIN_PAYLOAD_TEST_OBJS)
 
@@ -403,8 +403,7 @@ NORMAL_TESTS := test_big_tables test_qsort_r \
 	test_anwcs test_wcs test_fitstable test_fitsbin \
 	test_fitsioutils test_xylist test_rdlist test_bl test_bt test_endian \
 	test_healpix test_log test_ioutils test_scamp_catalog test_starutil \
-	test_svd test_fit_wcs test_quadfile test_index_metadata \
-	test_index_residency
+	test_svd test_fit_wcs test_quadfile test_index_metadata
 
 $(NORMAL_TESTS): $(ANFILES_SLIB)
 

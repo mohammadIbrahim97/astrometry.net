@@ -16,6 +16,10 @@
 scamp_cat_t* scamp_catalog_open_for_writing(const char* filename, anbool ref) {
     scamp_cat_t* scamp;
     scamp = calloc(1, sizeof(scamp_cat_t));
+    if (!scamp) {
+        ERROR("Failed to allocate scamp catalog");
+        return NULL;
+    }
     scamp->table = fitstable_open_for_writing(filename);
     if (!scamp->table) {
         ERROR("Failed to open scamp catalog for writing");
@@ -28,9 +32,11 @@ scamp_cat_t* scamp_catalog_open_for_writing(const char* filename, anbool ref) {
 
 int scamp_catalog_write_field_header(scamp_cat_t* scamp, const qfits_header* hdr) {
     int i, N;
+    int rtn = 0;
     qfits_header* h;
-    char* hdrstring;
+    char* hdrstring = NULL;
     qfits_header* freehdr = NULL;
+    size_t header_bytes;
     tfits_type dubl = fitscolumn_double_type();
     tfits_type i16  = fitscolumn_i16_type();
 
@@ -41,6 +47,10 @@ int scamp_catalog_write_field_header(scamp_cat_t* scamp, const qfits_header* hdr
 
     if (!hdr) {
         freehdr = qfits_header_default();
+        if (!freehdr) {
+            ERROR("Failed to allocate scamp field header");
+            return -1;
+        }
         fits_header_add_int(freehdr, "BITPIX", 0, NULL);
         fits_header_add_int(freehdr, "NAXIS", 2, NULL);
         fits_header_add_int(freehdr, "NAXIS1", 0, NULL);
@@ -54,6 +64,12 @@ int scamp_catalog_write_field_header(scamp_cat_t* scamp, const qfits_header* hdr
     // 80 is FITS_LINESZ
     // How many cards are in the header?
     N = qfits_header_n(hdr);
+    if (N < 0 || (size_t)N > (((size_t)-1) - 1U) / FITS_LINESZ) {
+        ERROR("Scamp field header is too large");
+        rtn = -1;
+        goto cleanup;
+    }
+    header_bytes = (size_t)N * FITS_LINESZ;
     fitstable_add_write_column_array(scamp->table, fitscolumn_char_type(),
                                      N * FITS_LINESZ, "Field Header Card", NULL);
 
@@ -63,28 +79,37 @@ int scamp_catalog_write_field_header(scamp_cat_t* scamp, const qfits_header* hdr
 
     if (fitstable_write_header(scamp->table)) {
         ERROR("Failed to write scamp catalog header.\n");
-        return -1;
+        rtn = -1;
+        goto cleanup;
     }
 
     // +1 because qfits_header_write_line adds a trailing '\0'.
-    hdrstring = malloc(N * FITS_LINESZ + 1);
-    for (i=0; i<N; i++)
+    hdrstring = malloc(header_bytes + 1U);
+    if (!hdrstring) {
+        ERROR("Failed to allocate serialized scamp field header");
+        rtn = -1;
+        goto cleanup;
+    }
+    for (i=0; i<N; i++) {
         if (qfits_header_write_line(hdr, i, hdrstring + i * FITS_LINESZ)) {
             ERROR("Failed to get scamp catalog field header line %i", i);
-            return -1;
+            rtn = -1;
+            goto cleanup;
         }
-    if (freehdr)
-        qfits_header_destroy(freehdr);
+    }
     if (fitstable_write_row(scamp->table, hdrstring)) {
         ERROR("Failed to write scamp catalog field header");
-        return -1;
+        rtn = -1;
+        goto cleanup;
     }
     free(hdrstring);
+    hdrstring = NULL;
 
     if (fitstable_pad_with(scamp->table, ' ') ||
         fitstable_fix_header(scamp->table)) {
         ERROR("Failed to fix scamp catalog header.\n");
-        return -1;
+        rtn = -1;
+        goto cleanup;
     }
     fitstable_next_extension(scamp->table);
     fitstable_clear_table(scamp->table);
@@ -129,9 +154,15 @@ int scamp_catalog_write_field_header(scamp_cat_t* scamp, const qfits_header* hdr
 
     if (fitstable_write_header(scamp->table)) {
         ERROR("Failed to write scamp catalog object header.\n");
-        return -1;
+        rtn = -1;
     }
-    return 0;
+
+ cleanup:
+    free(hdrstring);
+    if (freehdr) {
+        qfits_header_destroy(freehdr);
+    }
+    return rtn;
 }
 
 int scamp_catalog_write_object(scamp_cat_t* scamp, const scamp_obj_t* obj) {
@@ -145,12 +176,20 @@ int scamp_catalog_write_reference(scamp_cat_t* scamp, const scamp_ref_t* ref) {
 }
 
 int scamp_catalog_close(scamp_cat_t* scamp) {
-    if (fitstable_fix_header(scamp->table) ||
-        fitstable_close(scamp->table)) {
+    int rtn = 0;
+
+    if (!scamp) {
+        return 0;
+    }
+    if (scamp->table->header && scamp->table->table &&
+        fitstable_fix_header(scamp->table)) {
+        ERROR("Failed to fix scamp catalog header");
+        rtn = -1;
+    }
+    if (fitstable_close(scamp->table)) {
         ERROR("Failed to close scamp catalog");
-        return -1;
+        rtn = -1;
     }
     free(scamp);
-    return 0;
+    return rtn;
 }
-

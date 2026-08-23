@@ -116,15 +116,12 @@ int index_shard_config_resolve_workers(int requested_workers,
   return requested_workers;
 }
 
-int index_shard_config_effective_workers(int configured_workers,
-                                         size_t nindexes) {
+int index_shard_config_effective_workers(int configured_workers) {
   int workers = configured_workers;
 
   if (workers < 1) {
     workers = 1;
   }
-
-  (void)nindexes;
 
   return workers;
 }
@@ -133,43 +130,35 @@ int index_shard_config_exact_demand_pass(
     int detached_completion,
     int payload_io_width,
     int mapped_population_supported,
-    int random_mmap_advice,
     size_t filename_indexes,
-    size_t loaded_indexes,
-    int full_cohort_resident) {
+    size_t loaded_indexes) {
   if ((detached_completion != 0 && detached_completion != 1) ||
       (mapped_population_supported != 0 &&
-       mapped_population_supported != 1) ||
-      (random_mmap_advice != 0 && random_mmap_advice != 1) ||
-      (full_cohort_resident != 0 && full_cohort_resident != 1)) {
+       mapped_population_supported != 1)) {
     return 0;
   }
   return detached_completion &&
       payload_io_width > 0 &&
       mapped_population_supported &&
-      random_mmap_advice &&
       filename_indexes > 0U &&
-      loaded_indexes == 0U &&
-      !full_cohort_resident;
+      loaded_indexes == 0U;
 }
 
-int index_shard_config_plan_widths(
+size_t index_shard_config_producer_width(
     int worker_count,
     int payload_io_width,
     int detached_completion,
-    int exact_demand,
-    index_shard_width_plan_t *plan) {
+    int exact_demand) {
   size_t workers;
   size_t producers;
-  size_t helpers;
 
-  if (!plan || worker_count < 1 || payload_io_width < 0 ||
+  if (worker_count < 1 || payload_io_width < 0 ||
       (detached_completion != 0 && detached_completion != 1) ||
       (detached_completion && payload_io_width < 1) ||
       (exact_demand != 0 && exact_demand != 1) ||
       (exact_demand &&
        (!detached_completion || payload_io_width < 1))) {
-    return -1;
+    return 0U;
   }
   workers = (size_t)worker_count;
   if (detached_completion) {
@@ -183,16 +172,11 @@ int index_shard_config_plan_widths(
         (size_t)payload_io_width < workers
         ? (size_t)payload_io_width
         : workers;
-    helpers = workers - producers;
   } else {
-    helpers = workers > 1U ? 1U : 0U;
-    producers = workers - helpers;
+    producers = workers > 1U ? workers - 1U : workers;
   }
-  if (!producers || producers > workers ||
-      helpers != workers - producers) {
-    return -1;
+  if (!producers || producers > workers) {
+    return 0U;
   }
-  plan->producer_width = producers;
-  plan->helper_width = helpers;
-  return 0;
+  return producers;
 }

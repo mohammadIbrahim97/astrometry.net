@@ -4,387 +4,395 @@
  */
 #include "test_fitsbin_payload_common.h"
 
+static int submit_mapped_ticket(
+    payload_fixture_t* fixture,
+    fitsbin_payload_io_ticket_t** ticket);
+
+#if defined(MADV_POPULATE_READ)
+typedef struct payload_notifier_barrier_state {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int callback_entered;
+    int callback_release;
+    int callback_exited;
+    int waiter_calling;
+    int waiter_returned;
+    int waiter_status;
+    unsigned int sequence;
+    unsigned int callback_enter_sequence;
+    unsigned int waiter_call_sequence;
+    unsigned int callback_release_sequence;
+    unsigned int callback_exit_sequence;
+    unsigned int waiter_return_sequence;
+    unsigned long long completion_id;
+} payload_notifier_barrier_state_t;
+
+static int payload_notifier_barrier_wait(
+    payload_notifier_barrier_state_t* state,
+    const int* predicate) {
+    struct timespec deadline;
+    int status = 0;
+    int reached;
+
+    if (clock_gettime(CLOCK_REALTIME, &deadline)) {
+        return -1;
+    }
+    deadline.tv_sec += 2;
+    pthread_mutex_lock(&state->mutex);
+    while (!*predicate && status != ETIMEDOUT) {
+        status = pthread_cond_timedwait(
+            &state->condition,
+            &state->mutex,
+            &deadline);
+    }
+    reached = *predicate;
+    pthread_mutex_unlock(&state->mutex);
+    return reached ? 0 : -1;
+}
+
+static void payload_notifier_barrier_callback(
+    void* opaque,
+    unsigned long long completion_id) {
+    payload_notifier_barrier_state_t* state = opaque;
+
+    pthread_mutex_lock(&state->mutex);
+    state->callback_entered = 1;
+    state->completion_id = completion_id;
+    state->callback_enter_sequence = ++state->sequence;
+    pthread_cond_broadcast(&state->condition);
+    while (!state->callback_release) {
+        pthread_cond_wait(&state->condition, &state->mutex);
+    }
+    state->callback_exited = 1;
+    state->callback_exit_sequence = ++state->sequence;
+    pthread_cond_broadcast(&state->condition);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static void* payload_notifier_barrier_waiter(void* opaque) {
+    payload_notifier_barrier_state_t* state = opaque;
+    int status;
+
+    pthread_mutex_lock(&state->mutex);
+    state->waiter_calling = 1;
+    state->waiter_call_sequence = ++state->sequence;
+    pthread_cond_broadcast(&state->condition);
+    pthread_mutex_unlock(&state->mutex);
+
+    status = fitsbin_payload_io_wait_completion_notifier_idle(
+        payload_notifier_barrier_callback, state);
+
+    pthread_mutex_lock(&state->mutex);
+    state->waiter_status = status;
+    state->waiter_returned = 1;
+    state->waiter_return_sequence = ++state->sequence;
+    pthread_cond_broadcast(&state->condition);
+    pthread_mutex_unlock(&state->mutex);
+    return NULL;
+}
+
+static void test_payload_notifier_idle_barrier(CuTest* ct) {
+    payload_notifier_barrier_state_t state;
+    payload_fixture_t fixture;
+    fitsbin_payload_io_ticket_t* ticket = NULL;
+    pthread_t waiter;
+    int failure = 0;
+    int mutex_initialized = 0;
+    int condition_initialized = 0;
+    int fixture_opened = 0;
+    int service_started = 0;
+    int notifier_registered = 0;
+    int waiter_started = 0;
+    int poll_result = 0;
+    int drain_result = 0;
+
+    memset(&state, 0, sizeof(state));
+    memset(&fixture, 0, sizeof(fixture));
+    state.waiter_status = -1;
+    if (pthread_mutex_init(&state.mutex, NULL)) {
+        failure = 1;
+        goto cleanup;
+    }
+    mutex_initialized = 1;
+    if (pthread_cond_init(&state.condition, NULL)) {
+        failure = 2;
+        goto cleanup;
+    }
+    condition_initialized = 1;
+    if (payload_fixture_open(&fixture)) {
+        failure = 3;
+        goto cleanup;
+    }
+    fixture_opened = 1;
+    if (fitsbin_configure_index_mmap(fixture.fitsbin)) {
+        failure = 4;
+        goto cleanup;
+    }
+    fitsbin_payload_io_configure_workers(1);
+    if (fitsbin_payload_io_service_start(1)) {
+        failure = 5;
+        goto cleanup;
+    }
+    service_started = 1;
+    if (fitsbin_payload_io_set_completion_notifier(
+            payload_notifier_barrier_callback, &state)) {
+        failure = 6;
+        goto cleanup;
+    }
+    notifier_registered = 1;
+
+    if (submit_mapped_ticket(&fixture, &ticket) !=
+            FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED || !ticket) {
+        failure = 7;
+        goto cleanup;
+    }
+    if (payload_notifier_barrier_wait(
+            &state, &state.callback_entered)) {
+        failure = 8;
+        goto cleanup;
+    }
+
+    /* The provider callback is active, but its terminal ticket is collectible. */
+    if (fitsbin_payload_io_ticket_poll_and_destroy(
+            &ticket, &poll_result) != 1 || ticket || poll_result <= 0) {
+        failure = 9;
+        goto cleanup;
+    }
+
+    if (pthread_create(
+            &waiter, NULL,
+            payload_notifier_barrier_waiter, &state)) {
+        failure = 10;
+        goto cleanup;
+    }
+    waiter_started = 1;
+    if (payload_notifier_barrier_wait(
+            &state, &state.waiter_calling)) {
+        failure = 11;
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&state.mutex);
+    if (state.waiter_returned) {
+        failure = 12;
+    }
+    state.callback_release = 1;
+    state.callback_release_sequence = ++state.sequence;
+    pthread_cond_broadcast(&state.condition);
+    pthread_mutex_unlock(&state.mutex);
+
+    if (pthread_join(waiter, NULL)) {
+        failure = 13;
+    } else {
+        waiter_started = 0;
+    }
+    if (!failure &&
+        (state.waiter_status || !state.callback_exited ||
+         !state.completion_id ||
+         state.callback_enter_sequence >= state.waiter_call_sequence ||
+         state.waiter_call_sequence >=
+             state.callback_release_sequence ||
+         state.callback_release_sequence >=
+             state.waiter_return_sequence ||
+         state.callback_exit_sequence >=
+             state.waiter_return_sequence)) {
+        failure = 14;
+    }
+    if (fitsbin_payload_io_clear_completion_notifier(
+            payload_notifier_barrier_callback, &state)) {
+        failure = 15;
+        goto cleanup;
+    }
+    notifier_registered = 0;
+
+cleanup:
+    if (condition_initialized) {
+        pthread_mutex_lock(&state.mutex);
+        if (!state.callback_release) {
+            state.callback_release = 1;
+            state.callback_release_sequence = ++state.sequence;
+        }
+        pthread_cond_broadcast(&state.condition);
+        pthread_mutex_unlock(&state.mutex);
+    }
+    if (ticket) {
+        (void)fitsbin_payload_io_ticket_drain_and_destroy(
+            &ticket, &drain_result);
+    }
+    if (waiter_started) {
+        (void)pthread_join(waiter, NULL);
+    }
+    if (notifier_registered) {
+        (void)fitsbin_payload_io_clear_completion_notifier(
+            payload_notifier_barrier_callback, &state);
+    }
+    if (service_started) {
+        fitsbin_payload_io_service_stop();
+    }
+    fitsbin_payload_io_configure_workers(1);
+    if (fixture_opened) {
+        payload_fixture_close(&fixture);
+    }
+    if (condition_initialized) {
+        pthread_cond_destroy(&state.condition);
+    }
+    if (mutex_initialized) {
+        pthread_mutex_destroy(&state.mutex);
+    }
+    CuAssertIntEquals_Msg(
+        ct, "provider notifier idle barrier stage", 0, failure);
+}
+#endif
+
+static int submit_mapped_ticket(
+    payload_fixture_t* fixture,
+    fitsbin_payload_io_ticket_t** ticket) {
+    fitsbin_prefetch_range_t range;
+
+    range.data = fixture->chunk->data;
+    range.size = sizeof(fixture->bytes);
+    return fitsbin_prefetch_ranges_submit(
+        fixture->fitsbin,
+        &range,
+        1U,
+        SIZE_MAX,
+        ticket);
+}
+
 void test_fitsbin_payload_poll_transfers_ticket_ownership(CuTest* ct) {
     payload_fixture_t fixture;
-    fitsbin_pread_range_t range;
     fitsbin_payload_io_ticket_t* ticket = NULL;
-    fitsbin_payload_io_stats_t stats;
-    fitsbin_payload_io_stats_t repeated_stats;
-    unsigned char destination[32];
     int submitted;
     int poll_status;
     int result = 0;
     int result_errno;
 
     CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    memset(destination, 0, sizeof(destination));
-    range.data = (const unsigned char*)fixture.chunk->data + 17U;
-    range.size = sizeof(destination);
-    range.logical_size = sizeof(destination);
-    range.destination = destination;
-
+    CuAssertIntEquals(
+        ct, 0, fitsbin_configure_index_mmap(fixture.fitsbin));
     fitsbin_payload_io_configure_workers(1);
     CuAssertIntEquals(
         ct, 0, fitsbin_payload_io_service_start(1));
-    payload_wrapper_reset(PAYLOAD_WRAPPER_BLOCK);
-    submitted = fitsbin_pread_mapped_ranges_submit(
-        fixture.fitsbin,
-        &range,
-        1U,
-        sizeof(destination),
-        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
-        &ticket);
+    payload_readahead_block();
+    submitted = submit_mapped_ticket(&fixture, &ticket);
+
+#if defined(MADV_POPULATE_READ)
     CuAssertIntEquals(ct, 1, submitted);
     CuAssertPtrNotNull(ct, ticket);
     CuAssertIntEquals(
-        ct, 0, payload_wrapper_wait_for_calls(1, 2));
-
+        ct, 0, payload_readahead_wait_for_calls(1, 2));
     poll_status = fitsbin_payload_io_ticket_poll_and_destroy(
-        fixture.fitsbin,
-        &ticket,
-        &result);
+        &ticket, &result);
     CuAssertIntEquals(ct, 0, poll_status);
     CuAssertPtrNotNull(ct, ticket);
+#else
+    CuAssertIntEquals(ct, 0, submitted);
+#endif
 
-    payload_wrapper_release();
+    payload_readahead_release();
     fitsbin_payload_io_service_stop();
-    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+    payload_readahead_reset(0);
+#if defined(MADV_POPULATE_READ)
     errno = 0;
     poll_status = fitsbin_payload_io_ticket_poll_and_destroy(
-        fixture.fitsbin,
-        &ticket,
-        &result);
+        &ticket, &result);
     result_errno = errno;
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    fitsbin_take_payload_io_stats(
-        fixture.fitsbin, &repeated_stats);
-    fitsbin_payload_io_configure_workers(1);
-
     CuAssertIntEquals(ct, 1, poll_status);
-    CuAssertIntEquals(ct, 1, result);
+    CuAssert(ct, "mapped ticket did not become ready", result > 0);
     CuAssertIntEquals(ct, 0, result_errno);
     CuAssertPtrEquals(ct, NULL, ticket);
-    CuAssert(
-        ct,
-        "poll-and-destroy returned incorrect direct-read bytes",
-        !memcmp(
-            destination,
-            fixture.bytes + 17U,
-            sizeof(destination)));
-    CuAssertIntEquals(ct, 1, (int)stats.read_batches);
-    CuAssertIntEquals(ct, 1, (int)stats.read_calls);
-    CuAssertIntEquals(
-        ct, (int)sizeof(destination), (int)stats.read_bytes);
-    CuAssertIntEquals(
-        ct, (int)sizeof(destination),
-        (int)stats.read_logical_bytes);
-    CuAssertIntEquals(ct, 0, (int)stats.failures);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_batches);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_calls);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.failures);
-
+#endif
+    fitsbin_payload_io_configure_workers(1);
     payload_fixture_close(&fixture);
+#if defined(MADV_POPULATE_READ)
+    test_payload_notifier_idle_barrier(ct);
+#endif
 }
 
 void test_fitsbin_payload_poll_failure_transfers_once(CuTest* ct) {
     payload_fixture_t fixture;
-    fitsbin_pread_range_t range;
+    payload_planned_state_t plan;
     fitsbin_payload_io_ticket_t* ticket = NULL;
-    fitsbin_payload_io_stats_t stats;
-    fitsbin_payload_io_stats_t repeated_stats;
-    unsigned char destination[32];
     int submitted;
     int poll_status;
     int result = 0;
     int result_errno;
 
     CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    memset(destination, 0, sizeof(destination));
-    range.data = (const unsigned char*)fixture.chunk->data + 23U;
-    range.size = sizeof(destination);
-    range.logical_size = sizeof(destination);
-    range.destination = destination;
-
+    CuAssertIntEquals(
+        ct, 0, fitsbin_configure_index_mmap(fixture.fitsbin));
+    memset(&plan, 0, sizeof(plan));
+    plan.result = -1;
     fitsbin_payload_io_configure_workers(1);
     CuAssertIntEquals(
         ct, 0, fitsbin_payload_io_service_start(1));
-    payload_wrapper_reset(PAYLOAD_WRAPPER_EOF);
-    submitted = fitsbin_pread_mapped_ranges_submit(
+    submitted = fitsbin_prefetch_ranges_planned_submit(
         fixture.fitsbin,
-        &range,
-        1U,
-        sizeof(destination),
-        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
+        payload_planned_ranges,
+        &plan,
+        1024U * 1024U,
         &ticket);
     fitsbin_payload_io_service_stop();
-    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
 
+#if defined(MADV_POPULATE_READ)
     errno = 0;
     poll_status = fitsbin_payload_io_ticket_poll_and_destroy(
-        fixture.fitsbin,
-        &ticket,
-        &result);
+        &ticket, &result);
     result_errno = errno;
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    fitsbin_take_payload_io_stats(
-        fixture.fitsbin, &repeated_stats);
-    fitsbin_payload_io_configure_workers(1);
-
     CuAssertIntEquals(ct, 1, submitted);
     CuAssertIntEquals(ct, 1, poll_status);
     CuAssertIntEquals(ct, -1, result);
     CuAssertIntEquals(ct, EIO, result_errno);
     CuAssertPtrEquals(ct, NULL, ticket);
-    CuAssertIntEquals(ct, 0, (int)stats.read_batches);
-    CuAssertIntEquals(ct, 0, (int)stats.read_calls);
-    CuAssertIntEquals(ct, 1, (int)stats.failures);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_batches);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_calls);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.failures);
-
+#else
+    CuAssertIntEquals(ct, 0, submitted);
+#endif
+    fitsbin_payload_io_configure_workers(1);
     payload_fixture_close(&fixture);
 }
 
 void test_fitsbin_payload_poll_cancel_transfers_once(CuTest* ct) {
     payload_fixture_t fixture;
-    fitsbin_pread_range_t range;
     fitsbin_payload_io_ticket_t* ticket = NULL;
-    fitsbin_payload_io_stats_t stats;
-    fitsbin_payload_io_stats_t repeated_stats;
-    unsigned char destination[32];
     int submitted;
-    int cancelled;
+    int cancelled = 0;
     int poll_status;
     int result = -1;
     int result_errno;
 
     CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    memset(destination, 0, sizeof(destination));
-    range.data = (const unsigned char*)fixture.chunk->data + 29U;
-    range.size = sizeof(destination);
-    range.logical_size = sizeof(destination);
-    range.destination = destination;
-
+    CuAssertIntEquals(
+        ct, 0, fitsbin_configure_index_mmap(fixture.fitsbin));
     fitsbin_payload_io_configure_workers(1);
     CuAssertIntEquals(
         ct, 0, fitsbin_payload_io_service_start(1));
-    payload_wrapper_reset(PAYLOAD_WRAPPER_BLOCK);
-    submitted = fitsbin_pread_mapped_ranges_submit(
-        fixture.fitsbin,
-        &range,
-        1U,
-        sizeof(destination),
-        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
-        &ticket);
+    payload_readahead_block();
+    submitted = submit_mapped_ticket(&fixture, &ticket);
+
+#if defined(MADV_POPULATE_READ)
     CuAssertIntEquals(ct, 1, submitted);
     CuAssertPtrNotNull(ct, ticket);
     CuAssertIntEquals(
-        ct, 0, payload_wrapper_wait_for_calls(1, 2));
+        ct, 0, payload_readahead_wait_for_calls(1, 2));
     cancelled = fitsbin_payload_io_ticket_cancel_async(ticket);
-    payload_wrapper_release();
+    CuAssertIntEquals(ct, 1, cancelled);
+#else
+    CuAssertIntEquals(ct, 0, submitted);
+#endif
+    payload_readahead_release();
     fitsbin_payload_io_service_stop();
-    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+    payload_readahead_reset(0);
 
+#if defined(MADV_POPULATE_READ)
     errno = 0;
     poll_status = fitsbin_payload_io_ticket_poll_and_destroy(
-        fixture.fitsbin,
-        &ticket,
-        &result);
+        &ticket, &result);
     result_errno = errno;
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    fitsbin_take_payload_io_stats(
-        fixture.fitsbin, &repeated_stats);
-    fitsbin_payload_io_configure_workers(1);
-
-    CuAssertIntEquals(ct, 1, cancelled);
     CuAssertIntEquals(ct, 1, poll_status);
     CuAssertIntEquals(ct, 0, result);
     CuAssertIntEquals(ct, ECANCELED, result_errno);
     CuAssertPtrEquals(ct, NULL, ticket);
-    CuAssertIntEquals(ct, 0, (int)stats.read_batches);
-    CuAssertIntEquals(ct, 0, (int)stats.read_calls);
-    CuAssertIntEquals(ct, 0, (int)stats.failures);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_batches);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_calls);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.failures);
-
-    payload_fixture_close(&fixture);
-}
-
-void test_fitsbin_payload_drain_registered_waiter(CuTest* ct) {
-    payload_fixture_t fixture;
-    fitsbin_pread_range_t range;
-    fitsbin_payload_io_ticket_t* ticket = NULL;
-    fitsbin_payload_io_stats_t stats;
-    fitsbin_payload_io_stats_t repeated_stats;
-    payload_wait_helper_state_t helper = {
-        PTHREAD_MUTEX_INITIALIZER,
-        PTHREAD_COND_INITIALIZER,
-        0
-    };
-    payload_ticket_wait_state_t waiter;
-    payload_ticket_drain_state_t drain;
-    pthread_t waiter_thread;
-    pthread_t drain_thread;
-    unsigned char destination[32];
-    int submitted;
-    int provider_wait_status;
-    int waiter_created = 0;
-    int waiter_registered = -1;
-    int busy_poll_status = 0;
-    int busy_poll_errno = 0;
-    int busy_poll_result = 0;
-    int drain_mutex_status;
-    int drain_condition_status = -1;
-    int drain_created = 0;
-    int drain_started = -1;
-    int cleanup_result = 0;
-
-    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    memset(&waiter, 0, sizeof(waiter));
-    memset(&drain, 0, sizeof(drain));
-    memset(destination, 0, sizeof(destination));
-    range.data = (const unsigned char*)fixture.chunk->data + 37U;
-    range.size = sizeof(destination);
-    range.logical_size = sizeof(destination);
-    range.destination = destination;
-
+#endif
     fitsbin_payload_io_configure_workers(1);
-    CuAssertIntEquals(
-        ct, 0, fitsbin_payload_io_service_start(1));
-    payload_wrapper_reset(PAYLOAD_WRAPPER_BLOCK);
-    submitted = fitsbin_pread_mapped_ranges_submit(
-        fixture.fitsbin,
-        &range,
-        1U,
-        sizeof(destination),
-        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
-        &ticket);
-    provider_wait_status =
-        payload_wrapper_wait_for_calls(1, 2);
-
-    waiter.fitsbin = fixture.fitsbin;
-    waiter.ticket = ticket;
-    waiter.helper = &helper;
-    waiter.result = -1;
-    if (ticket &&
-        !pthread_create(
-            &waiter_thread,
-            NULL,
-            payload_ticket_wait_thread,
-            &waiter)) {
-        waiter_created = 1;
-        waiter_registered =
-            payload_wait_helper_wait_for_calls(
-                &helper, 1, 2);
-    }
-    if (!waiter_registered) {
-        errno = 0;
-        busy_poll_status =
-            fitsbin_payload_io_ticket_poll_and_destroy(
-                fixture.fitsbin,
-                &ticket,
-                &busy_poll_result);
-        busy_poll_errno = errno;
-    }
-
-    drain_mutex_status = pthread_mutex_init(&drain.mutex, NULL);
-    if (!drain_mutex_status) {
-        drain_condition_status =
-            pthread_cond_init(&drain.condition, NULL);
-    }
-    drain.fitsbin = fixture.fitsbin;
-    drain.ticket = ticket;
-    drain.status = -1;
-    drain.result = -1;
-    if (!waiter_registered &&
-        !drain_mutex_status &&
-        !drain_condition_status &&
-        !pthread_create(
-            &drain_thread,
-            NULL,
-            payload_ticket_drain_thread,
-            &drain)) {
-        drain_created = 1;
-        drain_started =
-            payload_ticket_drain_wait_started(&drain, 2);
-    }
-
-    payload_wrapper_release();
-    if (drain_created) {
-        pthread_join(drain_thread, NULL);
-        ticket = drain.ticket;
-    }
-    if (waiter_created) {
-        pthread_join(waiter_thread, NULL);
-    }
-    fitsbin_payload_io_service_stop();
-    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
-    if (ticket) {
-        cleanup_result =
-            fitsbin_payload_io_ticket_drain_and_destroy(
-                fixture.fitsbin,
-                &ticket,
-                &busy_poll_result);
-    }
-    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
-    fitsbin_take_payload_io_stats(
-        fixture.fitsbin, &repeated_stats);
-    fitsbin_payload_io_configure_workers(1);
-
-    CuAssertIntEquals(ct, 1, submitted);
-    CuAssertIntEquals(ct, 0, provider_wait_status);
-    CuAssertIntEquals(ct, 1, waiter_created);
-    CuAssertIntEquals(ct, 0, waiter_registered);
-    CuAssertIntEquals(ct, -1, busy_poll_status);
-    CuAssertIntEquals(ct, EBUSY, busy_poll_errno);
-    CuAssertIntEquals(ct, 0, busy_poll_result);
-    CuAssertIntEquals(ct, 0, drain_mutex_status);
-    CuAssertIntEquals(ct, 0, drain_condition_status);
-    CuAssertIntEquals(ct, 1, drain_created);
-    CuAssertIntEquals(ct, 0, drain_started);
-    CuAssertIntEquals(ct, 1, waiter.configured);
-    CuAssertIntEquals(ct, 1, waiter.result);
-    CuAssertIntEquals(ct, 0, waiter.error);
-    CuAssertIntEquals(ct, 1, drain.status);
-    CuAssertIntEquals(ct, 1, drain.result);
-    CuAssertIntEquals(ct, 0, drain.error);
-    CuAssertPtrEquals(ct, NULL, drain.ticket);
-    CuAssertPtrEquals(ct, NULL, ticket);
-    CuAssertIntEquals(ct, 0, cleanup_result);
-    CuAssert(
-        ct,
-        "drained waiter returned incorrect direct-read bytes",
-        !memcmp(
-            destination,
-            fixture.bytes + 37U,
-            sizeof(destination)));
-    CuAssertIntEquals(ct, 1, (int)stats.read_batches);
-    CuAssertIntEquals(ct, 1, (int)stats.read_calls);
-    CuAssertIntEquals(
-        ct, (int)sizeof(destination), (int)stats.read_bytes);
-    CuAssertIntEquals(
-        ct, (int)sizeof(destination),
-        (int)stats.read_logical_bytes);
-    CuAssertIntEquals(ct, 0, (int)stats.failures);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_batches);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_calls);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.read_bytes);
-    CuAssertIntEquals(
-        ct, 0, (int)repeated_stats.read_logical_bytes);
-    CuAssertIntEquals(
-        ct, 0, (int)repeated_stats.wait_nanoseconds);
-    CuAssertIntEquals(ct, 0, (int)repeated_stats.failures);
-
-    if (!drain_condition_status) {
-        pthread_cond_destroy(&drain.condition);
-    }
-    if (!drain_mutex_status) {
-        pthread_mutex_destroy(&drain.mutex);
-    }
     payload_fixture_close(&fixture);
 }

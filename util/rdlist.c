@@ -181,6 +181,9 @@ int rdlist_write_one_radec(rdlist_t* ls, double ra, double dec) {
 
 rdlist_t* rdlist_open_for_writing(const char* fn) {
     rdlist_t* rtn = xylist_open_for_writing(fn);
+    if (!rtn) {
+        return NULL;
+    }
     xylist_set_antype(rtn, AN_FILETYPE_RDLS);
     rdlist_set_raname (rtn, "RA");
     rdlist_set_decname(rtn, "DEC");
@@ -192,4 +195,3 @@ rdlist_t* rdlist_open_for_writing(const char* fn) {
     xylist_set_include_background(rtn, FALSE);
     return rtn;
 }
-
