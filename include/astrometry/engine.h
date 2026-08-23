@@ -13,6 +13,8 @@
 #include "astrometry/an-bool.h"
 #include "astrometry/index.h"
 
+struct index_shard_pool;
+
 struct engine {
     // search paths (directories)
     sl* index_paths;
@@ -42,6 +44,11 @@ struct engine {
      */
     int index_shard_workers_config;
     anbool index_shard_workers_config_set;
+    /*
+     * Process-lifetime parallel service.  Job and pass pointers are bound
+     * only while engine_run_job() owns the corresponding onefield state.
+     */
+    struct index_shard_pool* index_shard_pool;
     char* cancelfn;
     char* solvedfn;
 };

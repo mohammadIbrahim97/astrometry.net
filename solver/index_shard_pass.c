@@ -40,7 +40,8 @@ static int index_shard_pool_submit(
 
   pthread_mutex_lock(&pool->control_mutex);
 
-  if (!pool->pass_active || pool->shutdown ||
+  if (!pool->job_active || !pool->pass_active ||
+      pool->shutdown || pool->poisoned ||
       pool->owner_bp != bp || pool->owner_sp != base_sp) {
     pthread_mutex_unlock(&pool->control_mutex);
     return -1;
@@ -268,24 +269,33 @@ index_shard_solve(onefield_t *bp,
           bp, base_sp, &worker_view) ||
       !worker_view) {
     logerr("[index-shard] failed to create immutable worker view\n");
+    rc = index_shard_pool_release_pass(pool);
     if (worker_view && hooks->destroy_worker_view) {
       hooks->destroy_worker_view(worker_view);
     }
-    index_shard_pool_release_pass(pool);
+    if (rc) {
+      return INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT;
+    }
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
 
   if (nindexes > SIZE_MAX / sizeof(*results)) {
     logerr("[index-shard] result-array size overflow\n");
+    rc = index_shard_pool_release_pass(pool);
     hooks->destroy_worker_view(worker_view);
-    index_shard_pool_release_pass(pool);
+    if (rc) {
+      return INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT;
+    }
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
   results = calloc(nindexes, sizeof(*results));
   if (!results) {
     SYSERROR("Failed to allocate index-shard pass state");
+    rc = index_shard_pool_release_pass(pool);
     hooks->destroy_worker_view(worker_view);
-    index_shard_pool_release_pass(pool);
+    if (rc) {
+      return INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT;
+    }
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
   // Submit releases the hard current-band barrier to persistent workers.
@@ -299,9 +309,13 @@ index_shard_solve(onefield_t *bp,
       results);
 
   if (rc) {
-    free(results);
+    int release_rc = index_shard_pool_release_pass(pool);
+
     hooks->destroy_worker_view(worker_view);
-    index_shard_pool_release_pass(pool);
+    free(results);
+    if (release_rc) {
+      return INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT;
+    }
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
 
@@ -405,6 +419,7 @@ index_shard_solve(onefield_t *bp,
       state.global_integrity_failures) {
     rc = -1;
     status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
+    index_shard_pool_poison(pool);
   } else if (rc &&
              status != INDEX_SHARD_SOLVE_TERMINAL_FAILURE) {
     if (state.master_committed) {
@@ -439,11 +454,6 @@ index_shard_solve(onefield_t *bp,
     }
   }
 
-  // dispose unmerged worker results after all workers have left pass
-  for (i = 0; i < nindexes; i++) {
-    index_shard_result_dispose(&results[i], hooks);
-  }
-
   logverb("[index-shard] solver-pass generation=%lu candidates=%zu "
           "failed=%i codekd_calls=%llu codekd_hits=%llu "
           "resolve_calls=%llu verify_calls=%llu alloc_failures=%llu "
@@ -469,10 +479,16 @@ index_shard_solve(onefield_t *bp,
   pthread_mutex_lock(&pool->shared.queue_mutex);
   pool->shared.producer_width = 0U;
   pthread_mutex_unlock(&pool->shared.queue_mutex);
-  pool->shared.worker_view = NULL;
+  if (index_shard_pool_release_pass(pool)) {
+    status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
+    index_shard_pool_poison(pool);
+  }
+  /* Provider callbacks and workers can no longer borrow pass-owned storage. */
+  for (i = 0; i < nindexes; i++) {
+    index_shard_result_dispose(&results[i], hooks);
+  }
   hooks->destroy_worker_view(worker_view);
   worker_view = NULL;
   free(results);
-  index_shard_pool_release_pass(pool);
   return status;
 }

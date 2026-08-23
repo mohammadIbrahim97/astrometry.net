@@ -303,10 +303,13 @@ ALL_TEST_LIBS := $(SLIB)
 
 # Add the dependencies here...
 #test_multiindex2: test_multiindex2.o $(SLIB)
+test-index-shard-pool-lifecycle: \
+	test-index-shard-pool-lifecycle.o $(SLIB)
 
 tests: $(ALL_TEST_FILES) test-index-shard-config \
 	test-index-shard-staged \
-	test-engine-passes test-solver-parallel-integration \
+	test-engine-passes test-index-shard-pool-lifecycle \
+	test-solver-parallel-integration \
 	test-verify-theta-tail
 .PHONY: tests
 

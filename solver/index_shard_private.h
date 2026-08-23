@@ -346,11 +346,11 @@ typedef struct index_shard_worker_context {
 } index_shard_worker_context_t;
 
 /*
- * Persistent worker pool for one engine job.
+ * Persistent worker pool for one engine process.
  *
- * The pool survives across multiple onefield_run() submissions.  Workers sleep
- * between generations and wake when index_shard_pool_submit() increments
- * generation.
+ * Exactly one job may bind the pool and exactly one pass may be active.  Job
+ * and pass pointers are cleared before their owners can be cleaned up.  Worker
+ * threads sleep between monotonically numbered pass generations.
  */
 typedef enum index_shard_work_selection {
   INDEX_SHARD_WORK_ERROR = -1,
@@ -406,6 +406,7 @@ typedef enum index_shard_staged_select_class {
 
 struct index_shard_pool {
 
+  /* Valid only while job_active is true. */
   onefield_t *owner_bp;
   solver_t *owner_sp;
 
@@ -433,11 +434,15 @@ struct index_shard_pool {
 
   int shutdown;
   int stopping;
+  int poisoned;
+  int job_active;
   int pass_active;
+  int pass_releasing;
   int payload_io_owned;
   int payload_completion_registered;
   int ready_workers;
   int tls_startup_error;
+  unsigned long job_generation;
   unsigned long generation; // pass submission counter
 
   index_shard_thread_state_t shared;
@@ -497,11 +502,28 @@ void index_shard_inverse_cache_destroy(
     index_shard_pool_t *pool);
 
 /* index_shard_pool.c */
+int index_shard_pool_create(
+    const onefield_t *config_bp,
+    index_shard_pool_t **pool_out);
+int index_shard_pool_bind_job(
+    index_shard_pool_t *pool,
+    onefield_t *bp,
+    solver_t *sp);
+int index_shard_pool_job_width_compatible(
+    const index_shard_pool_t *pool,
+    const onefield_t *bp);
+int index_shard_pool_unbind_job(
+    index_shard_pool_t *pool,
+    onefield_t *bp,
+    solver_t *sp);
+int index_shard_pool_destroy(index_shard_pool_t *pool);
+void index_shard_pool_poison(index_shard_pool_t *pool);
+int index_shard_pool_is_poisoned(index_shard_pool_t *pool);
 index_shard_pool_acquire_status_t
 index_shard_pool_acquire_pass(onefield_t *bp,
                               solver_t *sp,
                               index_shard_pool_t **pool_out);
-void index_shard_pool_release_pass(index_shard_pool_t *pool);
+int index_shard_pool_release_pass(index_shard_pool_t *pool);
 int index_shard_pool_start(onefield_t *bp, solver_t *sp);
 void index_shard_pool_stop(onefield_t *bp);
 int index_shard_pool_active(onefield_t *bp);

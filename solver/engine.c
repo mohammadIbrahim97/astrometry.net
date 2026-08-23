@@ -48,6 +48,7 @@
 #include "solverutils.h"
 #include "tic.h"
 #include "index_shard_config.h"
+#include "index_shard_private.h"
 #include "engine_internal.h"
 #include "engine_private.h"
 
@@ -465,7 +466,7 @@ int engine_run_job(engine_t* engine, job_t* job) {
     int rtn = 0;
     double app_min_default;
     double app_max_default;
-    anbool index_shard_pool_started = FALSE;
+    anbool index_shard_pool_bound = FALSE;
     anbool legacy_grouped =
         engine->inparallel && !job->index_shard_workers_controlled;
     engine_pass_cursor_t pass_cursor;
@@ -496,13 +497,42 @@ int engine_run_job(engine_t* engine, job_t* job) {
     }
 
     if (index_shard_pthread_enabled(bp) && !legacy_grouped) {
-        if (index_shard_pool_start(bp, sp)) {
-            ERROR("Failed to start parallel solver pool");
+        if (engine->index_shard_pool &&
+            index_shard_pool_is_poisoned(engine->index_shard_pool)) {
+            if (index_shard_pool_destroy(engine->index_shard_pool)) {
+                ERROR("Failed to retire poisoned parallel solver pool");
+                engine->index_shard_pool = NULL;
+                rtn = -1;
+                goto finish;
+            }
+            engine->index_shard_pool = NULL;
+        }
+        if (engine->index_shard_pool &&
+            !index_shard_pool_job_width_compatible(
+                engine->index_shard_pool, bp)) {
+            if (index_shard_pool_destroy(engine->index_shard_pool)) {
+                ERROR("Failed to replace incompatible parallel solver pool");
+                engine->index_shard_pool = NULL;
+                rtn = -1;
+                goto finish;
+            }
+            engine->index_shard_pool = NULL;
+        }
+        if (!engine->index_shard_pool &&
+            index_shard_pool_create(
+                bp, &engine->index_shard_pool)) {
+            ERROR("Failed to create parallel solver pool");
+            rtn = -1;
+            goto finish;
+        }
+        if (index_shard_pool_bind_job(
+                engine->index_shard_pool, bp, sp)) {
+            ERROR("Failed to bind parallel solver pool to job");
             rtn = -1;
             goto finish;
         }
 
-        index_shard_pool_started = TRUE;
+        index_shard_pool_bound = TRUE;
     }
 
     engine_pass_cursor_init(&pass_cursor);
@@ -695,8 +725,17 @@ int engine_run_job(engine_t* engine, job_t* job) {
     logverb("AB scale constraints: %i\n", sp->num_abscale_skipped);
 
  finish:
-   if (index_shard_pool_started) {
-     index_shard_pool_stop(bp);
+   if (index_shard_pool_bound) {
+     if (index_shard_pool_unbind_job(
+             engine->index_shard_pool, bp, sp)) {
+       ERROR("Failed to unbind parallel solver pool from job");
+       rtn = -1;
+     }
+   }
+   if (engine->index_shard_pool &&
+       index_shard_pool_is_poisoned(engine->index_shard_pool)) {
+     (void)index_shard_pool_destroy(engine->index_shard_pool);
+     engine->index_shard_pool = NULL;
    }
    onefield_job_field_cache_end(bp);
 
@@ -730,6 +769,10 @@ void engine_free(engine_t* engine) {
     int i;
     if (!engine)
         return;
+    if (engine->index_shard_pool) {
+        (void)index_shard_pool_destroy(engine->index_shard_pool);
+        engine->index_shard_pool = NULL;
+    }
     if (engine->free_indexes) {
         for (i=0; i<pl_size(engine->free_indexes); i++) {
             index_t* ind = pl_get(engine->free_indexes, i);
