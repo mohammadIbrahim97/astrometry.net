@@ -7,7 +7,6 @@
 
 #if PY_MAJOR_VERSION >= 3
 #define IS_PY3K
-#define PyInt_FromLong PyLong_FromLong
 #endif
 
 #include <stdio.h>
@@ -458,7 +457,7 @@ static PyMethodDef kdtree_methods[] = {
 };
 
 static PyObject* KdTree_n(KdObject* self, void* closure) {
-    return PyInt_FromLong(kdtree_n(self->kd));
+    return PyLong_FromLong(kdtree_n(self->kd));
 }
 
 static PyObject* KdTree_bbox(KdObject* self, void* closure) {
@@ -564,9 +563,9 @@ static void callback_dualtree2(void* v, int ind1, int ind2, double dist2) {
         lst = PyList_New(1);
         // SetItem steals a ref -- that's what we want.
         PyList_SetItem(dt->indlist, ind1, lst);
-        PyList_SET_ITEM(lst, 0, PyInt_FromLong(ind2));
+        PyList_SET_ITEM(lst, 0, PyLong_FromLong(ind2));
     } else {
-        PyList_Append(lst, PyInt_FromLong(ind2));
+        PyList_Append(lst, PyLong_FromLong(ind2));
     }
 }
 

@@ -921,7 +921,7 @@ def lanczos_shift_image(img, dx, dy, order=3, weight=None,
   D = $1->dimquads;
   $result = PyList_New(D);
   for (i = 0; i < D; i++) {
-      PyObject *o = PyInt_FromLong($3[i]);
+      PyObject *o = PyLong_FromLong($3[i]);
       PyList_SetItem($result, i, o);
   }
 }
@@ -996,11 +996,11 @@ long quadfile_addr(index_t* ind);
   int i;
   int nn;
   // convert $result to nn
-  //nn = (int)PyInt_AsLong($result);
+  //nn = (int)PyLong_AsLong($result);
   nn = result;
   $result = PyList_New(nn);
   for (i = 0; i < nn; i++) {
-      PyObject *o = PyInt_FromLong($1[i]);
+      PyObject *o = PyLong_FromLong($1[i]);
       PyList_SetItem($result, i, o);
   }
 }
@@ -1018,7 +1018,7 @@ long quadfile_addr(index_t* ind);
   N = il_size($1);
   $result = PyList_New(N);
   for (i = 0; i < N; i++) {
-      PyObject *o = PyInt_FromLong(il_get($1, i));
+      PyObject *o = PyLong_FromLong(il_get($1, i));
       PyList_SetItem($result, i, o);
   }
 }
@@ -2296,7 +2296,7 @@ static PyObject* anwcs_xy2rd_wrapper(const anwcs_t* wcs,
             d = *(double*)PyArray_DATA((PyArrayObject*)py);
             py = PyFloat_FromDouble(d);
             i = *(int*)PyArray_DATA((PyArrayObject*)pok);
-            pok = PyInt_FromLong(i);
+            pok = PyLong_FromLong(i);
             ret = Py_BuildValue("(NNN)", pok, px, py);
         } else {
             // Grab the results -- note "4,2,3" order -- ok,x,y
