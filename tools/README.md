@@ -71,6 +71,8 @@ Default 999999.
 - `-c`: CPU time limit (`--cpulimit`). Default 300.
 - `-d`: Downsampling value (`--downsample`). Default 0.
 - `-b`: Object limit (`--objs`). Default 999999.
+- `-s`: Path to a configuration file for SourceExtractor.
+    If present, SourceExtractor will be used instead of image2xy.
 - `-r`: Number of runs. Measured time is averaged between all successful runs.
     Since this essentially runs the benchmark multiple times, it can be useful
     to mitigate random, temporary deviations in performance.
