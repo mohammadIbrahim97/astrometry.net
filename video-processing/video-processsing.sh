@@ -249,6 +249,13 @@ if [[ -z "$index_base_name" ]]; then
   usage; exit 255
 fi
 
+for required_command in bc find inotifywait mktemp seq setsid solve-field stat; do
+  if ! command -v "$required_command" 1>/dev/null 2>/dev/null; then
+    echo "ERROR: Required command '$required_command' was not found."
+    exit 255
+  fi
+done
+
 if [[ -n $scale_low ]] && [[ -n $scale_high ]]; then
   if (( $(echo "$scale_low > $scale_high" | bc) )); then
     echo "ERROR: --scale-low must not be greater than --scale-high."
