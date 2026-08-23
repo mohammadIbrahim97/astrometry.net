@@ -192,18 +192,18 @@ if [[ -n $scale_low ]] && [[ -n $scale_high ]]; then
 fi
 
 
-whole_command="solve-field -p"
+whole_command=(solve-field -p)
 
 # Find out whether a parallelized build is being used
-if eval "solve-field --wall-limit 0 1>/dev/null 2>/dev/null"; then
+if solve-field --wall-limit 0 1>/dev/null 2>/dev/null; then
   if [ $verbose ]; then
     echo "solve-field recognized --wall-limit, which means this version supports parallelization."
   fi
-  whole_command="$whole_command --wall-limit $time_limit"
+  whole_command+=(--wall-limit "$time_limit")
 else
-  if eval "solve-field --cpulimit 0 1>/dev/null 2>/dev/null"; then
+  if solve-field --cpulimit 0 1>/dev/null 2>/dev/null; then
     echo "WARNING: Using version of solve-field without parallelization."
-    whole_command="$whole_command --cpulimit $time_limit"
+    whole_command+=(--cpulimit "$time_limit")
   else
     echo "ERROR: solve-field recognized neither --wall-limit nor --cpulimit."
     echo "  Is your executable broken?"
@@ -214,12 +214,12 @@ fi
 min_index_scale=0
 max_index_scale=19
 if [[ -n $scale_low ]]; then
-  whole_command="$whole_command --scale-low $scale_low"
+  whole_command+=(--scale-low "$scale_low")
   # shellcheck disable=SC2086 # Values are numeric
   min_index_scale=$(("$(rounded_index_scale $scale_low)"-1))
 fi
 if [[ -n $scale_high ]]; then
-  whole_command="$whole_command --scale-high $scale_high"
+  whole_command+=(--scale-high "$scale_high")
   # shellcheck disable=SC2086
   max_index_scale=$(("$(rounded_index_scale $scale_high)"+1))
 fi
@@ -232,7 +232,7 @@ for i in $(seq -f "%02g" $min_index_scale $max_index_scale); do
   filename="$index_dir/$index_base_name$i.fits"
   if [[ -f $filename ]]; then
     indices_found=1
-    whole_command="$whole_command --index-file $filename"
+    whole_command+=(--index-file "$filename")
     if [ $verbose ]; then
       echo "Found index file $filename."
     fi
@@ -248,16 +248,24 @@ if [ $indices_found -eq 0 ]; then
 fi
 
 if [[ -n $source_extractor_config ]]; then
-  whole_command="$whole_command --use-source-extractor --source-extractor-config $source_extractor_config"
-  whole_command="$whole_command --x-column X_IMAGE --y-column Y_IMAGE --sort-column MAG_AUTO --sort-ascending"
+  whole_command+=(
+    --use-source-extractor
+    --source-extractor-config "$source_extractor_config"
+    --x-column X_IMAGE
+    --y-column Y_IMAGE
+    --sort-column MAG_AUTO
+    --sort-ascending
+  )
 fi
 
 tmp_dir=$(mktemp -d)
-whole_command="$whole_command --dir $tmp_dir"
+whole_command+=(--dir "$tmp_dir")
 trap 'rm -rf -- "$tmp_dir"' EXIT
 
 if [ $verbose ]; then
-  echo "Whole command is: $whole_command"
+  printf "Whole command is:"
+  printf " %q" "${whole_command[@]}"
+  printf "\n"
 fi
 
 # -----------------------------------------------------------------------------
@@ -296,7 +304,7 @@ while true; do
 
   if [ $solve_file ]; then
     echo "Calculating..."
-    output="$(eval "$whole_command $latest 2>/dev/null")"
+    output="$("${whole_command[@]}" "$latest" 2>/dev/null)"
     if [ -f "$tmp_dir/$noext_base.solved" ]; then
       echo "$output" | grep "Field center: (RA,Dec) ="
       distline="$(echo "$output" | grep -n -m 1 "brightest distractors are" | cut -d: -f1)"
