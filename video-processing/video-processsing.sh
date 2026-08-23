@@ -312,8 +312,11 @@ while true; do
   if [ -z "$blur_score_path" ]; then
     solve_file=1
   else
-    bs="$($blur_score_path "$latest")"
-    if (( $(echo "$bs > $blur_threshold" | bc ) )); then
+    blur_status=0
+    bs="$("$blur_score_path" "$latest")" || blur_status=$?
+    if [[ $blur_status -ne 0 || ! $bs =~ $NUMREG ]]; then
+      echo "WARNING: Could not calculate a valid blur score for $latest_base; skipping it."
+    elif (( $(echo "$bs > $blur_threshold" | bc ) )); then
       if [ $verbose ]; then
         echo "Skipping $latest_base because of blur score: Calculated $bs, threshold is $blur_threshold"
       fi
