@@ -70,6 +70,13 @@ clean() {
       -exec rm {} \;
 }
 
+file_is_stable() {
+  first_state=$(stat -Lc "%d:%i:%s:%y" -- "$1" 2>/dev/null) || return 1
+  sleep 0.1
+  second_state=$(stat -Lc "%d:%i:%s:%y" -- "$1" 2>/dev/null) || return 1
+  [[ "$first_state" == "$second_state" ]]
+}
+
 # This requires GNU getopt. On Mac OS X and FreeBSD, you have to install this separately.
 args=$(getopt -o hi:v --long help,input-directory:,input-dir:,index-dir:,index-directory:,index-base-name:,\
 source-extractor-config:,time-limit:,scale-low:,scale-high:,blur-score-path:,blur-threshold:,regex:,verbose \
@@ -277,12 +284,25 @@ while true; do
     if [ $verbose ]; then
       echo "Waiting for new files..."
     fi
-    while read -r _ _ file; do
+    while read -r file; do
       if [ $verbose ]; then
         echo "New file appeared: '$file'"
       fi
       latest="$input_dir/$file"
-    done < <(inotifywait "$input_dir" -e create -e moved_to --include "$regex")
+    done < <(inotifywait -q "$input_dir" -e close_write -e moved_to \
+        --include "$regex" --format "%f")
+  fi
+
+  if [[ -z $latest || ! -f $latest || -L $latest ]]; then
+    echo "WARNING: Ignoring an unavailable or unsafe input path: '$latest'."
+    last="$latest"
+    continue
+  fi
+  if ! file_is_stable "$latest"; then
+    if [ $verbose ]; then
+      echo "Waiting for '$latest' to become stable..."
+    fi
+    continue
   fi
 
   latest_base="$(basename "$latest")"
