@@ -1,0 +1,33 @@
+[paths]
+astrometry_install = ""
+workspace_root = ""
+
+[input]
+default_dir = ""
+recursive = false
+limit = 0
+
+[output]
+root = ""
+
+[solver]
+cpulimit_seconds = 120
+timeout_seconds = 180
+no_plots = true
+overwrite = true
+keep_temp = true
+optional_args = [
+  "--scale-low", "0.5",
+  "--scale-high", "2.0",
+  "--downsample", "2"
+]
+
+[dataset]
+categorized_relative = "data/categorized_5img_set"
+ser_relative = "data/ser_data"
+categories = ["clean", "noisy", "blurred", "disturbed"]
+
+[benchmark]
+output_relative = "runs/astrobench"
+default_workload = "mixed20"
+workers = [1, 2, 4]
