@@ -77,6 +77,64 @@ file_is_stable() {
   [[ "$first_state" == "$second_state" ]]
 }
 
+stop_child() {
+  signal="$1"
+  if [[ -z $child_pid ]]; then
+    return 0
+  fi
+
+  kill "-$signal" "$child_pid" 2>/dev/null || true
+  kill "-$signal" -- "-$child_group" 2>/dev/null || true
+  for ((attempt=0; attempt<50; attempt++)); do
+    if ! kill -0 "$child_pid" 2>/dev/null && \
+        ! kill -0 -- "-$child_group" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+  done
+  if kill -0 "$child_pid" 2>/dev/null || \
+      kill -0 -- "-$child_group" 2>/dev/null; then
+    kill -KILL -- "-$child_group" 2>/dev/null || true
+    kill -KILL "$child_pid" 2>/dev/null || true
+  fi
+  wait "$child_pid" 2>/dev/null || true
+  for ((attempt=0; attempt<50; attempt++)); do
+    if ! kill -0 -- "-$child_group" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+  done
+  if kill -0 -- "-$child_group" 2>/dev/null; then
+    echo "ERROR: Child process group $child_group did not stop." >&2
+    return 1
+  fi
+  child_pid=
+  child_group=
+}
+
+handle_signal() {
+  if [[ -n $launching_child ]]; then
+    pending_signal="$1"
+    pending_status="$2"
+    return 0
+  fi
+  signal="$1"
+  status="$2"
+  trap - HUP INT TERM
+  stop_child "$signal"
+  exit "$status"
+}
+
+cleanup() {
+  if ! stop_child TERM; then
+    echo "WARNING: Retaining temporary directory '$tmp_dir' for the running child." >&2
+    return
+  fi
+  if [[ -n $tmp_dir ]]; then
+    rm -rf -- "$tmp_dir"
+  fi
+}
+
 # This requires GNU getopt. On Mac OS X and FreeBSD, you have to install this separately.
 args=$(getopt -o hi:v --long help,input-directory:,input-dir:,index-dir:,index-directory:,index-base-name:,\
 source-extractor-config:,time-limit:,scale-low:,scale-high:,blur-score-path:,blur-threshold:,regex:,verbose \
@@ -265,11 +323,21 @@ if [[ -n $source_extractor_config ]]; then
   )
 fi
 
+tmp_dir=
+child_pid=
+child_group=
+launching_child=
+pending_signal=
+pending_status=
+trap 'handle_signal HUP 129' HUP
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+trap cleanup EXIT
 tmp_dir=$(mktemp -d) || exit 255
 whole_command+=(--dir "$tmp_dir")
 solve_stdout="$tmp_dir/solve-field.stdout"
 solve_stderr="$tmp_dir/solve-field.stderr"
-trap 'rm -rf -- "$tmp_dir"' EXIT
+watch_stdout="$tmp_dir/inotifywait.stdout"
 
 if [ $verbose ]; then
   printf "Whole command is:"
@@ -286,9 +354,30 @@ while true; do
     if [ $verbose ]; then
       echo "Waiting for new files..."
     fi
-    event="$(inotifywait -q -t 1 "$input_dir" -e close_write -e moved_to \
-        --include "$regex" --format "%f")"
+    : > "$watch_stdout"
+    launching_child="set"
+    setsid inotifywait -q -t 1 "$input_dir" -e close_write -e moved_to \
+        --include "$regex" --format "%f" >"$watch_stdout" &
+    child_pid=$!
+    child_group=$child_pid
+    launching_child=
+    if [[ -n $pending_signal ]]; then
+      saved_signal="$pending_signal"
+      saved_status="$pending_status"
+      pending_signal=
+      pending_status=
+      handle_signal "$saved_signal" "$saved_status"
+    fi
+    wait "$child_pid"
     watch_status=$?
+    if kill -0 -- "-$child_group" 2>/dev/null; then
+      stop_child TERM
+      watch_status=125
+    else
+      child_pid=
+      child_group=
+    fi
+    event="$(<"$watch_stdout")"
     if [[ $watch_status -eq 2 ]]; then
       continue
     elif [[ $watch_status -ne 0 ]]; then
@@ -340,8 +429,27 @@ while true; do
     clean "$tmp_dir" "$noext_base"
     : > "$solve_stdout"
     : > "$solve_stderr"
-    "${whole_command[@]}" "$latest" >"$solve_stdout" 2>"$solve_stderr"
+    launching_child="set"
+    setsid "${whole_command[@]}" "$latest" >"$solve_stdout" 2>"$solve_stderr" &
+    child_pid=$!
+    child_group=$child_pid
+    launching_child=
+    if [[ -n $pending_signal ]]; then
+      saved_signal="$pending_signal"
+      saved_status="$pending_status"
+      pending_signal=
+      pending_status=
+      handle_signal "$saved_signal" "$saved_status"
+    fi
+    wait "$child_pid"
     solve_status=$?
+    if kill -0 -- "-$child_group" 2>/dev/null; then
+      stop_child TERM
+      solve_status=125
+    else
+      child_pid=
+      child_group=
+    fi
     output="$(<"$solve_stdout")"
     if [[ $solve_status -ne 0 ]]; then
       echo "Could not solve $latest: solve-field exited with status $solve_status."
