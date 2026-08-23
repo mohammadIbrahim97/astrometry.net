@@ -265,8 +265,10 @@ if [[ -n $source_extractor_config ]]; then
   )
 fi
 
-tmp_dir=$(mktemp -d)
+tmp_dir=$(mktemp -d) || exit 255
 whole_command+=(--dir "$tmp_dir")
+solve_stdout="$tmp_dir/solve-field.stdout"
+solve_stderr="$tmp_dir/solve-field.stderr"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 
 if [ $verbose ]; then
@@ -327,11 +329,30 @@ while true; do
 
   if [ $solve_file ]; then
     echo "Calculating..."
-    output="$("${whole_command[@]}" "$latest" 2>/dev/null)"
-    if [ -f "$tmp_dir/$noext_base.solved" ]; then
+    clean "$tmp_dir" "$noext_base"
+    : > "$solve_stdout"
+    : > "$solve_stderr"
+    "${whole_command[@]}" "$latest" >"$solve_stdout" 2>"$solve_stderr"
+    solve_status=$?
+    output="$(<"$solve_stdout")"
+    if [[ $solve_status -ne 0 ]]; then
+      echo "Could not solve $latest: solve-field exited with status $solve_status."
+      if [ $verbose ]; then
+        echo "Output from solve-field:"
+        echo "$output"
+        if [[ -s $solve_stderr ]]; then
+          echo "Errors from solve-field:" >&2
+          cat "$solve_stderr" >&2
+        fi
+      fi
+    elif [ -f "$tmp_dir/$noext_base.solved" ]; then
       echo "$output" | grep "Field center: (RA,Dec) ="
       distline="$(echo "$output" | grep -n -m 1 "brightest distractors are" | cut -d: -f1)"
-      echo "$output" | tail -n +$distline
+      if [[ -n $distline ]]; then
+        echo "$output" | tail -n +"$distline"
+      elif [ $verbose ]; then
+        echo "$output"
+      fi
     else
       echo "Could not solve $latest."
       if [ $verbose ]; then
