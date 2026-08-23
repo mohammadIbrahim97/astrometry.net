@@ -47,7 +47,8 @@ index_t* onefield_internal_get_index(onefield_t* bp, size_t index_order) {
             NULL);
         if (!ind) {
             ERROR("Failed to load index %s", fn);
-            exit(-1);
+            bp->solver_failed = TRUE;
+            return NULL;
         }
         return ind;
     }

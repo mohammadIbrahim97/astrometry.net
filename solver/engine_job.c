@@ -35,6 +35,13 @@ static job_t* job_new() {
     }
     job->scales = dl_new(8);
     job->depths = il_new(8);
+    if (!job->scales || !job->depths) {
+        ERROR("Failed to allocate job scale/depth lists");
+        dl_free(job->scales);
+        il_free(job->depths);
+        free(job);
+        return NULL;
+    }
     job->index_shard_workers_override = INDEX_SHARD_WORKERS_UNSET;
     return job;
 }
@@ -429,7 +436,13 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
         return NULL;
     }
     job = job_new();
+    if (!job) {
+        qfits_header_destroy(hdr);
+        return NULL;
+    }
     if (!parse_job_from_qfits_header(hdr, job)) {
+        solver_cleanup(&job->bp.solver);
+        onefield_cleanup(&job->bp);
         job_free(job);
         qfits_header_destroy(hdr);
         return NULL;
