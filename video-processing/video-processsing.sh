@@ -286,13 +286,21 @@ while true; do
     if [ $verbose ]; then
       echo "Waiting for new files..."
     fi
-    while read -r file; do
-      if [ $verbose ]; then
-        echo "New file appeared: '$file'"
-      fi
-      latest="$input_dir/$file"
-    done < <(inotifywait -q "$input_dir" -e close_write -e moved_to \
-        --include "$regex" --format "%f")
+    event="$(inotifywait -q -t 1 "$input_dir" -e close_write -e moved_to \
+        --include "$regex" --format "%f")"
+    watch_status=$?
+    if [[ $watch_status -eq 2 ]]; then
+      continue
+    elif [[ $watch_status -ne 0 ]]; then
+      echo "WARNING: Could not watch '$input_dir'; retrying..." >&2
+      sleep 1
+      continue
+    fi
+    file="$event"
+    if [ $verbose ]; then
+      echo "New file appeared: '$file'"
+    fi
+    latest="$input_dir/$file"
   fi
 
   if [[ -z $latest || ! -f $latest || -L $latest ]]; then
