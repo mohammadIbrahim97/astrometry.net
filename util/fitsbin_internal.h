@@ -99,6 +99,14 @@ int fitsbin_payload_io_mapped_population_supported(void);
 int fitsbin_payload_io_set_completion_notifier(
     fitsbin_payload_io_completion_notify_fn notify,
     void* opaque);
+/*
+ * The caller has stopped publishing tickets for this notifier pair and has
+ * collected every ticket it registered. Wait until callbacks already acquired
+ * by the provider have returned without unregistering the notifier.
+ */
+int fitsbin_payload_io_wait_completion_notifier_idle(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
 int fitsbin_payload_io_clear_completion_notifier(
     fitsbin_payload_io_completion_notify_fn notify,
     void* opaque);

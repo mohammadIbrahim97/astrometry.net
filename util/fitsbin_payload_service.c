@@ -103,7 +103,7 @@ fitsbin_payload_io_completion_acquire_locked(void** opaque) {
     if (opaque) {
         *opaque = NULL;
     }
-    if (!notify) {
+    if (!notify || service.completion.clearing) {
         return NULL;
     }
     service.completion.active++;
@@ -162,6 +162,33 @@ int fitsbin_payload_io_set_completion_notifier(
     return 0;
 }
 
+int fitsbin_payload_io_wait_completion_notifier_idle(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque) {
+    if (!notify) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fitsbin_payload_io_completion_dispatch_depth) {
+        errno = EDEADLK;
+        return -1;
+    }
+    pthread_mutex_lock(&service.mutex);
+    if (service.completion.notify != notify ||
+        service.completion.opaque != opaque) {
+        pthread_mutex_unlock(&service.mutex);
+        errno = ENOENT;
+        return -1;
+    }
+    while (service.completion.active) {
+        pthread_cond_wait(
+            &service.completion_cv,
+            &service.mutex);
+    }
+    pthread_mutex_unlock(&service.mutex);
+    return 0;
+}
+
 int fitsbin_payload_io_clear_completion_notifier(
     fitsbin_payload_io_completion_notify_fn notify,
     void* opaque) {
@@ -186,13 +213,13 @@ int fitsbin_payload_io_clear_completion_notifier(
         return -1;
     }
     service.completion.clearing = TRUE;
-    service.completion.notify = NULL;
-    service.completion.opaque = NULL;
     while (service.completion.active) {
         pthread_cond_wait(
             &service.completion_cv,
             &service.mutex);
     }
+    service.completion.notify = NULL;
+    service.completion.opaque = NULL;
     service.completion.clearing = FALSE;
     pthread_mutex_unlock(&service.mutex);
     return 0;
