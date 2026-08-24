@@ -69,7 +69,7 @@ static an_option_t myopts[] = {
     {'f', "inputs-from", required_argument, "file",
      "read input filenames from the given file, \"-\" for stdin"},
     {'R', "job-status-fd", required_argument, "fd",
-     "write one PROI26_JOB_STATUS_V2 record after each streamed job"},
+     "write one status record after each streamed job"},
     {'i', "index", required_argument, "file(s)",
      "use the given index files (in addition to any specified in the config file); put in quotes to use wildcards, eg: \" -i 'index-*.fits' \""},
     {'I', "index-dir", required_argument, "directory",
@@ -79,7 +79,7 @@ static an_option_t myopts[] = {
     {'D', "data-log file", required_argument, "file",
      "log data to the given filename"},
     {'j', "job-id", required_argument, "jobid",
-     "IGNORED; purely to allow process to contain the job id!"},
+     "accepted for process identification; does not affect solving"},
 };
 
 static int publish_job_status(FILE* stream,
@@ -91,7 +91,7 @@ static int publish_job_status(FILE* stream,
     }
     (*sequence)++;
     if (fprintf(stream,
-                "PROI26_JOB_STATUS_V2\t%llu\t%i\t%s\t%i\t%i\t"
+                "astrometry-job-status-v2\t%llu\t%i\t%s\t%i\t%i\t"
                 "%i\t%i\t%i\n",
                 *sequence,
                 result->engine_rc,

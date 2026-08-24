@@ -349,8 +349,8 @@ fi
 
 if grep -qE 'failed=1|serial-precommit-retry' "$work_dir"/*.log; then
     grep -nE 'failed=1|serial-precommit-retry' "$work_dir"/*.log >&2
-    die "a release-gate log contains a failed solver state"
+    die "an integration log contains a failed solver state"
 fi
 
-printf 'SOLVER_PARALLEL_RELEASE_GATE_OK output=%s\n' \
+printf 'solver parallel integration checks passed: output=%s\n' \
     "$([[ "$temporary_output" -eq 1 ]] && printf transient || printf '%s' "$work_dir")"
