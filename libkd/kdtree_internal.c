@@ -308,7 +308,7 @@ static inline void dist2_bailout(const kdtree_t *kd,
 #endif
 
   /*
-   * Phase C: specialized 4D CodeKD distance kernel.
+   * Specialized 4D CodeKD distance kernel.
    *
    * The dominant solver CodeKD workload is four-dimensional.  Keep the
    * original POINT_DE() decoding, accumulation order, bailout predicate and

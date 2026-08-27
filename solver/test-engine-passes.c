@@ -275,9 +275,9 @@ static void job_result_outcome_precedence(void) {
 }
 
 static void obsolete_markers_preserve_terminal_state(void) {
-    char solved_path[] = "/tmp/proi26-engine-solved-XXXXXX";
+    char solved_path[] = "/tmp/astrometry-engine-solved-XXXXXX";
     char solved_lock_path[PATH_MAX];
-    char cancel_path[] = "/tmp/proi26-engine-cancel-XXXXXX";
+    char cancel_path[] = "/tmp/astrometry-engine-cancel-XXXXXX";
     engine_job_result_t result;
     onefield_t onefield;
     int fd;
@@ -317,10 +317,10 @@ static void obsolete_markers_preserve_terminal_state(void) {
 }
 
 static void solved_marker_batch_is_atomic(void) {
-    char solved_path[] = "/tmp/proi26-solved-batch-XXXXXX";
-    char mode_path[] = "/tmp/proi26-solved-mode-XXXXXX";
-    char concurrent_path[] = "/tmp/proi26-solved-concurrent-XXXXXX";
-    char failure_dir[] = "/tmp/proi26-solved-failure-XXXXXX";
+    char solved_path[] = "/tmp/astrometry-solved-batch-XXXXXX";
+    char mode_path[] = "/tmp/astrometry-solved-mode-XXXXXX";
+    char concurrent_path[] = "/tmp/astrometry-solved-concurrent-XXXXXX";
+    char failure_dir[] = "/tmp/astrometry-solved-failure-XXXXXX";
     char failure_path[256];
     char lock_path[512];
     struct stat info;
