@@ -720,27 +720,30 @@ static void after_solved(augment_xylist_t* axy,
             double xycoords[2];
             double rdcoords[2*MAX_UNIDENTIFIED_OBJS_TO_MENTION];
             int unidObjsFound = 0;
+            anbool keep_outputting = TRUE;
             for (int xyrow=0, corrindex=0;
-                unidObjsFound<MAX_UNIDENTIFIED_OBJS_TO_MENTION && corrindex<corrnrows;
+                corrindex<corrnrows;
                 xyrow++
             ) {
                 if (corrfieldids[corrindex] == xyrow) {
                     corrindex++;
-                    if (corrindex>=corrnrows)
-                        printf("(only found %d) ", unidObjsFound);
                     continue;
                 }
-                starxy_get(xy, xyrow, xycoords);
-                anwcs_pixelxy2radec(anwcs, xycoords[0], xycoords[1],
-                    &rdcoords[2*unidObjsFound], &rdcoords[2*unidObjsFound+1]);
+                if (keep_outputting) {
+                    starxy_get(xy, xyrow, xycoords);
+                    anwcs_pixelxy2radec(anwcs, xycoords[0], xycoords[1],
+                        &rdcoords[2*unidObjsFound], &rdcoords[2*unidObjsFound+1]);
+                }
                 unidObjsFound++;
                 if (unidObjsFound>=MAX_UNIDENTIFIED_OBJS_TO_MENTION) {
-                    printf("(capped at %d) ", MAX_UNIDENTIFIED_OBJS_TO_MENTION);
-                    break;
+                    keep_outputting = FALSE;
                 }
             }
             anwcs_free(anwcs);
-            printf("(RA, DEC):\n");
+            printf("(total %d, outputting ", unidObjsFound);
+            if (unidObjsFound>=MAX_UNIDENTIFIED_OBJS_TO_MENTION)
+                unidObjsFound = MAX_UNIDENTIFIED_OBJS_TO_MENTION;
+            printf("%d) (RA, DEC):\n", unidObjsFound);
             for (int i=0; i<unidObjsFound; i++) {
                 printf("  %f, %f\n", rdcoords[2*i], rdcoords[2*i+1]);
             }
