@@ -705,7 +705,7 @@ static void after_solved(augment_xylist_t* axy,
         }
 
         if (file_exists(axy->corrfn)) {
-            const int MAX_DISTRACTORS_TO_MENTION = 5;
+            const int MAX_UNIDENTIFIED_OBJS_TO_MENTION = 5;
 
             fitstable_t *const corrtab = fitstable_open(axy->corrfn);
             const int corrnrows = fitstable_nrows(corrtab);
@@ -714,35 +714,34 @@ static void after_solved(augment_xylist_t* axy,
 
             anwcs_t *const anwcs = anwcs_open(axy->wcsfn, 0);
 
-            printf("The brightest distractors are ");
+            printf("The brightest unidentified objects are ");
             // Using doubles is fine here despite them being variably sized,
             // since starxy_t itself uses doubles
             double xycoords[2];
-            double rdcoords[2*MAX_DISTRACTORS_TO_MENTION];
-            int distractorsFound = 0;
+            double rdcoords[2*MAX_UNIDENTIFIED_OBJS_TO_MENTION];
+            int unidObjsFound = 0;
             for (int xyrow=0, corrindex=0;
-                distractorsFound<MAX_DISTRACTORS_TO_MENTION && corrindex<corrnrows;
+                unidObjsFound<MAX_UNIDENTIFIED_OBJS_TO_MENTION && corrindex<corrnrows;
                 xyrow++
             ) {
                 if (corrfieldids[corrindex] == xyrow) {
                     corrindex++;
+                    if (corrindex>=corrnrows)
+                        printf("(only found %d) ", unidObjsFound);
                     continue;
                 }
                 starxy_get(xy, xyrow, xycoords);
                 anwcs_pixelxy2radec(anwcs, xycoords[0], xycoords[1],
-                    &rdcoords[2*distractorsFound], &rdcoords[2*distractorsFound+1]);
-                distractorsFound++;
-                if (distractorsFound>=MAX_DISTRACTORS_TO_MENTION) {
-                    printf("(capped at %d) ", MAX_DISTRACTORS_TO_MENTION);
-                    break;
-                } if (corrindex>=corrnrows) {
-                    printf("(only found %d) ", distractorsFound);
+                    &rdcoords[2*unidObjsFound], &rdcoords[2*unidObjsFound+1]);
+                unidObjsFound++;
+                if (unidObjsFound>=MAX_UNIDENTIFIED_OBJS_TO_MENTION) {
+                    printf("(capped at %d) ", MAX_UNIDENTIFIED_OBJS_TO_MENTION);
                     break;
                 }
             }
             anwcs_free(anwcs);
             printf("(RA, DEC):\n");
-            for (int i=0; i<distractorsFound; i++) {
+            for (int i=0; i<unidObjsFound; i++) {
                 printf("  %f, %f\n", rdcoords[2*i], rdcoords[2*i+1]);
             }
         }
