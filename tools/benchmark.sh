@@ -16,7 +16,7 @@ printhelp() {
   echo "  -d <downsample> [default: 0]"
   echo "  -b <object-limit>: Corresponds to --objs parameter in solve-field [default: 999999]"
   echo "  -s <source-extractor-config-path>: Path to the configuration file for SourceExtractor."
-  ehco "    If present, SourceExtractor will be used instead of image2xy."
+  echo "    If present, SourceExtractor will be used instead of image2xy."
   echo "  -r <number-of-runs> [default: 1]"
   echo "  -e <command-string>: Allows to call external tools and add their data to the generated file."
   echo "    <command-string> must consist of two parts separated by a colon (:)."
